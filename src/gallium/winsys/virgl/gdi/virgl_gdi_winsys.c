@@ -1027,7 +1027,7 @@ virgl_gdi_get_caps(struct virgl_winsys *vws, struct virgl_drm_caps *caps)
 
    args.Capset.CapsetId = 2;
    args.Capset.Size = sizeof(union virgl_caps);
-   args.Capset.Capset = (UCHAR *)&caps->caps;
+   args.Capset.Capset = (ULONG64)(UINT_PTR)&caps->caps;
 
    ret = vdws->device->escape(vdws->device, &args, sizeof(args));
    if (!NT_SUCCESS(ret)) {
