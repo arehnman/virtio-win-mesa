@@ -587,7 +587,7 @@ virtgpu_get_caps(struct virtgpu *gpu,
    esc.Capset.CapsetId = id;
    esc.Capset.Version = version;
    esc.Capset.Size = (ULONG)capset_size;
-   esc.Capset.Capset = (UCHAR *)capset;
+   esc.Capset.Capset = (ULONG64)(UINT_PTR)capset;
 
    return virtgpu_d3dkmt_escape(gpu, &esc) ? 0 : -1;
 }

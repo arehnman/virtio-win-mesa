@@ -51,7 +51,7 @@
 /* cast a WSI object to a pointer for logging */
 #define VN_WSI_PTR(obj) ((const void *)(uintptr_t)(obj))
 
-static PFN_vkVoidFunction
+static PFN_vkVoidFunction VKAPI_PTR
 vn_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
 {
    struct vn_physical_device *physical_dev =
