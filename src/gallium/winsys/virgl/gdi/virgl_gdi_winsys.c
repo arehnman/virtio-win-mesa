@@ -787,8 +787,6 @@ virgl_gdi_cmd_buf_create(struct virgl_winsys *qws, uint32_t size)
    unsigned new_alloc = cbuf->ctx->AllocationListSize;
    unsigned new_patch = cbuf->ctx->PatchLocationListSize;
    unsigned actual = MIN2(new_alloc, new_patch);
-   unsigned req_alloc = render.NewAllocationListSize;
-   unsigned req_patch = render.NewPatchLocationListSize;
    if (new_alloc == 0 || new_patch == 0) {
       _debug_printf("Allocation lists are zero: %u/%u\n",
                     new_alloc, new_patch);
