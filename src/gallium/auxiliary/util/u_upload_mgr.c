@@ -105,7 +105,7 @@ u_upload_clone(struct pipe_context *pipe, struct u_upload_mgr *upload)
    struct u_upload_mgr *result = u_upload_create(pipe, upload->default_size,
                                                  upload->bind, upload->usage,
                                                  upload->flags);
-   if (!upload->map_persistent && result->map_persistent)
+   if (result && !upload->map_persistent && result->map_persistent)
       u_upload_disable_persistent(result);
 
    return result;

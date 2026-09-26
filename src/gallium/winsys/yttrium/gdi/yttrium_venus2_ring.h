@@ -14,6 +14,25 @@ yttrium_venus2_ring_lock(void);
 void
 yttrium_venus2_ring_unlock(void);
 
+/* Stack-local encoder sink for async vkCmd* calls inside a ring transaction.
+ * It changes transport write granularity, not GPU submission boundaries.
+ */
+struct yttrium_venus_command_stream {
+   struct vn_ring vn_ring;
+   struct yttrium_venus *venus;
+   uint32_t size;
+   uint32_t command_count;
+   bool failed;
+   uint8_t data[16384];
+};
+
+void
+yttrium_venus2_command_stream_init(struct yttrium_venus_command_stream *stream,
+                                  struct yttrium_venus *venus);
+
+bool
+yttrium_venus2_command_stream_flush(struct yttrium_venus_command_stream *stream);
+
 bool
 yttrium_venus2_ring_transaction_begin(struct yttrium_venus *venus);
 
@@ -33,6 +52,12 @@ yttrium_venus2_vn_ring_warn_reply_request_with_invalid_seqno(
 
 bool
 yttrium_venus_ring_create(struct yttrium_venus *venus);
+
+bool
+yttrium_venus_ring_publish_for_submit(struct yttrium_venus *venus, uint32_t *seqno);
+
+bool
+yttrium_venus_submit_gpu(struct yttrium_venus *venus, const void *data, size_t size);
 
 void
 yttrium_venus_ring_forget_at_device_teardown(struct yttrium_venus *venus);

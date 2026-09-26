@@ -1208,6 +1208,28 @@ static const mesa_shader_stage graphics_uav_stages[] = {
 static void
 ClearGraphicsUnorderedAccessViews(Device *pDevice)
 {
+   bool already_clear = true;
+   for (unsigned i = 0; i < ARRAY_SIZE(graphics_uav_stages); i++) {
+      const mesa_shader_stage stage = graphics_uav_stages[i];
+
+      if (!pDevice->bufinfo_constants_bound[stage] ||
+          pDevice->bufinfo_constants_dirty[stage]) {
+         already_clear = false;
+         break;
+      }
+
+      for (unsigned slot = 0; slot < PIPE_MAX_SHADER_IMAGES; slot++) {
+         if (pDevice->unordered_access_views[stage][slot]) {
+            already_clear = false;
+            break;
+         }
+      }
+      if (!already_clear)
+         break;
+   }
+   if (already_clear)
+      return;
+
    for (unsigned i = 0; i < ARRAY_SIZE(graphics_uav_stages); i++) {
       const mesa_shader_stage stage = graphics_uav_stages[i];
 
@@ -1218,6 +1240,7 @@ ClearGraphicsUnorderedAccessViews(Device *pDevice)
 
       pDevice->pipe->set_shader_images(pDevice->pipe, stage,
                                        0, 0, PIPE_MAX_SHADER_IMAGES, NULL);
+      pDevice->counter_image_bound_mask[stage] = 0;
       UpdateBufferInfoUavConstants(pDevice, stage, 0,
                                    PIPE_MAX_SHADER_IMAGES);
       UpdateBufferInfoConstants(pDevice, stage);
@@ -1333,7 +1356,6 @@ SetRenderTargets11(
    UINT UAVStartSlot, UINT NumUAVs, UINT UAVRangeStart, UINT UAVRangeSize)
 {
    Device *pDevice = CastDevice(hDevice);
-   struct pipe_context *pipe = pDevice->pipe;
 
    SetRenderTargetsImpl(hDevice, phRenderTargetView, RTargets, ClearTargets,
                         hDepthStencilView, false);
@@ -1351,7 +1373,7 @@ SetRenderTargets11(
          if (pUAVInitialCounts &&
              pUAVInitialCounts[i] != ~0u &&
              (uav->buffer_counter || uav->buffer_append))
-            uav->counter_value = pUAVInitialCounts[i];
+            ResetUAVCounter(pDevice, uav, pUAVInitialCounts[i]);
          for (unsigned stage_idx = 0;
               stage_idx < ARRAY_SIZE(graphics_uav_stages);
               stage_idx++) {
@@ -1376,8 +1398,7 @@ SetRenderTargets11(
 
    for (unsigned i = 0; i < ARRAY_SIZE(graphics_uav_stages); i++) {
       const mesa_shader_stage stage = graphics_uav_stages[i];
-      pipe->set_shader_images(pipe, stage, UAVStartSlot, NumUAVs, 0,
-                              &pDevice->shader_images[stage][UAVStartSlot]);
+      BindShaderImages(pDevice, stage, UAVStartSlot, NumUAVs);
       UpdateBufferInfoUavConstants(pDevice, stage, UAVStartSlot, NumUAVs);
       UpdateBufferInfoConstants(pDevice, stage);
    }

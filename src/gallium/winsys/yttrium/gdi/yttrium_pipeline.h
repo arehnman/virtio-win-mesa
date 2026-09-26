@@ -66,6 +66,7 @@ struct yttrium_pipeline_key {
    uint8_t patch_vertices;
    VkBool32 primitive_restart_enable;
    VkBool32 rasterizer_discard_enable;
+   VkBool32 targetless_stream_output;
    VkCullModeFlags cull_mode;
    VkFrontFace front_face;
    VkBool32 depth_bias_enable;
@@ -104,17 +105,19 @@ struct yttrium_pipeline_key {
    uint32_t tes_ubo_used_mask;
    uint32_t fs_ubo_used_mask;
    uint32_t gs_ubo_used_mask;
-   uint32_t sampled_sampler_used_mask;
    uint32_t sampled_stage_mask;
-   uint32_t sampled_image_mask;
-   uint32_t sampled_buffer_mask;
+   uint32_t sampled_binding_count;
+   struct yttrium_venus_sampled_binding_layout
+      sampled_bindings[YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES];
    uint32_t color_feedback_loop_mask;
    VkBool32 depth_feedback_loop;
+   /* Whole-image, depth-only sampled attachment with no effective writes.
+    * Mutually exclusive with depth_feedback_loop; color feedback is separate.
+    */
+   VkBool32 depth_read_only;
    uint64_t storage_image_mask;
    uint64_t storage_buffer_mask;
    uint32_t storage_stage_mask;
-   struct yttrium_venus_sampler_state
-      sampled_image_samplers[YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES];
    uint8_t vs_ubo_default;
    uint8_t tcs_ubo_default;
    uint8_t tes_ubo_default;
@@ -169,6 +172,7 @@ struct yttrium_pipeline {
    VkDescriptorPool descriptor_pool;
    VkDescriptorSet descriptor_set;
    VkSampler samplers[YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES];
+   uint32_t custom_border_color_sampler_count;
    VkPipelineLayout pipeline_layout;
    VkPipeline pipeline;
    VkDescriptorSetLayout push_descriptor_set_layout;
@@ -193,8 +197,6 @@ struct yttrium_pipeline {
    uint32_t sampled_buffer_descriptor_count;
    uint32_t storage_image_descriptor_count;
    uint32_t storage_buffer_descriptor_count;
-   uint32_t sampled_image_mask;
-   uint32_t sampled_buffer_mask;
    uint64_t storage_image_mask;
    uint64_t storage_buffer_mask;
    bool has_sampled_image;
@@ -215,6 +217,10 @@ yttrium_pipeline_cache_init(struct yttrium_context *yctx);
 
 void
 yttrium_pipeline_cache_fini(struct yttrium_context *yctx);
+
+void
+yttrium_compute_pipeline_cache_invalidate(
+   struct yttrium_context *yctx, const struct yttrium_shader_state *shader);
 
 void
 yttrium_pipeline_state_changed(struct yttrium_context *yctx);

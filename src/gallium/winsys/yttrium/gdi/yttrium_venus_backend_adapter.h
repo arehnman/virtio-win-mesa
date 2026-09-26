@@ -74,13 +74,11 @@ backend_pipeline_init(void *ctx,
                       uint32_t attrib_count,
                       const struct yttrium_venus_ubo_binding_layout *ubo_bindings,
                       uint32_t ubo_binding_count,
-                      uint32_t sampled_image_mask,
-                      uint32_t sampled_buffer_mask,
-                      VkShaderStageFlags sampled_stage_flags,
+                      const struct yttrium_venus_sampled_binding_layout *sampled_bindings,
+                      uint32_t sampled_binding_count,
                       uint64_t storage_image_mask,
                       uint64_t storage_buffer_mask,
                       VkShaderStageFlags storage_stage_flags,
-                      const struct yttrium_venus_sampler_state *samplers,
                       const struct yttrium_venus_draw_state *draw_state)
 {
    return YTTRIUM_VENUS_BACKEND_SYM(pipeline_init)(
@@ -89,9 +87,15 @@ backend_pipeline_init(void *ctx,
       depth_resource_id, vertex_shader, tess_ctrl_shader, tess_eval_shader,
       geometry_shader, fragment_shader,
       bindings, binding_count, binding_divisors, attribs, attrib_count,
-      ubo_bindings, ubo_binding_count, sampled_image_mask, sampled_buffer_mask,
-      sampled_stage_flags, storage_image_mask, storage_buffer_mask,
-      storage_stage_flags, samplers, draw_state);
+      ubo_bindings, ubo_binding_count, sampled_bindings,
+      sampled_binding_count, storage_image_mask, storage_buffer_mask,
+      storage_stage_flags, draw_state);
+}
+
+static bool
+backend_supports_load_store_op_none(void *ctx)
+{
+   return YTTRIUM_VENUS_BACKEND_SYM(supports_load_store_op_none)(ctx);
 }
 
 static bool
@@ -128,6 +132,25 @@ backend_sampled_texture_format_supported(void *ctx,
 }
 #endif
 
+#ifdef YTTRIUM_VENUS_BACKEND_HAS_STORAGE_IMAGE_FORMATLESS_CAPS
+static bool
+backend_storage_image_without_format_supported(void *ctx,
+                                               bool read, bool write)
+{
+   return YTTRIUM_VENUS_BACKEND_SYM(storage_image_without_format_supported)(
+      ctx, read, write);
+}
+
+static bool
+backend_storage_image_formatless_format_supported(void *ctx,
+                                                   enum pipe_format format,
+                                                   bool read, bool write)
+{
+   return YTTRIUM_VENUS_BACKEND_SYM(storage_image_formatless_format_supported)(
+      ctx, format, read, write);
+}
+#endif
+
 static bool
 backend_compute_pipeline_init(
    void *ctx,
@@ -135,12 +158,15 @@ backend_compute_pipeline_init(
    VkShaderModule compute_shader,
    const struct yttrium_venus_ubo_binding_layout *ubo_bindings,
    uint32_t ubo_binding_count,
+   const struct yttrium_venus_sampled_binding_layout *sampled_bindings,
+   uint32_t sampled_binding_count,
    uint64_t storage_image_mask,
    uint64_t storage_buffer_mask)
 {
    return YTTRIUM_VENUS_BACKEND_SYM(compute_pipeline_init)(
       ctx, pipeline, compute_shader, ubo_bindings, ubo_binding_count,
-      storage_image_mask, storage_buffer_mask);
+      sampled_bindings, sampled_binding_count, storage_image_mask,
+      storage_buffer_mask);
 }
 
 static void
@@ -199,6 +225,8 @@ backend_draw_pipeline(void *ctx,
 static bool
 backend_dispatch_compute(void *ctx,
                          struct yttrium_pipeline *pipeline,
+                         const struct yttrium_venus_sampled_image *sampled_images,
+                         uint32_t sampled_image_count,
                          const struct yttrium_venus_storage_image *storage_images,
                          uint32_t storage_image_count,
                          const struct yttrium_venus_ubo_upload *ubo_uploads,
@@ -208,8 +236,8 @@ backend_dispatch_compute(void *ctx,
                          uint32_t grid_z)
 {
    return YTTRIUM_VENUS_BACKEND_SYM(dispatch_compute)(
-      ctx, pipeline, storage_images, storage_image_count, ubo_uploads,
-      ubo_upload_count, grid_x, grid_y, grid_z);
+      ctx, pipeline, sampled_images, sampled_image_count, storage_images,
+      storage_image_count, ubo_uploads, ubo_upload_count, grid_x, grid_y, grid_z);
 }
 
 static bool
@@ -821,6 +849,7 @@ const struct yttrium_venus_backend YTTRIUM_VENUS_BACKEND_SYM(backend) = {
    .pipe_format = backend_pipe_format,
    .destroy_shader_module = backend_destroy_shader_module,
    .pipeline_init = backend_pipeline_init,
+   .supports_load_store_op_none = backend_supports_load_store_op_none,
    .supports_multisampled_render_to_single_sampled =
       backend_supports_multisampled_render_to_single_sampled,
    .supports_forced_sample_interlock =
@@ -830,6 +859,12 @@ const struct yttrium_venus_backend YTTRIUM_VENUS_BACKEND_SYM(backend) = {
 #endif
 #ifdef YTTRIUM_VENUS_BACKEND_HAS_SAMPLED_TEXTURE_FORMAT_CAPS
    .sampled_texture_format_supported = backend_sampled_texture_format_supported,
+#endif
+#ifdef YTTRIUM_VENUS_BACKEND_HAS_STORAGE_IMAGE_FORMATLESS_CAPS
+   .storage_image_without_format_supported =
+      backend_storage_image_without_format_supported,
+   .storage_image_formatless_format_supported =
+      backend_storage_image_formatless_format_supported,
 #endif
    .compute_pipeline_init = backend_compute_pipeline_init,
    .pipeline_fini = backend_pipeline_fini,

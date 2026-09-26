@@ -27,8 +27,10 @@
 #include "yttrium_venus.h"
 
 struct yttrium_pipeline;
+struct yttrium_compute_pipeline_cache_entry;
 struct yttrium_buffer_storage;
 
+#define YTTRIUM_COMPUTE_PIPELINE_CACHE_SIZE 64
 #define YTTRIUM_ORDERED_UPLOAD_POOL_MAX_ENTRIES 64
 #define YTTRIUM_ORDERED_UPLOAD_POOL_MAX_BYTES (64ull * 1024ull * 1024ull)
 #define YTTRIUM_BUFFER_REPLACEMENT_POOL_MAX_ENTRIES 256
@@ -125,12 +127,15 @@ struct yttrium_readback_mapping {
 };
 
 struct yttrium_vertex_elements_state {
+   /* Original shader-location span, including PIPE_FORMAT_NONE holes. */
    unsigned num_elements;
    struct pipe_vertex_element elements[PIPE_MAX_ATTRIBS];
    unsigned num_bindings;
    uint8_t binding_map[PIPE_MAX_ATTRIBS];
    uint32_t binding_divisor[PIPE_MAX_ATTRIBS];
    VkVertexInputBindingDescription bindings[PIPE_MAX_ATTRIBS];
+   /* Compact Vulkan attributes; location indexes the original elements. */
+   unsigned num_attribs;
    VkVertexInputAttributeDescription attribs[PIPE_MAX_ATTRIBS];
    bool vk_vertex_input_valid;
 };
@@ -141,6 +146,16 @@ struct yttrium_rasterizer_state {
 
 struct yttrium_blend_state {
    struct pipe_blend_state state;
+   /* Immutable translations; all slots are initialized, including unused RTs. */
+   VkLogicOp logic_op;
+   VkBool32 rt_blend_enable[PIPE_MAX_COLOR_BUFS];
+   VkColorComponentFlags rt_color_write_mask[PIPE_MAX_COLOR_BUFS];
+   VkBlendFactor rt_src_color_blend_factor[PIPE_MAX_COLOR_BUFS];
+   VkBlendFactor rt_dst_color_blend_factor[PIPE_MAX_COLOR_BUFS];
+   VkBlendOp rt_color_blend_op[PIPE_MAX_COLOR_BUFS];
+   VkBlendFactor rt_src_alpha_blend_factor[PIPE_MAX_COLOR_BUFS];
+   VkBlendFactor rt_dst_alpha_blend_factor[PIPE_MAX_COLOR_BUFS];
+   VkBlendOp rt_alpha_blend_op[PIPE_MAX_COLOR_BUFS];
 };
 
 /*
@@ -168,13 +183,16 @@ struct yttrium_index_bounds_entry {
 #define YTTRIUM_INDEX_BOUNDS_CACHE_WAYS 4
 
 struct yttrium_gdi_present_ticket;
+struct yttrium_gdi_flush_issuance;
 
 struct yttrium_context {
    struct pipe_context base;
    struct threaded_context *threaded;
+   volatile LONG draw_failure;
    char pending_flush_label[96];
    bool pending_flush_label_valid;
    struct yttrium_gdi_present_ticket *pending_present_ticket;
+   struct yttrium_gdi_flush_issuance *pending_flush_issuance;
    struct yttrium_index_bounds_entry
       index_bounds_cache[YTTRIUM_INDEX_BOUNDS_CACHE_SET_COUNT]
                         [YTTRIUM_INDEX_BOUNDS_CACHE_WAYS];
@@ -212,10 +230,8 @@ struct yttrium_context {
    unsigned num_so_targets;
    struct pipe_resource *so_dummy_target;
    struct pipe_resource *so_dummy_buffer;
-   struct pipe_resource *uav_only_dummy_target;
-   unsigned uav_only_dummy_width;
-   unsigned uav_only_dummy_height;
-   unsigned uav_only_dummy_samples;
+   /* Exact-size UAV-only scratch targets, most recently used first. */
+   struct pipe_resource *uav_only_dummy_targets[4];
    struct pipe_blend_color blend_color;
    struct pipe_stencil_ref stencil_ref;
    unsigned sample_mask;
@@ -232,6 +248,9 @@ struct yttrium_context {
    uint32_t pipeline_cache_size;
    uint32_t pipeline_cache_count;
    uint32_t pipeline_cache_next;
+   struct yttrium_compute_pipeline_cache_entry
+      *compute_pipeline_cache[YTTRIUM_COMPUTE_PIPELINE_CACHE_SIZE];
+   uint32_t compute_pipeline_cache_next;
 
    /*
     * Ordinary state setters advance pipeline_state_serial and clear the
@@ -246,6 +265,7 @@ struct yttrium_context {
    uint64_t current_pipeline_zs_image_id;
    VkPrimitiveTopology current_pipeline_topology;
    VkBool32 current_pipeline_primitive_restart_enable;
+   VkBool32 current_pipeline_targetless_stream_output;
    uint32_t current_pipeline_viewport_count;
    uint32_t current_pipeline_rasterization_samples;
    uint32_t current_pipeline_forced_sample_count;
@@ -263,6 +283,16 @@ struct yttrium_context {
    uint64_t upload_staging_size;
    uint64_t upload_staging_offset;
    struct yttrium_readback_mapping upload_staging_mapping;
+
+   /*
+    * Format-compatible depth-to-color copies use an image -> buffer -> image
+    * sequence.  Keep that GPU scratch buffer alive across copies so the draw
+    * thread does not synchronously create and bind a new buffer for every
+    * copy.
+    */
+   struct yttrium_venus_resource image_copy_staging;
+   uint64_t image_copy_staging_mem_id;
+   uint64_t image_copy_staging_size;
 };
 
 struct yttrium_resource {
@@ -310,7 +340,11 @@ struct yttrium_resource {
    uint64_t data_capacity;
    bool owns_data;
    bool data_dirty;
+   /* Counter/indirect buffer writes make GPU storage authoritative.  Detached
+    * CPU storage is refreshed only for an explicit CPU map, never for a draw. */
+   bool gpu_buffer_written;
    bool direct_bind_unsafe;
+   bool private_immutable_draw_buffer;
    bool ordered_worker_upload_buffer;
    bool ordered_worker_upload_direct_backing;
    struct yttrium_buffer_storage *replacement_storage;

@@ -1823,12 +1823,48 @@ DECL_SPECIAL(M3x2)
     return NineTranslateInstruction_Mkxn(tx, 3, 2);
 }
 
+/* D3D9 MIN/MAX select their second source when the ordered comparison is
+ * false, including unordered NaN inputs.  TGSI MIN/MAX can become SPIR-V
+ * FMin/FMax, whose NaN operand selection is implementation-dependent. */
+static HRESULT
+NineTranslateInstruction_MinMax(struct shader_translator *tx, bool is_max)
+{
+    struct ureg_dst dst = tx_dst_param(tx, &tx->insn.dst[0]);
+    struct ureg_src src0 = tx_src_param(tx, &tx->insn.src[0]);
+    struct ureg_src src1 = tx_src_param(tx, &tx->insn.src[1]);
+    struct ureg_dst condition = tx_scratch(tx);
+
+    if (is_max)
+        ureg_SGE(tx->ureg, condition, src0, src1);
+    else
+        ureg_SLT(tx->ureg, condition, src0, src1);
+    ureg_CMP(tx->ureg, dst, ureg_negate(ureg_src(condition)), src0, src1);
+    return D3D_OK;
+}
+
+DECL_SPECIAL(MIN)
+{
+    return NineTranslateInstruction_MinMax(tx, false);
+}
+
+DECL_SPECIAL(MAX)
+{
+    return NineTranslateInstruction_MinMax(tx, true);
+}
+
 DECL_SPECIAL(CMP)
 {
-    ureg_CMP(tx->ureg, tx_dst_param(tx, &tx->insn.dst[0]),
-             tx_src_param(tx, &tx->insn.src[0]),
-             tx_src_param(tx, &tx->insn.src[2]),
-             tx_src_param(tx, &tx->insn.src[1]));
+    struct ureg_dst dst = tx_dst_param(tx, &tx->insn.dst[0]);
+    struct ureg_src src0 = tx_src_param(tx, &tx->insn.src[0]);
+    struct ureg_src src1 = tx_src_param(tx, &tx->insn.src[1]);
+    struct ureg_src src2 = tx_src_param(tx, &tx->insn.src[2]);
+    struct ureg_dst condition = tx_scratch(tx);
+
+    /* D3D9 CMP tests >= 0, whereas TGSI CMP tests < 0.  Swapping the
+     * selected sources is not equivalent for NaN.  Materialize the ordered
+     * comparison first, then select using its finite 0.0/1.0 result. */
+    ureg_SGE(tx->ureg, condition, src0, ureg_imm1f(tx->ureg, 0.0f));
+    ureg_CMP(tx->ureg, dst, ureg_negate(ureg_src(condition)), src1, src2);
     return D3D_OK;
 }
 
@@ -3243,8 +3279,8 @@ static const struct sm1_op_info inst_table[] =
     _OPI(RSQ, RSQ, V(0,0), V(3,0), V(0,0), V(3,0), 1, 1, SPECIAL(RSQ)), /* 7 */
     _OPI(DP3, DP3, V(0,0), V(3,0), V(0,0), V(3,0), 1, 2, NULL), /* 8 */
     _OPI(DP4, DP4, V(0,0), V(3,0), V(0,0), V(3,0), 1, 2, NULL), /* 9 */
-    _OPI(MIN, MIN, V(0,0), V(3,0), V(0,0), V(3,0), 1, 2, NULL), /* 10 */
-    _OPI(MAX, MAX, V(0,0), V(3,0), V(0,0), V(3,0), 1, 2, NULL), /* 11 */
+    _OPI(MIN, MIN, V(0,0), V(3,0), V(0,0), V(3,0), 1, 2, SPECIAL(MIN)), /* 10 */
+    _OPI(MAX, MAX, V(0,0), V(3,0), V(0,0), V(3,0), 1, 2, SPECIAL(MAX)), /* 11 */
     _OPI(SLT, SLT, V(0,0), V(3,0), V(0,0), V(3,0), 1, 2, NULL), /* 12 */
     _OPI(SGE, SGE, V(0,0), V(3,0), V(0,0), V(3,0), 1, 2, NULL), /* 13 */
     _OPI(EXP, EX2, V(0,0), V(3,0), V(0,0), V(3,0), 1, 1, NULL), /* 14 */

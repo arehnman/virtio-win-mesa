@@ -417,6 +417,20 @@ yttrium_venus_render_barrier_range(
    return range;
 }
 
+/* A buffer bound to memory allocated with the export info below has to
+ * declare the same handle type when it is created, or the binding is
+ * invalid: the host driver is entitled to have chosen a layout the
+ * export cannot satisfy.
+ */
+static VkExternalMemoryBufferCreateInfo
+yttrium_venus_external_buffer_info(void)
+{
+   return (VkExternalMemoryBufferCreateInfo) {
+      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+   };
+}
+
 static VkExportMemoryAllocateInfo
 yttrium_venus_export_memory_info(void)
 {
@@ -783,18 +797,34 @@ yttrium_venus2_create_sampled_texture_image(struct yttrium_venus *venus,
       VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
       VK_IMAGE_USAGE_TRANSFER_DST_BIT |
       VK_IMAGE_USAGE_SAMPLED_BIT;
+   VkImageTiling tiling = VK_IMAGE_TILING_OPTIMAL;
    if (!yttrium_venus2_sampled_image_supported(venus, vk_format, image_type,
                                                 width, image_height, image_depth,
                                                 levels, image_layers,
                                                 VK_SAMPLE_COUNT_1_BIT,
-                                                image_flags, usage,
-                                                VK_IMAGE_TILING_OPTIMAL))
-      return false;
+                                                image_flags, usage, tiling)) {
+      /* Some native formats, notably RGB32 on RADV, are sampleable only as
+       * linear images.  Preserve the exact format and keep the resource on
+       * the GPU instead of rejecting the draw or introducing a CPU path.
+       */
+      tiling = VK_IMAGE_TILING_LINEAR;
+      if (!yttrium_venus2_sampled_image_supported(
+             venus, vk_format, image_type, width, image_height, image_depth,
+             levels, image_layers, VK_SAMPLE_COUNT_1_BIT, image_flags, usage,
+             tiling))
+         return false;
+
+      YTTRIUM_LOG("yttrium: Venus sampled texture uses linear tiling "
+                  "target=%u extent=%ux%ux%u levels=%u layers=%u "
+                  "format=%u vk_format=%u\n",
+                  target, width, image_height, image_depth, levels,
+                  image_layers, pipe_format, vk_format);
+   }
    if (!yttrium_venus_create_image_tiled(
           venus, resource, image_type, vk_format, width, image_height,
           image_depth, levels, image_layers, image_flags, usage,
           VK_SAMPLE_COUNT_1_BIT,
-          VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_LAYOUT_UNDEFINED))
+          tiling, VK_IMAGE_LAYOUT_UNDEFINED))
       return false;
 
    VkMemoryRequirements reqs;
@@ -1117,29 +1147,17 @@ yttrium_venus2_create_texture_image_for_bind(struct yttrium_venus *venus,
        !image_flags)
       return false;
 
-   /* A shared colour texture's memory can be bound by a second VkImage
-    * belonging to another API -- the win32 WSI DXGI_SHARED present path does
-    * exactly that with the swapchain images.  Vulkan only defines aliasing
-    * between images created with VK_IMAGE_CREATE_ALIAS_BIT and otherwise
-    * identical parameters, so the exporting image has to carry the bit too,
-    * and the tiling has to be one both sides can arrive at independently.
-    * With optimal tiling each driver picks its own swizzle variant from the
-    * same inputs and they do not agree, so shared colour textures use linear
-    * and the WSI pins its side to linear to match.
-    *
-    * Linear tiling is only legal for a single-sampled non-depth image:
-    * VkImageCreateInfo requires samples to be VK_SAMPLE_COUNT_1_BIT when
-    * tiling is VK_IMAGE_TILING_LINEAR, and RADV advertises no
-    * linearTilingFeatures for depth formats.  Neither is refused at create
-    * time -- a multisampled linear image is accepted and then reports a zero
-    * memory requirement, which is why the guard below exists as well.
+   /* Shared single-sample colour images use linear tiling and ALIAS so
+    * yttrium_venus2_import_texture_image_for_bind and the win32 WSI
+    * DXGI_SHARED path can reproduce their memory layout.  Multisampled and
+    * depth images retain optimal tiling.
     */
-   bool shared_colour = (bind & PIPE_BIND_SHARED) &&
-                        !yttrium_venus_format_has_depth(vk_format) &&
-                        samples == VK_SAMPLE_COUNT_1_BIT;
+   const bool shared_colour = (bind & PIPE_BIND_SHARED) &&
+                              !yttrium_venus_format_has_depth(vk_format) &&
+                              samples == VK_SAMPLE_COUNT_1_BIT;
 
-   VkImageTiling tiling = shared_colour ? VK_IMAGE_TILING_LINEAR
-                                        : VK_IMAGE_TILING_OPTIMAL;
+   const VkImageTiling tiling = shared_colour ? VK_IMAGE_TILING_LINEAR
+                                             : VK_IMAGE_TILING_OPTIMAL;
    if (shared_colour)
       image_flags |= VK_IMAGE_CREATE_ALIAS_BIT;
 
@@ -1149,60 +1167,31 @@ yttrium_venus2_create_texture_image_for_bind(struct yttrium_venus *venus,
           levels, image_layers, samples, image_flags, usage, tiling))
       return false;
 
-   /* Creation succeeding is not enough: RADV accepts some linear images and
-    * then reports zero memory requirements for them -- observed for a linear
-    * colour attachment without SAMPLED usage.  Allocating zero bytes yields a
-    * memory object with no backing, and binding it dereferences null inside
-    * the host driver, killing the renderer's ring thread.  Never carry a
-    * zero-size requirement forward; retry once at optimal tiling, which
-    * costs the layout agreement but keeps the resource usable.
-    */
-   VkMemoryRequirements reqs;
-   for (;;) {
-      if (!yttrium_venus_create_image_tiled(
-             venus, resource, image_type, vk_format, width, image_height,
-             image_depth, levels, image_layers, image_flags, usage,
-             samples,
-             tiling, VK_IMAGE_LAYOUT_UNDEFINED))
-         return false;
+   if (!yttrium_venus_create_image_tiled(
+          venus, resource, image_type, vk_format, width, image_height,
+          image_depth, levels, image_layers, image_flags, usage, samples,
+          tiling, VK_IMAGE_LAYOUT_UNDEFINED))
+      return false;
 
-      memset(&reqs, 0, sizeof(reqs));
-      vn_call_vkGetImageMemoryRequirements(&venus->vn_ring,
-                                           venus->device_handle,
-                                           resource->image, &reqs);
-      if (reqs.size)
-         break;
+   VkMemoryRequirements reqs;
+   memset(&reqs, 0, sizeof(reqs));
+   vn_call_vkGetImageMemoryRequirements(&venus->vn_ring,
+                                        venus->device_handle,
+                                        resource->image, &reqs);
+   /* Never allocate or bind zero-sized backing.  Changing tiling here would
+    * break the shared image layout agreement with the importer.
+    */
+   if (!reqs.size) {
+      YTTRIUM_WARN("yttrium: Venus zero memory requirement for image %ux%ux%u "
+                   "format=%u vk_format=%u tiling=%u usage=0x%x "
+                   "flags=0x%x samples=0x%x bind=0x%x; refusing allocation\n",
+                   width, image_height, image_depth, pipe_format, vk_format,
+                   tiling, usage, image_flags, samples, bind);
 
       vn_async_vkDestroyImage(&venus->vn_ring, venus->device_handle,
                               resource->image, NULL);
       memset(resource, 0, sizeof(*resource));
-
-      if (tiling != VK_IMAGE_TILING_LINEAR) {
-         YTTRIUM_WARN("yttrium: zero memory requirement for image %ux%ux%u "
-                      "format=%u vk_format=%u tiling=%u usage=0x%x "
-                      "flags=0x%x samples=0x%x bind=0x%x\n", width,
-                      image_height, image_depth, pipe_format, vk_format,
-                      tiling, usage, image_flags, samples, bind);
-         return false;
-      }
-
-      /* Expected for some shared colour textures, so report it once rather
-       * than per resource.  Aliasing no longer matches after the retry.
-       */
-      static bool reported = false;
-      if (!reported) {
-         reported = true;
-         YTTRIUM_WARN("yttrium: linear shared texture gave a zero memory "
-                      "requirement (format=%u vk_format=%u usage=0x%x "
-                      "flags=0x%x samples=0x%x); retrying at optimal tiling, "
-                      "so a VkImage aliasing such memory from another API "
-                      "will not agree on its layout\n",
-                      pipe_format, vk_format, usage, image_flags, samples);
-      }
-
-      tiling = VK_IMAGE_TILING_OPTIMAL;
-      image_flags &= ~VK_IMAGE_CREATE_ALIAS_BIT;
-      shared_colour = false;
+      return false;
    }
 
    const uint32_t memory_type_index =
@@ -1668,17 +1657,29 @@ yttrium_venus2_import_texture_image_for_bind(
        !(venus->framebuffer_sample_counts & samples))
       return false;
 
-   const VkImageCreateFlags image_flags =
+   VkImageCreateFlags image_flags =
       yttrium_venus_image_flags_for_target(target, width, image_height,
                                            image_layers);
    if ((target == PIPE_TEXTURE_CUBE || target == PIPE_TEXTURE_CUBE_ARRAY) &&
        !image_flags)
       return false;
 
+   /* Match the shared colour image created by
+    * yttrium_venus2_create_texture_image_for_bind.  Importing its linear
+    * backing through an optimal-tiled image changes texel addressing.
+    */
+   const bool shared_colour = (bind & PIPE_BIND_SHARED) &&
+                              !yttrium_venus_format_has_depth(vk_format) &&
+                              samples == VK_SAMPLE_COUNT_1_BIT;
+   const VkImageTiling tiling = shared_colour ? VK_IMAGE_TILING_LINEAR
+                                             : VK_IMAGE_TILING_OPTIMAL;
+   if (shared_colour)
+      image_flags |= VK_IMAGE_CREATE_ALIAS_BIT;
+
    if (!yttrium_venus_create_image_tiled(
           venus, resource, image_type, vk_format, width, image_height,
           image_depth, levels, image_layers, image_flags, usage, samples,
-          VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_LAYOUT_UNDEFINED))
+          tiling, VK_IMAGE_LAYOUT_UNDEFINED))
       return false;
 
    VkMemoryRequirements reqs;
@@ -1793,8 +1794,11 @@ yttrium_venus2_create_display_buffer(struct yttrium_venus *venus,
 
    const VkDeviceSize buffer_size = MAX2((VkDeviceSize)allocation_size,
                                          (VkDeviceSize)1);
+   const VkExternalMemoryBufferCreateInfo external_buffer_info =
+      yttrium_venus_external_buffer_info();
    const VkBufferCreateInfo buffer_info = {
       .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .pNext = &external_buffer_info,
       .size = buffer_size,
       .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -1818,10 +1822,34 @@ yttrium_venus2_create_display_buffer(struct yttrium_venus *venus,
                                          venus->device_handle,
                                          resource->buffer, &reqs);
 
-   const uint32_t memory_type_index =
-      yttrium_venus_choose_memory_type(venus, reqs.memoryTypeBits,
-                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+   uint32_t memory_type_index = UINT32_MAX;
+   if (resource->cpu_readback) {
+      /*
+       * Readback buffers are consumed by the CPU after the GPU copy.  A
+       * merely coherent exported allocation is reported by virglrenderer as
+       * write-combined, making sequential CPU reads pathologically slow.
+       * Requiring CACHED as well as COHERENT gives the KMD a legitimate
+       * write-back mapping and avoids any explicit invalidate requirement.
+       */
+      memory_type_index = yttrium_venus_choose_memory_type(
+         venus, reqs.memoryTypeBits,
+         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+            VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+         0);
+      if (memory_type_index == UINT32_MAX) {
+         YTTRIUM_WARN("yttrium: WARNING: readback cache fallback owner=venus2 reason=no_host_cached_coherent_memory fallback=host_visible_coherent bits=0x%x size=0x%llx\n",
+                      reqs.memoryTypeBits,
+                      (unsigned long long)buffer_size);
+      }
+   }
+   if (memory_type_index == UINT32_MAX) {
+      memory_type_index =
+         yttrium_venus_choose_memory_type(
+            venus, reqs.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+   }
    if (memory_type_index == UINT32_MAX) {
       YTTRIUM_LOG("yttrium: Venus no host-visible memory type for display buffer bits=0x%x size=0x%llx\n",
                    reqs.memoryTypeBits, (unsigned long long)buffer_size);
@@ -1887,14 +1915,14 @@ yttrium_venus2_create_display_buffer(struct yttrium_venus *venus,
    if (out_memory_id)
       *out_memory_id = resource->memory_obj.id;
 
-   YTTRIUM_LOG("yttrium: Venus display buffer memory_id=%llu buffer_id=%llu size=0x%llx req_size=0x%llx type=%u flags=0x%x bits=0x%x\n",
+   YTTRIUM_LOG("yttrium: Venus display buffer memory_id=%llu buffer_id=%llu size=0x%llx req_size=0x%llx type=%u flags=0x%x bits=0x%x cpu_readback=%u\n",
                 (unsigned long long)resource->memory_obj.id,
                 (unsigned long long)resource->buffer_obj.id,
                 (unsigned long long)buffer_size,
                 (unsigned long long)reqs.size,
                 memory_type_index,
                 venus->memory_props.memoryTypes[memory_type_index].propertyFlags,
-                reqs.memoryTypeBits);
+                reqs.memoryTypeBits, resource->cpu_readback);
    return true;
 }
 
@@ -2074,6 +2102,8 @@ yttrium_venus2_create_bind_buffer(struct yttrium_venus *venus,
                                   VkBufferUsageFlags usage,
                                   uint64_t *out_memory_id)
 {
+   const bool exportable = out_memory_id != NULL;
+
    if (out_memory_id)
       *out_memory_id = 0;
 
@@ -2100,8 +2130,11 @@ yttrium_venus2_create_bind_buffer(struct yttrium_venus *venus,
 
    const VkDeviceSize buffer_size = MAX2((VkDeviceSize)allocation_size,
                                          (VkDeviceSize)1);
+   const VkExternalMemoryBufferCreateInfo external_buffer_info =
+      yttrium_venus_external_buffer_info();
    const VkBufferCreateInfo buffer_info = {
       .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .pNext = &external_buffer_info,
       .size = buffer_size,
       .usage = usage,
       .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
@@ -2125,7 +2158,8 @@ yttrium_venus2_create_bind_buffer(struct yttrium_venus *venus,
                                          resource->buffer, &reqs);
 
    /*
-    * Prefer HOST_CACHED as well as HOST_COHERENT.  virglrenderer derives the
+    * For exported buffers, prefer HOST_CACHED as well as HOST_COHERENT.
+    * virglrenderer derives the
     * blob's map_info from these very bits - `(coherent && cached) ? CACHED :
     * WC` in vkr_device_memory.c - and the guest maps the blob with whatever it
     * reports.  Without HOST_CACHED we are handed write-combined memory, where
@@ -2138,15 +2172,42 @@ yttrium_venus2_create_bind_buffer(struct yttrium_venus *venus,
     * Preferred, not required, so this degrades to the previous behaviour when
     * no such memory type exists.
     */
-   const uint32_t memory_type_index =
-      yttrium_venus_choose_memory_type(venus, reqs.memoryTypeBits,
-                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                                       VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+   uint32_t memory_type_index = UINT32_MAX;
+   if (exportable) {
+      memory_type_index =
+         yttrium_venus_choose_memory_type(
+            venus, reqs.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+            VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+   } else {
+      /*
+       * A private immutable draw buffer is populated through Vulkan transfer
+       * commands.  Prefer real VRAM and deliberately omit export metadata so
+       * RADV does not place it on the global external-memory BO list.
+       */
+      for (uint32_t i = 0; i < venus->memory_props.memoryTypeCount; i++) {
+         if (!(reqs.memoryTypeBits & (1u << i)))
+            continue;
+
+         const VkMemoryPropertyFlags flags =
+            venus->memory_props.memoryTypes[i].propertyFlags;
+         if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+             !(flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+            memory_type_index = i;
+            break;
+         }
+      }
+      if (memory_type_index == UINT32_MAX) {
+         memory_type_index = yttrium_venus_choose_memory_type(
+            venus, reqs.memoryTypeBits,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+      }
+   }
    if (memory_type_index == UINT32_MAX) {
-      YTTRIUM_LOG("yttrium: Venus no host-visible memory type for bind buffer bits=0x%x size=0x%llx usage=0x%x\n",
-                  reqs.memoryTypeBits, (unsigned long long)buffer_size,
-                  usage);
+      YTTRIUM_WARN("yttrium: Venus no compatible memory type for bind buffer bits=0x%x size=0x%llx usage=0x%x\n",
+                   reqs.memoryTypeBits, (unsigned long long)buffer_size,
+                   usage);
       vn_async_vkDestroyBuffer(&venus->vn_ring, venus->device_handle,
                                resource->buffer, NULL);
       memset(resource, 0, sizeof(*resource));
@@ -2161,7 +2222,7 @@ yttrium_venus2_create_bind_buffer(struct yttrium_venus *venus,
       yttrium_venus_export_memory_info();
    const VkMemoryAllocateInfo memory_info = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-      .pNext = &export_info,
+      .pNext = exportable ? &export_info : NULL,
       .allocationSize = MAX2(reqs.size, buffer_size),
       .memoryTypeIndex = memory_type_index,
    };
@@ -2169,12 +2230,12 @@ yttrium_venus2_create_bind_buffer(struct yttrium_venus *venus,
       vn_call_vkAllocateMemory(&venus->vn_ring, venus->device_handle,
                                &memory_info, NULL, &resource->memory);
    if (result != VK_SUCCESS) {
-      YTTRIUM_LOG("yttrium: Venus vkAllocateMemory bind buffer failed result=%d alloc_size=0x%llx type=%u bits=0x%x flags=0x%x usage=0x%x\n",
-                  result,
-                  (unsigned long long)memory_info.allocationSize,
-                  memory_type_index, reqs.memoryTypeBits,
-                  venus->memory_props.memoryTypes[memory_type_index].propertyFlags,
-                  usage);
+      YTTRIUM_WARN("yttrium: Venus vkAllocateMemory bind buffer failed result=%d alloc_size=0x%llx type=%u bits=0x%x flags=0x%x usage=0x%x\n",
+                   result,
+                   (unsigned long long)memory_info.allocationSize,
+                   memory_type_index, reqs.memoryTypeBits,
+                   venus->memory_props.memoryTypes[memory_type_index].propertyFlags,
+                   usage);
       vn_async_vkDestroyBuffer(&venus->vn_ring, venus->device_handle,
                                resource->buffer, NULL);
       memset(resource, 0, sizeof(*resource));
@@ -2186,10 +2247,10 @@ yttrium_venus2_create_bind_buffer(struct yttrium_venus *venus,
                                        resource->buffer,
                                        resource->memory, 0);
    if (result != VK_SUCCESS) {
-      YTTRIUM_LOG("yttrium: Venus vkBindBufferMemory bind buffer failed result=%d memory_id=%llu usage=0x%x\n",
-                  result,
-                  (unsigned long long)resource->memory_obj.id,
-                  usage);
+      YTTRIUM_WARN("yttrium: Venus vkBindBufferMemory bind buffer failed result=%d memory_id=%llu usage=0x%x\n",
+                   result,
+                   (unsigned long long)resource->memory_obj.id,
+                   usage);
       vn_async_vkFreeMemory(&venus->vn_ring, venus->device_handle,
                             resource->memory, NULL);
       vn_async_vkDestroyBuffer(&venus->vn_ring, venus->device_handle,
@@ -2205,7 +2266,7 @@ yttrium_venus2_create_bind_buffer(struct yttrium_venus *venus,
    resource->allocation_size = memory_info.allocationSize;
    resource->image_size = buffer_size;
 
-   if (venus->device_local_static_draw_buffers &&
+   if (exportable && venus->device_local_static_draw_buffers &&
        (usage & (VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT))) {
       yttrium_venus2_create_device_local_draw_mirror(
@@ -2215,14 +2276,6 @@ yttrium_venus2_create_bind_buffer(struct yttrium_venus *venus,
    if (out_memory_id)
       *out_memory_id = resource->memory_obj.id;
 
-   YTTRIUM_LOG("yttrium: Venus bind buffer memory_id=%llu buffer_id=%llu size=0x%llx req_size=0x%llx type=%u flags=0x%x bits=0x%x usage=0x%x\n",
-               (unsigned long long)resource->memory_obj.id,
-               (unsigned long long)resource->buffer_obj.id,
-               (unsigned long long)buffer_size,
-               (unsigned long long)reqs.size,
-               memory_type_index,
-               venus->memory_props.memoryTypes[memory_type_index].propertyFlags,
-               reqs.memoryTypeBits, usage);
    return true;
 }
 

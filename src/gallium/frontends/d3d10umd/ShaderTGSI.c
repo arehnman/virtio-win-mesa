@@ -230,6 +230,8 @@ static struct dx10_opcode_xlate opcode_xlate[D3D10_SB_NUM_OPCODES] = {
       D3D11_SB_OPCODE_GATHER4_PO,                    OF_FLOAT, TGSI_EXPAND},
    [D3D11_SB_OPCODE_GATHER4_PO_C] = {
       D3D11_SB_OPCODE_GATHER4_PO_C,                  OF_FLOAT, TGSI_EXPAND},
+   [D3D11_SB_OPCODE_EVAL_SAMPLE_INDEX] = {
+      D3D11_SB_OPCODE_EVAL_SAMPLE_INDEX,            OF_FLOAT, TGSI_EXPAND},
    [DX10_SM5_OPCODE_DCL_UAV_RAW] = {
       DX10_SM5_OPCODE_DCL_UAV_RAW,                   OF_UINT,  TGSI_EXPAND},
    [DX10_SM5_OPCODE_DCL_UAV_STRUCTURED] = {
@@ -355,6 +357,14 @@ struct Shader_resource {
    uint target;   /* TGSI_TEXTURE_x */
    uint structured_stride;
    bool raw;
+   uint8_t mixed_return_component_mask;
+   enum tgsi_return_type return_type[4];
+};
+
+struct Shader_sampler_binding_slot {
+   unsigned resource;
+   unsigned sampler;
+   enum tgsi_texture_type target;
    enum tgsi_return_type return_type[4];
 };
 
@@ -384,12 +394,18 @@ struct Shader_xlate {
    struct ureg_dst addrs[SHADER_MAX_ADDRS];
    struct Shader_resource resources[SHADER_MAX_RESOURCES];
    struct Shader_image images[SHADER_MAX_IMAGES];
+   uint8_t counter_image_slots[SHADER_MAX_IMAGES];
+   struct ureg_src counter_images[SHADER_MAX_IMAGES];
    struct Shader_tgsm tgsm[SHADER_MAX_TGSM];
    struct ureg_src shared_memory;
    bool shared_memory_declared;
    unsigned shared_memory_size;
    struct ureg_src sv[SHADER_MAX_RESOURCES];
    struct ureg_src samplers[SHADER_MAX_SAMPLERS];
+   struct pipe_shader_sampler_binding_map *sampler_binding_map;
+   struct Shader_sampler_binding_slot
+      sampler_binding_slots[SHADER_MAX_SAMPLERS];
+   unsigned sampler_binding_count;
    struct ureg_src imms;
    struct ureg_src prim_id;
    struct ureg_src gs_instance_id;
@@ -436,8 +452,23 @@ struct Shader_xlate {
 
    struct {
       struct ureg_dst reg[4];
+      struct ureg_dst gs_value;
+      struct ureg_dst gs_packed_output;
+      unsigned declared_mask;
+      unsigned gs_scalar_mask;
    } outputs[SHADER_MAX_OUTPUTS];
+   bool has_gs_scalar_outputs;
    unsigned tcs_tess_factor_writemask[SHADER_MAX_OUTPUTS];
+   unsigned tcs_tess_factor_range_first[SHADER_MAX_OUTPUTS];
+   unsigned tcs_tess_factor_range_end[SHADER_MAX_OUTPUTS];
+   struct {
+      const struct Shader_dst_operand *operand;
+      struct ureg_dst value;
+      struct ureg_dst index;
+      unsigned first;
+      unsigned end;
+   } tcs_indexed_output_stores[SHADER_MAX_DST_OPERANDS];
+   unsigned num_tcs_indexed_output_stores;
    const struct Shader_tessellation_io_signatures *tessellation_signatures;
    struct ureg_dst tcs_tess_outer;
    struct ureg_dst tcs_tess_inner;
@@ -474,6 +505,14 @@ struct Shader_xlate {
       unsigned remaining;
    } bufinfo_stride;
 };
+
+#define SHADER_TRANSLATION_UNSUPPORTED(sx, expr) \
+   do { \
+      if (expr) { \
+         LogUnsupported(__FILE__, __LINE__, __func__, #expr); \
+         (sx)->translation_failed = true; \
+      } \
+   } while (0)
 
 static uint
 translate_interpolation(D3D10_SB_INTERPOLATION_MODE interpolation)
@@ -514,11 +553,11 @@ translate_interpolation_location(D3D10_SB_INTERPOLATION_MODE interpolation)
 }
 
 static uint
-translate_system_name(D3D10_SB_NAME name)
+translate_system_name(struct Shader_xlate *sx, D3D10_SB_NAME name)
 {
    switch (name) {
    case D3D10_SB_NAME_UNDEFINED:
-      assert(0);                /* should not happen */
+      SHADER_TRANSLATION_UNSUPPORTED(sx, true);
       return TGSI_SEMANTIC_GENERIC;
    case D3D10_SB_NAME_POSITION:
       return TGSI_SEMANTIC_POSITION;
@@ -554,12 +593,9 @@ translate_system_name(D3D10_SB_NAME name)
    case DX11_SM5_NAME_FINAL_TRI_INSIDE_TESSFACTOR:
       return TGSI_SEMANTIC_TESSINNER;
    default:
-      LOG_UNSUPPORTED(true);
+      SHADER_TRANSLATION_UNSUPPORTED(sx, true);
       return TGSI_SEMANTIC_GENERIC;
    }
-
-   assert(0);
-   return TGSI_SEMANTIC_GENERIC;
 }
 
 static uint
@@ -595,7 +631,8 @@ translate_semantic_index(struct Shader_xlate *sx,
 }
 
 static enum tgsi_return_type
-trans_dcl_ret_type(D3D10_SB_RESOURCE_RETURN_TYPE d3drettype) {
+trans_dcl_ret_type(struct Shader_xlate *sx,
+                   D3D10_SB_RESOURCE_RETURN_TYPE d3drettype) {
    switch (d3drettype) {
    case D3D10_SB_RETURN_TYPE_UNORM:
       return TGSI_RETURN_TYPE_UNORM;
@@ -608,14 +645,25 @@ trans_dcl_ret_type(D3D10_SB_RESOURCE_RETURN_TYPE d3drettype) {
    case D3D10_SB_RETURN_TYPE_FLOAT:
       return TGSI_RETURN_TYPE_FLOAT;
    case D3D10_SB_RETURN_TYPE_MIXED:
+      /* MIXED means that the declaration does not provide a concrete
+       * component type.  TGSI has no typeless sampler-view return type;
+       * preserve the long-standing D3D10 UMD and DXVK-compatible float
+       * interpretation.  The declaration site emits a persistent warning
+       * once per resource instead of silently hiding the approximation.
+       */
+      return TGSI_RETURN_TYPE_FLOAT;
    default:
-      LOG_UNSUPPORTED(true);
+      YTTRIUM_WARN("yttrium: shader TGSI translation failed "
+                   "owner=d3d10umd-shader component=resource-return-type "
+                   "value=%u action=abort-translation\n", d3drettype);
+      SHADER_TRANSLATION_UNSUPPORTED(sx, true);
       return TGSI_RETURN_TYPE_FLOAT;
    }
 }
 
 static enum pipe_format
-trans_image_format(D3D10_SB_RESOURCE_RETURN_TYPE d3drettype)
+trans_image_format(struct Shader_xlate *sx,
+                   D3D10_SB_RESOURCE_RETURN_TYPE d3drettype)
 {
    switch (d3drettype) {
    /* The D3D declaration carries only the typed UAV return type; the bound
@@ -632,7 +680,7 @@ trans_image_format(D3D10_SB_RESOURCE_RETURN_TYPE d3drettype)
    case D3D10_SB_RETURN_TYPE_FLOAT:
       return PIPE_FORMAT_R32_FLOAT;
    default:
-      LOG_UNSUPPORTED(true);
+      SHADER_TRANSLATION_UNSUPPORTED(sx, true);
       return PIPE_FORMAT_R32_UINT;
    }
 }
@@ -728,6 +776,8 @@ dcl_base_output(struct Shader_xlate *sx,
       operand->base.index[operand->base.index_dim == 2 ? 1 : 0].imm;
    unsigned i;
 
+   sx->outputs[idx].declared_mask |= writemask ?
+      writemask : TGSI_WRITEMASK_XYZW;
    if (!writemask) {
       sx->outputs[idx].reg[0] = reg;
       sx->outputs[idx].reg[1] = reg;
@@ -740,6 +790,80 @@ dcl_base_output(struct Shader_xlate *sx,
       unsigned mask = 1 << i;
       if ((writemask & mask)) {
          sx->outputs[idx].reg[i] = reg;
+      }
+   }
+}
+
+static void
+dcl_gs_scalar_output(struct Shader_xlate *sx,
+                     const struct Shader_dst_operand *operand)
+{
+   const unsigned output = operand->base.index[0].imm;
+   const unsigned mask =
+      operand->mask >> D3D10_SB_OPERAND_4_COMPONENT_MASK_SHIFT;
+
+   if (util_bitcount(mask) != 1) {
+      YTTRIUM_WARN("yttrium: shader TGSI translation failed "
+                   "owner=d3d10umd-shader component=gs-scalar-output "
+                   "reason=invalid-declaration-mask output=%u mask=%x "
+                   "action=abort-translation\n", output, mask);
+      sx->translation_failed = true;
+      return;
+   }
+
+   /* D3D can pack a scalar system value beside generic components in one
+    * output register. Keep that complete register in a temporary so even a
+    * single instruction writing both semantics retains its original mask.
+    * TGSI requires LAYER, VIEWPORT_INDEX and PRIMID in separate outputs' X.
+    */
+   if (!sx->outputs[output].gs_scalar_mask) {
+      sx->outputs[output].gs_value = ureg_DECL_temporary(sx->ureg);
+      /* SO declarations address whole D3D registers and retain their D3D
+       * component masks. Mirror the packed value in the existing GENERIC
+       * semantic for this D3D register (or declare it for a scalar-only
+       * register), separately from the canonical scalar system outputs.
+       */
+      sx->outputs[output].gs_packed_output =
+         ureg_DECL_output(sx->ureg, TGSI_SEMANTIC_GENERIC, output);
+   }
+   sx->outputs[output].gs_scalar_mask |= mask;
+   sx->has_gs_scalar_outputs = true;
+}
+
+static bool
+is_gs_scalar_output_name(D3D10_SB_NAME name)
+{
+   return name == D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX ||
+          name == D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX ||
+          name == D3D10_SB_NAME_PRIMITIVE_ID;
+}
+
+static void
+emit_gs_scalar_output_stores(struct Shader_xlate *sx)
+{
+   if (!sx->has_gs_scalar_outputs)
+      return;
+
+   for (unsigned output = 0; output < SHADER_MAX_OUTPUTS; ++output) {
+      const unsigned scalar_mask = sx->outputs[output].gs_scalar_mask;
+      if (!scalar_mask)
+         continue;
+
+      ureg_MOV(sx->ureg,
+               ureg_writemask(sx->outputs[output].gs_packed_output,
+                              sx->outputs[output].declared_mask),
+               ureg_src(sx->outputs[output].gs_value));
+      for (unsigned component = 0; component < 4; ++component) {
+         const struct ureg_dst dst = sx->outputs[output].reg[component];
+         if (ureg_dst_is_undef(dst) ||
+             dst.Index == sx->outputs[output].gs_packed_output.Index)
+            continue;
+
+         const unsigned mask = scalar_mask & (1u << component) ?
+            TGSI_WRITEMASK_X : 1u << component;
+         ureg_MOV(sx->ureg, ureg_writemask(dst, mask),
+                  ureg_scalar(ureg_src(sx->outputs[output].gs_value),
+                               component));
       }
    }
 }
@@ -807,15 +931,15 @@ dcl_input_index_range(struct Shader_xlate *sx,
    if (dst->base.type != D3D10_SB_OPERAND_TYPE_INPUT ||
        dst->base.index_dim != 1 ||
        dst->base.index[0].index_rep != D3D10_SB_OPERAND_INDEX_IMMEDIATE32) {
-      LOG_UNSUPPORTED(true);
+      SHADER_TRANSLATION_UNSUPPORTED(sx, true);
       return;
    }
 
    first = dst->base.index[0].imm;
    count = opcode->specific.index_range_count;
    if (!count || first >= SHADER_MAX_INPUTS ||
-       first + count > SHADER_MAX_INPUTS) {
-      LOG_UNSUPPORTED(true);
+       count > SHADER_MAX_INPUTS - first) {
+      SHADER_TRANSLATION_UNSUPPORTED(sx, true);
       return;
    }
 
@@ -827,13 +951,50 @@ dcl_input_index_range(struct Shader_xlate *sx,
    }
 
    if (sx->num_input_ranges >= SHADER_MAX_INPUTS) {
-      LOG_UNSUPPORTED(true);
+      SHADER_TRANSLATION_UNSUPPORTED(sx, true);
       return;
    }
 
    sx->input_ranges[sx->num_input_ranges].first = first;
    sx->input_ranges[sx->num_input_ranges].count = count;
    sx->num_input_ranges++;
+}
+
+static void
+dcl_tcs_tess_factor_index_range(struct Shader_xlate *sx,
+                                 const struct Shader_opcode *opcode)
+{
+   const struct Shader_dst_operand *dst = &opcode->dst[0];
+   if (!sx->is_tcs || !sx->tcs_patch_phase_active ||
+       dst->base.type != D3D10_SB_OPERAND_TYPE_OUTPUT ||
+       dst->base.index_dim != 1 ||
+       dst->base.index[0].index_rep != D3D10_SB_OPERAND_INDEX_IMMEDIATE32 ||
+       dst->mask != D3D10_SB_OPERAND_4_COMPONENT_MASK_X) {
+      SHADER_TRANSLATION_UNSUPPORTED(sx, true);
+      return;
+   }
+
+   const unsigned first = dst->base.index[0].imm;
+   const unsigned count = opcode->specific.index_range_count;
+   if (!count || first >= SHADER_MAX_OUTPUTS ||
+       count > SHADER_MAX_OUTPUTS - first) {
+      SHADER_TRANSLATION_UNSUPPORTED(sx, true);
+      return;
+   }
+
+   /* D3D scalar tessellation-factor registers are packed into components
+    * of TGSI TESSOUTER/TESSINNER, not consecutive TGSI output registers.
+    */
+   for (unsigned i = first; i < first + count; ++i) {
+      if (!sx->tcs_tess_factor_writemask[i]) {
+         SHADER_TRANSLATION_UNSUPPORTED(sx, true);
+         return;
+      }
+   }
+   for (unsigned i = first; i < first + count; ++i) {
+      sx->tcs_tess_factor_range_first[i] = first;
+      sx->tcs_tess_factor_range_end[i] = first + count;
+   }
 }
 
 static void
@@ -1020,8 +1181,8 @@ dcl_tess_input(struct Shader_xlate *sx,
          ureg_DECL_input(ureg,
                          system_value == D3D10_SB_NAME_UNDEFINED ?
                             TGSI_SEMANTIC_GENERIC :
-                            translate_system_name(system_value),
-                         semantic_index, 1, sx->vertices_in);
+                            translate_system_name(sx, system_value),
+                         semantic_index, 0, 1);
       dcl_base_input(sx, ureg, dst, reg, input, system_value);
    }
 }
@@ -1056,7 +1217,7 @@ dcl_tcs_output(struct Shader_xlate *sx,
    enum tgsi_semantic semantic =
       sx->tcs_patch_phase_active ? TGSI_SEMANTIC_PATCH :
       system_value == D3D10_SB_NAME_UNDEFINED ?
-         TGSI_SEMANTIC_GENERIC : translate_system_name(system_value);
+         TGSI_SEMANTIC_GENERIC : translate_system_name(sx, system_value);
    unsigned semantic_index = output;
    if (system_value == D3D10_SB_NAME_CLIP_DISTANCE ||
        system_value == D3D10_SB_NAME_CULL_DISTANCE) {
@@ -1094,6 +1255,45 @@ tcs_tess_factor_writemask(D3D10_SB_NAME name)
 }
 
 static void
+dcl_tes_tess_factor_input(struct Shader_xlate *sx,
+                          struct ureg_program *ureg,
+                          const struct Shader_dst_operand *dst,
+                          D3D10_SB_NAME name)
+{
+   const unsigned component_mask = tcs_tess_factor_writemask(name);
+   const unsigned input_mask =
+      dst->mask >> D3D10_SB_OPERAND_4_COMPONENT_MASK_SHIFT;
+
+   if (dst->base.type != DX11_SM5_OPERAND_TYPE_INPUT_PATCH_CONSTANT ||
+       dst->base.index_dim != 1 ||
+       dst->base.index[0].index_rep != D3D10_SB_OPERAND_INDEX_IMMEDIATE32 ||
+       dst->base.index[0].imm >= SHADER_MAX_INPUTS ||
+       !component_mask || util_bitcount(input_mask) != 1) {
+      tessellation_translation_unsupported(
+         sx, "invalid-tessellation-factor-input-declaration");
+      return;
+   }
+
+   const unsigned input = dst->base.index[0].imm;
+   if (sx->patch_inputs[input].declared) {
+      tessellation_translation_unsupported(
+         sx, "overlapping-tessellation-factor-input-declaration");
+      return;
+   }
+
+   /* D3D declares each factor in a separate scalar patch register. TGSI packs
+    * them into TESSOUTER/TESSINNER vectors, using the same component mapping
+    * as hull outputs. Keep these separate from per-control-point inputs:
+    * vpc0 and vicp[vertex][0] are different input namespaces.
+    */
+   struct ureg_src reg =
+      ureg_DECL_input(ureg, translate_system_name(sx, name), 0, 0, 1);
+   sx->patch_inputs[input].reg =
+      ureg_scalar(reg, ffs(component_mask) - 1);
+   sx->patch_inputs[input].declared = true;
+}
+
+static void
 dcl_tcs_tess_factor_output(struct Shader_xlate *sx,
                            struct ureg_program *ureg,
                            const struct Shader_dst_operand *dst,
@@ -1101,7 +1301,7 @@ dcl_tcs_tess_factor_output(struct Shader_xlate *sx,
 {
    const unsigned writemask = tcs_tess_factor_writemask(name);
    const bool inner =
-      translate_system_name(name) == TGSI_SEMANTIC_TESSINNER;
+      translate_system_name(sx, name) == TGSI_SEMANTIC_TESSINNER;
    struct ureg_dst reg;
 
    if (dst->base.index_dim != 1 || !writemask) {
@@ -1287,10 +1487,10 @@ tcs_emit_implicit_control_point_passthrough(struct Shader_xlate *sx,
          signatures->output_system_values[i];
       enum tgsi_semantic input_semantic =
          input_name == D3D10_SB_NAME_UNDEFINED ?
-            TGSI_SEMANTIC_GENERIC : translate_system_name(input_name);
+            TGSI_SEMANTIC_GENERIC : translate_system_name(sx, input_name);
       enum tgsi_semantic output_semantic =
          output_name == D3D10_SB_NAME_UNDEFINED ?
-            TGSI_SEMANTIC_GENERIC : translate_system_name(output_name);
+            TGSI_SEMANTIC_GENERIC : translate_system_name(sx, output_name);
       unsigned input_index = i;
       unsigned output_index = i;
       if (input_name == D3D10_SB_NAME_CLIP_DISTANCE ||
@@ -1303,9 +1503,11 @@ tcs_emit_implicit_control_point_passthrough(struct Shader_xlate *sx,
          output_index = tessellation_clip_distance_semantic_index(
             signatures, true, i);
       }
+      /* Control points use the source dimension, not a register array.
+       * TGSI-to-NIR adds the per-vertex array for tessellation inputs.
+       */
       struct ureg_src input =
-         ureg_DECL_input(ureg, input_semantic, input_index,
-                         1, sx->vertices_in);
+         ureg_DECL_input(ureg, input_semantic, input_index, 0, 1);
       struct ureg_dst output =
          ureg_DECL_output(ureg, output_semantic, output_index);
       ureg_MOV(ureg, ureg_writemask(output, writemask),
@@ -1324,7 +1526,8 @@ dcl_sgv_input(struct Shader_xlate *sx,
    assert(dst->base.index_dim == 1);
    assert(dst->base.index[0].imm < SHADER_MAX_INPUTS);
 
-   reg = ureg_DECL_system_value(ureg, translate_system_name(dcl_siv_name), 0);
+   reg = ureg_DECL_system_value(
+      ureg, translate_system_name(sx, dcl_siv_name), 0);
 
    dcl_base_input(sx, ureg, dst, reg, dst->base.index[0].imm,
                   dcl_siv_name);
@@ -1343,7 +1546,7 @@ dcl_siv_input(struct Shader_xlate *sx,
    declare_vertices_in(sx, dst->base.index[0].imm);
 
    reg = ureg_DECL_input(ureg,
-                         translate_system_name(dcl_siv_name), 0,
+                         translate_system_name(sx, dcl_siv_name), 0,
                          0, 1);
 
    dcl_base_input(sx, ureg, dst, reg, dst->base.index[1].imm,
@@ -1413,11 +1616,11 @@ dcl_ps_sgv_input(struct Shader_xlate *sx,
    if (dcl_siv_name == D3D10_SB_NAME_POSITION ||
        dcl_siv_name == D3D10_SB_NAME_SAMPLE_INDEX) {
       reg = ureg_DECL_system_value(ureg,
-                                   translate_system_name(dcl_siv_name),
+                                   translate_system_name(sx, dcl_siv_name),
                                    0);
    } else {
       reg = ureg_DECL_fs_input(ureg,
-                               translate_system_name(dcl_siv_name),
+                               translate_system_name(sx, dcl_siv_name),
                                0,
                                TGSI_INTERPOLATE_CONSTANT);
    }
@@ -1464,11 +1667,11 @@ dcl_ps_siv_input(struct Shader_xlate *sx,
    if (dcl_siv_name == D3D10_SB_NAME_POSITION ||
        dcl_siv_name == D3D10_SB_NAME_SAMPLE_INDEX) {
       reg = ureg_DECL_system_value(ureg,
-                                   translate_system_name(dcl_siv_name),
+                                   translate_system_name(sx, dcl_siv_name),
                                    0);
    } else {
       reg = ureg_DECL_fs_input_centroid(ureg,
-                                        translate_system_name(dcl_siv_name),
+                                        translate_system_name(sx, dcl_siv_name),
                                         0,
                                         translate_interpolation(
                                            dcl_in_ps_interp),
@@ -1724,7 +1927,7 @@ translate_relative_operand_src(struct Shader_xlate *sx,
    case D3D10_SB_OPERAND_TYPE_NULL:
    case D3D10_SB_OPERAND_TYPE_RASTERIZER:
    case D3D10_SB_OPERAND_TYPE_OUTPUT_COVERAGE_MASK:
-      LOG_UNSUPPORTED(true);
+      SHADER_TRANSLATION_UNSUPPORTED(sx, true);
       reg = ureg_src(ureg_DECL_temporary(sx->ureg));
       break;
 
@@ -1783,6 +1986,91 @@ find_input_index_range(struct Shader_xlate *sx,
    return false;
 }
 
+static void
+prepare_tcs_indexed_output_stores(struct Shader_xlate *sx,
+                                   const struct Shader_opcode *opcode)
+{
+   assert(!sx->num_tcs_indexed_output_stores);
+   if (!sx->is_tcs || !sx->tcs_patch_phase_active)
+      return;
+
+   for (unsigned i = 0; i < opcode->num_dst; ++i) {
+      const struct Shader_dst_operand *dst = &opcode->dst[i];
+      if (dst->base.type != D3D10_SB_OPERAND_TYPE_OUTPUT ||
+          dst->base.index_dim != 1)
+         continue;
+
+      const struct Shader_index *index = &dst->base.index[0];
+      if (index->index_rep != D3D10_SB_OPERAND_INDEX_RELATIVE &&
+          index->index_rep != D3D10_SB_OPERAND_INDEX_IMMEDIATE32_PLUS_RELATIVE)
+         continue;
+
+      const unsigned base =
+         index->index_rep == D3D10_SB_OPERAND_INDEX_RELATIVE ? 0 : index->imm;
+      if (base >= SHADER_MAX_OUTPUTS ||
+          sx->tcs_tess_factor_range_end[base] <= base ||
+          dst->mask != D3D10_SB_OPERAND_4_COMPONENT_MASK_X) {
+         SHADER_TRANSLATION_UNSUPPORTED(sx, true);
+         return;
+      }
+
+      const unsigned slot = sx->num_tcs_indexed_output_stores++;
+      sx->tcs_indexed_output_stores[slot].operand = dst;
+      sx->tcs_indexed_output_stores[slot].first =
+         sx->tcs_tess_factor_range_first[base];
+      sx->tcs_indexed_output_stores[slot].end =
+         sx->tcs_tess_factor_range_end[base];
+      sx->tcs_indexed_output_stores[slot].value =
+         ureg_DECL_temporary(sx->ureg);
+      sx->tcs_indexed_output_stores[slot].index =
+         ureg_DECL_temporary(sx->ureg);
+
+      /* Snapshot all indices before executing a multi-destination opcode:
+       * another destination may overwrite the register holding an index.
+       */
+      ureg_UADD(sx->ureg,
+                ureg_writemask(sx->tcs_indexed_output_stores[slot].index,
+                               TGSI_WRITEMASK_X),
+                translate_relative_operand_src(sx, &index->rel),
+                ureg_imm1u(sx->ureg, base));
+   }
+}
+
+static void
+emit_tcs_indexed_output_stores(struct Shader_xlate *sx)
+{
+   if (!sx->num_tcs_indexed_output_stores)
+      return;
+
+   struct ureg_program *ureg = sx->ureg;
+   struct ureg_dst predicate = ureg_DECL_temporary(ureg);
+   for (unsigned slot = 0; slot < sx->num_tcs_indexed_output_stores; ++slot) {
+      const unsigned first = sx->tcs_indexed_output_stores[slot].first;
+      const unsigned end = sx->tcs_indexed_output_stores[slot].end;
+      const struct ureg_src index = ureg_scalar(
+         ureg_src(sx->tcs_indexed_output_stores[slot].index), TGSI_SWIZZLE_X);
+      const struct ureg_src value = ureg_scalar(
+         ureg_src(sx->tcs_indexed_output_stores[slot].value), TGSI_SWIZZLE_X);
+
+      for (unsigned output = first; output < end; ++output) {
+         unsigned label = 0;
+         ureg_USEQ(ureg, ureg_writemask(predicate, TGSI_WRITEMASK_X),
+                    index, ureg_imm1u(ureg, output));
+         ureg_UIF(ureg, ureg_scalar(ureg_src(predicate), TGSI_SWIZZLE_X),
+                   &label);
+         ureg_MOV(ureg,
+                  ureg_writemask(sx->outputs[output].reg[0],
+                                 sx->tcs_tess_factor_writemask[output]),
+                  value);
+         ureg_ENDIF(ureg);
+      }
+      ureg_release_temporary(ureg, sx->tcs_indexed_output_stores[slot].index);
+      ureg_release_temporary(ureg, sx->tcs_indexed_output_stores[slot].value);
+   }
+   ureg_release_temporary(ureg, predicate);
+   sx->num_tcs_indexed_output_stores = 0;
+}
+
 static struct ureg_src
 translate_indexed_input(struct Shader_xlate *sx,
                         uint base,
@@ -1795,7 +2083,7 @@ translate_indexed_input(struct Shader_xlate *sx,
    assert(base < SHADER_MAX_INPUTS);
 
    if (!find_input_index_range(sx, base, &count)) {
-      LOG_UNSUPPORTED(true);
+      SHADER_TRANSLATION_UNSUPPORTED(sx, true);
       return sx->inputs[base].reg;
    }
 
@@ -1808,7 +2096,7 @@ translate_indexed_input(struct Shader_xlate *sx,
    ureg_MOV(ureg, selected, sx->inputs[base].reg);
    for (uint i = 1; i < count; i++) {
       if (!sx->inputs[base + i].declared) {
-         LOG_UNSUPPORTED(true);
+         SHADER_TRANSLATION_UNSUPPORTED(sx, true);
          continue;
       }
 
@@ -1846,7 +2134,9 @@ translate_operand(struct Shader_xlate *sx,
       if (index->index_rep == D3D10_SB_OPERAND_INDEX_IMMEDIATE32) {
          unsigned output = index->imm;
          assert(output < SHADER_MAX_OUTPUTS);
-         if (!writemask) {
+         if (sx->outputs[output].gs_scalar_mask) {
+            reg = sx->outputs[output].gs_value;
+         } else if (!writemask) {
             reg = sx->outputs[output].reg[0];
          } else {
             unsigned i;
@@ -1863,6 +2153,15 @@ translate_operand(struct Shader_xlate *sx,
       } else if (index->index_rep == D3D10_SB_OPERAND_INDEX_RELATIVE ||
                  index->index_rep ==
                     D3D10_SB_OPERAND_INDEX_IMMEDIATE32_PLUS_RELATIVE) {
+         if (sx->has_gs_scalar_outputs) {
+            YTTRIUM_WARN("yttrium: shader TGSI translation failed "
+                         "owner=d3d10umd-shader component=gs-scalar-output "
+                         "reason=indexed-output-access "
+                         "action=abort-translation\n");
+            sx->translation_failed = true;
+            reg = ureg_DECL_temporary(sx->ureg);
+            break;
+         }
          unsigned output =
             index->index_rep == D3D10_SB_OPERAND_INDEX_RELATIVE ?
                0 : index->imm;
@@ -1871,7 +2170,7 @@ translate_operand(struct Shader_xlate *sx,
             translate_relative_operand(sx, &index->rel);
          reg = ureg_dst_indirect(sx->outputs[output].reg[0], addr);
       } else {
-         LOG_UNSUPPORTED(true);
+         SHADER_TRANSLATION_UNSUPPORTED(sx, true);
          reg = ureg_DECL_temporary(sx->ureg);
       }
 
@@ -1890,7 +2189,7 @@ translate_operand(struct Shader_xlate *sx,
                operand->index[0].imm);
             break;
          default:
-            LOG_UNSUPPORTED(true);
+            SHADER_TRANSLATION_UNSUPPORTED(sx, true);
             break;
          }
       }
@@ -1931,7 +2230,7 @@ translate_operand(struct Shader_xlate *sx,
    default:
       /* XXX: Translate more operands types.
        */
-      LOG_UNSUPPORTED(true);
+      SHADER_TRANSLATION_UNSUPPORTED(sx, true);
       reg = ureg_DECL_temporary(sx->ureg);
    }
 
@@ -1967,7 +2266,7 @@ translate_indexable_temp(struct Shader_xlate *sx,
    default:
       /* XXX: Other index representations.
        */
-      LOG_UNSUPPORTED(true);
+      SHADER_TRANSLATION_UNSUPPORTED(sx, true);
       reg = ureg_src(ureg_DECL_temporary(sx->ureg));
    }
    return reg;
@@ -1987,6 +2286,14 @@ translate_dst_operand(struct Shader_xlate *sx,
    assert((D3D10_SB_OPERAND_4_COMPONENT_MASK_Y >> 4) == TGSI_WRITEMASK_Y);
    assert((D3D10_SB_OPERAND_4_COMPONENT_MASK_Z >> 4) == TGSI_WRITEMASK_Z);
    assert((D3D10_SB_OPERAND_4_COMPONENT_MASK_W >> 4) == TGSI_WRITEMASK_W);
+
+   for (unsigned i = 0; i < sx->num_tcs_indexed_output_stores; ++i) {
+      if (sx->tcs_indexed_output_stores[i].operand == operand) {
+         reg = ureg_writemask(sx->tcs_indexed_output_stores[i].value,
+                              writemask);
+         return saturate ? ureg_saturate(reg) : reg;
+      }
+   }
 
    if (operand->base.type == D3D10_SB_OPERAND_TYPE_OUTPUT &&
        operand->base.index_dim == 1 &&
@@ -2142,7 +2449,7 @@ translate_src_operand(struct Shader_xlate *sx,
         default:
            /* XXX: Other index representations.
             */
-            LOG_UNSUPPORTED(true);
+            SHADER_TRANSLATION_UNSUPPORTED(sx, true);
             /* Ensure reg is initialized even for unsupported index reps. */
             reg = ureg_src(ureg_DECL_temporary(sx->ureg));
 
@@ -2170,7 +2477,7 @@ translate_src_operand(struct Shader_xlate *sx,
         default:
            /* XXX: Other index representations.
             */
-            LOG_UNSUPPORTED(true);
+            SHADER_TRANSLATION_UNSUPPORTED(sx, true);
             /* Ensure reg is initialized even for unsupported index reps. */
             reg = ureg_src(ureg_DECL_temporary(sx->ureg));
          }
@@ -2194,7 +2501,7 @@ translate_src_operand(struct Shader_xlate *sx,
         default:
            /* XXX: Other index representations.
             */
-            LOG_UNSUPPORTED(true);
+            SHADER_TRANSLATION_UNSUPPORTED(sx, true);
             /* Ensure reg is initialized even for unsupported index reps. */
             reg = ureg_src(ureg_DECL_temporary(sx->ureg));
          }
@@ -2329,7 +2636,7 @@ translate_src_operand(struct Shader_xlate *sx,
       default:
          /* XXX: Other index representations.
           */
-         LOG_UNSUPPORTED(true);
+         SHADER_TRANSLATION_UNSUPPORTED(sx, true);
          /* Ensure reg is initialized even for unsupported index reps. */
          reg = ureg_src(ureg_DECL_temporary(sx->ureg));
       }
@@ -2355,7 +2662,7 @@ translate_src_operand(struct Shader_xlate *sx,
       default:
          /* XXX: Other index representations.
           */
-         LOG_UNSUPPORTED(true);
+         SHADER_TRANSLATION_UNSUPPORTED(sx, true);
          /* Ensure reg is initialized even for unsupported index reps. */
          reg = ureg_src(ureg_DECL_temporary(sx->ureg));
       }
@@ -2399,6 +2706,145 @@ translate_src_operand(struct Shader_xlate *sx,
 }
 
 static struct ureg_src
+declare_compact_sampler_for_resource(struct Shader_xlate *sx,
+                                     unsigned resource,
+                                     unsigned sampler,
+                                     enum tgsi_texture_type target,
+                                     unsigned *binding_slot);
+
+static bool
+translate_binding_operand_index(struct Shader_xlate *sx,
+                                const struct Shader_src_operand *operand,
+                                unsigned expected_type,
+                                unsigned limit,
+                                const char *role,
+                                unsigned *index)
+{
+   if (!operand || !index || operand->base.type != expected_type ||
+       operand->base.index_dim != 1 ||
+       operand->base.index[0].index_rep !=
+          D3D10_SB_OPERAND_INDEX_IMMEDIATE32 ||
+       operand->base.index[0].imm >= limit) {
+      YTTRIUM_WARN("yttrium: shader TGSI translation failed "
+                   "owner=d3d10umd-shader component=sampler-binding-map "
+                   "reason=invalid-binding-operand role=%s type=%u "
+                   "index_dim=%u action=abort-translation\n",
+                   role ? role : "unknown",
+                   operand ? operand->base.type : ~0u,
+                   operand ? operand->base.index_dim : 0);
+      sx->translation_failed = true;
+      return false;
+   }
+
+   *index = operand->base.index[0].imm;
+   return true;
+}
+
+static struct ureg_src
+declare_compact_sampler_for_resource(struct Shader_xlate *sx,
+                                     unsigned resource,
+                                     unsigned sampler,
+                                     enum tgsi_texture_type target,
+                                     unsigned *binding_slot)
+{
+   const unsigned sampler_none = PIPE_MAX_SAMPLERS;
+   unsigned slot = PIPE_MAX_SAMPLERS;
+
+   assert(sx->sampler_binding_map);
+   assert(resource < SHADER_MAX_RESOURCES);
+   assert(sampler <= sampler_none);
+
+   for (unsigned i = 0; i < sx->sampler_binding_count; i++) {
+      const struct Shader_sampler_binding_slot *binding =
+         &sx->sampler_binding_slots[i];
+      bool same_view = binding->resource == resource &&
+                       binding->target == target;
+      for (unsigned component = 0; same_view && component < 4; component++)
+         same_view = binding->return_type[component] ==
+                     sx->resources[resource].return_type[component];
+      if (!same_view)
+         continue;
+
+      if (sampler == sampler_none || binding->sampler == sampler) {
+         slot = i;
+         break;
+      }
+
+      if (binding->sampler == sampler_none) {
+         sx->sampler_binding_slots[i].sampler = sampler;
+         sx->sampler_binding_map->sampler_state_index[i] = (uint8_t)sampler;
+         slot = i;
+         break;
+      }
+   }
+
+   if (slot == PIPE_MAX_SAMPLERS) {
+      if (sx->sampler_binding_count >= PIPE_MAX_SAMPLERS) {
+         YTTRIUM_WARN("yttrium: shader TGSI translation failed "
+                      "owner=d3d10umd-shader component=sampler-binding-map "
+                      "reason=combined-slot-limit resource=%u sampler=%u "
+                      "target=%u slots=%u action=abort-translation\n",
+                      resource, sampler, target,
+                      sx->sampler_binding_count);
+         sx->translation_failed = true;
+         slot = 0;
+      } else {
+         slot = sx->sampler_binding_count++;
+         struct Shader_sampler_binding_slot *binding =
+            &sx->sampler_binding_slots[slot];
+         binding->resource = resource;
+         binding->sampler = sampler;
+         binding->target = target;
+         memcpy(binding->return_type, sx->resources[resource].return_type,
+                sizeof(binding->return_type));
+
+         sx->sampler_binding_map->valid_mask |= 1u << slot;
+         sx->sampler_binding_map->sampler_view_index[slot] =
+            (uint8_t)resource;
+         sx->sampler_binding_map->sampler_state_index[slot] =
+            (uint8_t)sampler;
+      }
+   }
+
+   if (target == TGSI_TEXTURE_BUFFER &&
+       sx->resources[resource].mixed_return_component_mask ==
+          TGSI_WRITEMASK_XYZW)
+      sx->sampler_binding_map->mixed_return_mask |= 1u << slot;
+
+   if (ureg_src_is_undef(sx->samplers[slot]))
+      sx->samplers[slot] = ureg_DECL_sampler(sx->ureg, slot);
+   declare_sampler_view_for_resource(sx, slot, resource, target);
+   if (binding_slot)
+      *binding_slot = slot;
+   return sx->samplers[slot];
+}
+
+static struct ureg_src
+compact_sampler_view_src(struct Shader_xlate *sx,
+                         unsigned slot,
+                         const struct Shader_src_operand *operand)
+{
+   assert(slot < SHADER_MAX_SAMPLERS);
+   assert(!ureg_src_is_undef(sx->sv[slot]));
+
+   struct ureg_src view = sx->sv[slot];
+   if (operand) {
+      view = ureg_swizzle(view,
+                          operand->swizzle[0], operand->swizzle[1],
+                          operand->swizzle[2], operand->swizzle[3]);
+      if (operand->modifier != D3D10_SB_OPERAND_MODIFIER_NONE) {
+         YTTRIUM_WARN("yttrium: shader TGSI translation failed "
+                      "owner=d3d10umd-shader component=sampler-binding-map "
+                      "reason=modified-resource-operand slot=%u "
+                      "action=abort-translation\n",
+                      slot);
+         sx->translation_failed = true;
+      }
+   }
+   return view;
+}
+
+static struct ureg_src
 translate_old_tex_sampler_for_resource(struct Shader_xlate *sx, unsigned resource,
                                        const struct Shader_src_operand *sampler)
 {
@@ -2406,8 +2852,32 @@ translate_old_tex_sampler_for_resource(struct Shader_xlate *sx, unsigned resourc
 
    assert(resource < SHADER_MAX_RESOURCES);
 
+   if (sx->sampler_binding_map) {
+      unsigned sampler_index;
+      if (!translate_binding_operand_index(
+             sx, sampler, D3D10_SB_OPERAND_TYPE_SAMPLER,
+             SHADER_MAX_SAMPLERS, "sampler", &sampler_index)) {
+         return declare_compact_sampler_for_resource(
+            sx, resource, PIPE_MAX_SAMPLERS,
+            (enum tgsi_texture_type)sx->resources[resource].target, NULL);
+      }
+
+      return declare_compact_sampler_for_resource(
+         sx, resource, sampler_index,
+         (enum tgsi_texture_type)sx->resources[resource].target, NULL);
+   }
+
    if (resource >= SHADER_MAX_SAMPLERS) {
-      LOG_UNSUPPORTED(true);
+      const unsigned sampler_index =
+         sampler->base.index_dim == 1 &&
+         sampler->base.index[0].index_rep ==
+            D3D10_SB_OPERAND_INDEX_IMMEDIATE32 ?
+               sampler->base.index[0].imm : ~0u;
+      YTTRIUM_WARN("yttrium: shader TGSI compatibility path "
+                   "owner=d3d10umd-shader operation=legacy-texture-sample "
+                   "resource=%u sampler=%u reason=resource-exceeds-legacy-"
+                   "combined-sampler-range action=continue\n",
+                   resource, sampler_index);
       translated_sampler = translate_src_operand(sx, sampler, OF_FLOAT);
    } else {
       if (ureg_src_is_undef(sx->samplers[resource])) {
@@ -2714,7 +3184,8 @@ image_buffer_load_dwords_ureg_emit(struct ureg_program *ureg,
                                    struct ureg_src coord,
                                    enum tgsi_texture_type target,
                                    enum pipe_format format,
-                                   unsigned component_stride)
+                                   unsigned component_stride,
+                                   const D3D10_SB_4_COMPONENT_NAME *swizzle)
 {
    struct ureg_dst base = ureg_DECL_temporary(ureg);
    struct ureg_dst fetch_coord = ureg_DECL_temporary(ureg);
@@ -2730,10 +3201,13 @@ image_buffer_load_dwords_ureg_emit(struct ureg_program *ureg,
       if (scalar_dst.WriteMask == TGSI_WRITEMASK_NONE)
          continue;
 
-      if (chan) {
+      /* The destination mask selects registers to write, not DWORDs to read:
+       * ld_structured r0.y, ..., u0.xxxx still loads source component X. */
+      const unsigned component = swizzle ? swizzle[chan] : chan;
+      if (component) {
          ureg_UADD(ureg, fetch_coord,
                    ureg_scalar(ureg_src(base), TGSI_SWIZZLE_X),
-                   ureg_imm1u(ureg, chan * component_stride));
+                   ureg_imm1u(ureg, component * component_stride));
       } else {
          ureg_MOV(ureg, fetch_coord,
                   ureg_scalar(ureg_src(base), TGSI_SWIZZLE_X));
@@ -3109,6 +3583,150 @@ emit_tessellation_properties(
    }
 }
 
+/*
+ * The stage output signature is the union of the registers used by all
+ * shaders which share that signature.  A particular shader may therefore
+ * omit declarations which are nevertheless named by a tokenless
+ * geometry-shader stream-output declaration.
+ *
+ * Yttrium translates D3D output registers to packed TGSI output registers,
+ * so it cannot ignore that union the way hardware with an identity register
+ * layout can.  Declare every generic signature output before translating the
+ * bytecode.  This gives all shaders sharing the signature the same packed
+ * layout, and leaves signature-only values undefined as required.  System
+ * outputs are deliberately left to their real bytecode declarations because
+ * several of them have stage-specific side effects or packing rules.
+ */
+static bool
+dcl_stage_signature_generic_outputs(
+   struct ureg_program *ureg,
+   unsigned *output_mapping,
+   const D3D10DDIARG_STAGE_IO_SIGNATURES *signatures)
+{
+   if (!signatures || !output_mapping)
+      return true;
+
+   if (signatures->NumOutputSignatureEntries &&
+       !signatures->pOutputSignature) {
+      YTTRIUM_WARN("yttrium: shader TGSI translation failed "
+                   "owner=d3d10umd-shader component=stage-signature "
+                   "reason=null-output-signature action=abort-translation\n");
+      return false;
+   }
+
+   for (unsigned i = 0; i < signatures->NumOutputSignatureEntries; ++i) {
+      const D3D10DDIARG_SIGNATURE_ENTRY *entry =
+         &signatures->pOutputSignature[i];
+      const unsigned mask = entry->Mask;
+
+      if (entry->Register >= SHADER_MAX_OUTPUTS ||
+          !mask || (mask & ~TGSI_WRITEMASK_XYZW)) {
+         YTTRIUM_WARN("yttrium: shader TGSI translation failed "
+                      "owner=d3d10umd-shader component=stage-signature "
+                      "reason=invalid-generic-output entry=%u register=%u "
+                      "mask=0x%x action=abort-translation\n",
+                      i, entry->Register, mask);
+         return false;
+      }
+
+      if (entry->SystemValue != D3D10_SB_NAME_UNDEFINED)
+         continue;
+
+      const struct ureg_dst output =
+         ureg_DECL_output_masked(ureg, TGSI_SEMANTIC_GENERIC,
+                                 entry->Register, mask, 0, 1);
+      const unsigned old_mapping = output_mapping[entry->Register];
+      if (old_mapping != ~0u && old_mapping != output.Index) {
+         YTTRIUM_WARN("yttrium: shader TGSI translation failed "
+                      "owner=d3d10umd-shader component=stage-signature "
+                      "reason=ambiguous-generic-output entry=%u register=%u "
+                      "old_tgsi=%u new_tgsi=%u action=abort-translation\n",
+                      i, entry->Register, old_mapping, output.Index);
+         return false;
+      }
+      output_mapping[entry->Register] = output.Index;
+   }
+
+   return true;
+}
+
+/* Hidden counters share Gallium's image namespace with application UAVs.
+ * Allocate only unused declarations, including for sparse D3D11.1 UAV slots.
+ * Never alias an application's image or silently drop an overflowing counter.
+ */
+static bool
+find_counter_image_slots(const unsigned *code, uint8_t *slots)
+{
+   struct Shader_parser parser;
+   struct Shader_opcode opcode;
+   uint64_t declared = 0, counters = 0;
+   bool valid = true;
+
+   memset(slots, 0, SHADER_MAX_IMAGES * sizeof(*slots));
+   Shader_parse_init(&parser, code);
+   while (Shader_parse_opcode(&parser, &opcode)) {
+      unsigned operand = 0;
+      bool declaration = false, counter = false;
+      switch (opcode.type) {
+      case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_TYPED:
+      case DX10_SM5_OPCODE_DCL_UAV_RAW:
+      case DX10_SM5_OPCODE_DCL_UAV_STRUCTURED:
+         declaration = true;
+         break;
+      case DX10_SM5_OPCODE_IMM_ATOMIC_ALLOC:
+      case DX10_SM5_OPCODE_IMM_ATOMIC_CONSUME:
+         operand = 1;
+         counter = true;
+         break;
+      default:
+         break;
+      }
+      if (declaration || counter) {
+         const struct Shader_operand *image = &opcode.dst[operand].base;
+         if (image->index_dim != 1 ||
+             image->index[0].index_rep != D3D10_SB_OPERAND_INDEX_IMMEDIATE32 ||
+             image->index[0].imm >= SHADER_MAX_IMAGES) {
+            valid = false;
+         } else if (declaration) {
+            declared |= UINT64_C(1) << image->index[0].imm;
+         } else {
+            counters |= UINT64_C(1) << image->index[0].imm;
+         }
+      }
+      Shader_opcode_free(&opcode);
+   }
+   if (parser.failed || !valid || (counters & ~declared))
+      return false;
+
+   /* The native device enables fragmentStoresAndAtomics, but does not yet
+    * enable vertexPipelineStoresAndAtomics. Never emit unsupported pre-raster
+    * counter atomics merely because D3D11.1 allows those UAV declarations. */
+   if (counters && parser.header.type != D3D10_SB_PIXEL_SHADER &&
+       parser.header.type != DX10_SM5_COMPUTE_SHADER) {
+      YTTRIUM_WARN("yttrium: shader translation rejected owner=d3d10umd "
+                   "reason=hidden_counter_stage_unsupported stage=%u\n",
+                   parser.header.type);
+      return false;
+   }
+
+   for (unsigned slot = 0; slot < SHADER_MAX_IMAGES; ++slot) {
+      if (!(counters & (UINT64_C(1) << slot)))
+         continue;
+      unsigned hidden;
+      for (hidden = 0; hidden < SHADER_MAX_IMAGES; ++hidden)
+         if (!(declared & (UINT64_C(1) << hidden)))
+            break;
+      if (hidden == SHADER_MAX_IMAGES) {
+         YTTRIUM_WARN("yttrium: shader translation rejected owner=d3d10umd "
+                      "reason=hidden_counter_image_slots_exhausted\n");
+         return false;
+      }
+      slots[slot] = hidden + 1;
+      declared |= UINT64_C(1) << hidden;
+   }
+   return true;
+}
+
 const struct tgsi_token *
 Shader_tgsi_translate(const unsigned *code,
                       unsigned *output_mapping,
@@ -3117,9 +3735,13 @@ Shader_tgsi_translate(const unsigned *code,
                       const struct Shader_tessellation_io_signatures *
                       tessellation_signatures,
                       const struct Shader_tessellation_properties *
-                      tessellation_properties)
+                      tessellation_properties,
+                      const D3D10DDIARG_STAGE_IO_SIGNATURES *stage_signatures,
+                      struct pipe_shader_sampler_binding_map *
+                      sampler_binding_map,
+                      uint8_t *counter_image_slots)
 {
-   struct Shader_xlate sx;
+   struct Shader_xlate *sx;
    struct Shader_parser parser;
    struct ureg_program *ureg = NULL;
    struct Shader_opcode opcode;
@@ -3129,27 +3751,49 @@ Shader_tgsi_translate(const unsigned *code,
    bool inside_sub = false;
    uint i, j;
 
-   memset(&sx, 0, sizeof sx);
-   sx.tessellation_signatures = tessellation_signatures;
+   /* DWM can translate shaders on threads with only a 128 KiB stack.
+    * Keep the large scratch context off the caller's stack and private to
+    * this translation, including concurrent or reentrant shader creation.
+    */
+   sx = CALLOC_STRUCT(Shader_xlate);
+   if (!sx) {
+      YTTRIUM_WARN("yttrium: shader translation failed owner=d3d10umd-shader "
+                   "reason=context-allocation-failed action=abort-translation\n");
+      return NULL;
+   }
+   sx->tessellation_signatures = tessellation_signatures;
+   sx->sampler_binding_map = sampler_binding_map;
+   if (sampler_binding_map)
+      memset(sampler_binding_map, 0, sizeof(*sampler_binding_map));
    if (shared_memory_size)
       *shared_memory_size = 0;
+   if (counter_image_slots)
+      memset(counter_image_slots, 0, sizeof(sx->counter_image_slots));
+
+   if (!find_counter_image_slots(code, sx->counter_image_slots)) {
+      YTTRIUM_WARN("yttrium: shader translation rejected owner=d3d10umd "
+                   "reason=invalid_hidden_counter_image_map\n");
+      goto fail;
+   }
 
    Shader_parse_init(&parser, code);
+   if (parser.failed)
+      goto fail;
 
    if (st_debug & ST_DEBUG_TGSI) {
       dx10_shader_dump_tokens(code);
       shader_dumped = true;
    }
 
-   sx.max_calls = 64;
-   sx.calls = (struct Shader_call *)MALLOC(sx.max_calls *
+   sx->max_calls = 64;
+   sx->calls = (struct Shader_call *)MALLOC(sx->max_calls *
                                            sizeof(struct Shader_call));
-   sx.num_calls = 0;
+   sx->num_calls = 0;
 
-   sx.max_labels = 64;
-   sx.labels = (struct Shader_label *)MALLOC(sx.max_labels *
+   sx->max_labels = 64;
+   sx->labels = (struct Shader_label *)MALLOC(sx->max_labels *
                                              sizeof(struct Shader_call));
-   sx.num_labels = 0;
+   sx->num_labels = 0;
 
 
 
@@ -3166,7 +3810,7 @@ Shader_tgsi_translate(const unsigned *code,
       break;
    case DX11_SM5_HULL_SHADER:
       ureg = ureg_create(MESA_SHADER_TESS_CTRL);
-      sx.is_tcs = true;
+      sx->is_tcs = true;
       break;
    case DX11_SM5_DOMAIN_SHADER:
       ureg = ureg_create(MESA_SHADER_TESS_EVAL);
@@ -3182,12 +3826,25 @@ Shader_tgsi_translate(const unsigned *code,
    if (parser.header.type == DX11_SM5_HULL_SHADER ||
        parser.header.type == DX11_SM5_DOMAIN_SHADER)
       ureg_set_any_inout_decl_range(ureg, true);
-   sx.ureg = ureg;
+   sx->ureg = ureg;
+   for (unsigned slot = 0; slot < SHADER_MAX_IMAGES; ++slot) {
+      if (!sx->counter_image_slots[slot])
+         continue;
+      sx->counter_images[slot] = ureg_DECL_image(
+         ureg, sx->counter_image_slots[slot] - 1, TGSI_TEXTURE_2D,
+         PIPE_FORMAT_R32_UINT, true, false);
+   }
+
+   if ((parser.header.type == D3D10_SB_VERTEX_SHADER ||
+        parser.header.type == D3D10_SB_GEOMETRY_SHADER) &&
+       !dcl_stage_signature_generic_outputs(ureg, output_mapping,
+                                            stage_signatures))
+      goto fail;
 
    for(uint i = 0; i < SHADER_MAX_ADDRS; i++) {
-      sx.addrs[i] = ureg_DECL_address(sx.ureg);
+      sx->addrs[i] = ureg_DECL_address(sx->ureg);
    }
-   sx.addr_cur = 0;
+   sx->addr_cur = 0;
 
    while (Shader_parse_opcode(&parser, &opcode)) {
       const struct dx10_opcode_xlate *ox;
@@ -3195,27 +3852,41 @@ Shader_tgsi_translate(const unsigned *code,
       assert(opcode.type < D3D10_SB_NUM_OPCODES);
       ox = &opcode_xlate[opcode.type];
 
+      prepare_tcs_indexed_output_stores(sx, &opcode);
+      if (sx->translation_failed) {
+         Shader_opcode_free(&opcode);
+         goto fail;
+      }
+
       switch (opcode.type) {
       case DX11_SM5_OPCODE_HS_DECLS:
          break;
 
       case DX11_SM5_OPCODE_HS_CONTROL_POINT_PHASE:
-         tcs_end_patch_phase(&sx, ureg);
-         sx.tcs_control_point_phase_seen = true;
+         tcs_end_patch_phase(sx, ureg);
+         memset(sx->tcs_tess_factor_writemask, 0,
+                sizeof(sx->tcs_tess_factor_writemask));
+         memset(sx->tcs_tess_factor_range_end, 0,
+                sizeof(sx->tcs_tess_factor_range_end));
+         sx->tcs_control_point_phase_seen = true;
          break;
 
       case DX11_SM5_OPCODE_HS_FORK_PHASE:
       case DX11_SM5_OPCODE_HS_JOIN_PHASE:
-         tcs_end_patch_phase(&sx, ureg);
-         if (sx.tcs_control_point_phase_seen &&
-             !sx.tcs_control_point_barrier_emitted) {
+         tcs_end_patch_phase(sx, ureg);
+         memset(sx->tcs_tess_factor_writemask, 0,
+                sizeof(sx->tcs_tess_factor_writemask));
+         memset(sx->tcs_tess_factor_range_end, 0,
+                sizeof(sx->tcs_tess_factor_range_end));
+         if (sx->tcs_control_point_phase_seen &&
+             !sx->tcs_control_point_barrier_emitted) {
             ureg_BARRIER(ureg);
-            sx.tcs_control_point_barrier_emitted = true;
+            sx->tcs_control_point_barrier_emitted = true;
          }
-         if (!sx.tcs_control_point_phase_seen &&
-             !sx.tcs_implicit_control_point_passthrough) {
-            tcs_emit_implicit_control_point_passthrough(&sx, ureg);
-            sx.tcs_implicit_control_point_passthrough = true;
+         if (!sx->tcs_control_point_phase_seen &&
+             !sx->tcs_implicit_control_point_passthrough) {
+            tcs_emit_implicit_control_point_passthrough(sx, ureg);
+            sx->tcs_implicit_control_point_passthrough = true;
          }
          /*
           * A fork/join phase without an instance-count declaration has one
@@ -3223,7 +3894,7 @@ Shader_tgsi_translate(const unsigned *code,
           * as per-patch.  An explicit declaration immediately replaces the
           * empty default phase before any executable instruction.
           */
-         tcs_begin_patch_phase(&sx, ureg, 1);
+         tcs_begin_patch_phase(sx, ureg, 1);
          break;
 
       case DX11_SM5_OPCODE_DCL_HS_MAX_TESSFACTOR:
@@ -3233,29 +3904,29 @@ Shader_tgsi_translate(const unsigned *code,
 
       case DX11_SM5_OPCODE_DCL_HS_FORK_PHASE_INSTANCE_COUNT:
       case DX11_SM5_OPCODE_DCL_HS_JOIN_PHASE_INSTANCE_COUNT:
-         tcs_begin_patch_phase(&sx, ureg,
+         tcs_begin_patch_phase(sx, ureg,
                                opcode.specific.dcl_hs_phase_instance_count);
          break;
 
       case DX11_SM5_OPCODE_DCL_INPUT_CONTROL_POINT_COUNT:
          declare_vertices_in(
-            &sx, opcode.specific.dcl_input_control_point_count);
+            sx, opcode.specific.dcl_input_control_point_count);
          break;
 
       case DX11_SM5_OPCODE_DCL_OUTPUT_CONTROL_POINT_COUNT:
-         sx.tcs_vertices_out =
+         sx->tcs_vertices_out =
             opcode.specific.dcl_output_control_point_count;
          ureg_property(ureg, TGSI_PROPERTY_TCS_VERTICES_OUT,
-                       sx.tcs_vertices_out);
+                       sx->tcs_vertices_out);
          break;
 
       case DX11_SM5_OPCODE_DCL_TESS_DOMAIN:
-         sx.tessellation_properties.domain =
+         sx->tessellation_properties.domain =
             opcode.specific.dcl_tess_domain;
          break;
 
       case DX11_SM5_OPCODE_DCL_TESS_PARTITIONING:
-         sx.tessellation_properties.partitioning =
+         sx->tessellation_properties.partitioning =
             opcode.specific.dcl_tess_partitioning;
          if (opcode.specific.dcl_tess_partitioning == 2) {
             ureg_property(ureg,
@@ -3264,15 +3935,15 @@ Shader_tgsi_translate(const unsigned *code,
          break;
 
       case DX11_SM5_OPCODE_DCL_TESS_OUTPUT_PRIMITIVE:
-         sx.tessellation_properties.output_primitive =
+         sx->tessellation_properties.output_primitive =
             opcode.specific.dcl_tess_output_primitive;
          break;
 
       case DX10_SM5_OPCODE_DCL_THREAD_GROUP:
          assert(parser.header.type == DX10_SM5_COMPUTE_SHADER);
-         sx.cs_thread_group_size[0] = opcode.specific.dcl_thread_group.x;
-         sx.cs_thread_group_size[1] = opcode.specific.dcl_thread_group.y;
-         sx.cs_thread_group_size[2] = opcode.specific.dcl_thread_group.z;
+         sx->cs_thread_group_size[0] = opcode.specific.dcl_thread_group.x;
+         sx->cs_thread_group_size[1] = opcode.specific.dcl_thread_group.y;
+         sx->cs_thread_group_size[2] = opcode.specific.dcl_thread_group.z;
          if (thread_group_size) {
             thread_group_size[0] = opcode.specific.dcl_thread_group.x;
             thread_group_size[1] = opcode.specific.dcl_thread_group.y;
@@ -3293,55 +3964,55 @@ Shader_tgsi_translate(const unsigned *code,
          unsigned slot = 0;
          assert(parser.header.type == DX10_SM5_COMPUTE_SHADER);
          if (tgsm_operand_slot(&opcode.dst[0].base, &slot)) {
-            sx.tgsm[slot].byte_offset = sx.shared_memory_size;
-            sx.tgsm[slot].byte_count = opcode.specific.dcl_tgsm.byte_count;
-            sx.tgsm[slot].structured_stride =
+            sx->tgsm[slot].byte_offset = sx->shared_memory_size;
+            sx->tgsm[slot].byte_count = opcode.specific.dcl_tgsm.byte_count;
+            sx->tgsm[slot].structured_stride =
                opcode.specific.dcl_tgsm.structured_stride;
-            sx.shared_memory_size += opcode.specific.dcl_tgsm.byte_count;
-            get_tgsm_memory(&sx);
+            sx->shared_memory_size += opcode.specific.dcl_tgsm.byte_count;
+            get_tgsm_memory(sx);
          }
          break;
       }
       case D3D10_SB_OPCODE_EXP:
-         expand_unary_to_scalarf(ureg, ureg_EX2, &sx, &opcode);
+         expand_unary_to_scalarf(ureg, ureg_EX2, sx, &opcode);
          break;
       case D3D10_SB_OPCODE_SQRT:
-         expand_unary_to_scalarf(ureg, ureg_SQRT, &sx, &opcode);
+         expand_unary_to_scalarf(ureg, ureg_SQRT, sx, &opcode);
          break;
       case D3D10_SB_OPCODE_RSQ:
-         expand_unary_to_scalarf(ureg, ureg_RSQ, &sx, &opcode);
+         expand_unary_to_scalarf(ureg, ureg_RSQ, sx, &opcode);
          break;
       case DX10_SM5_OPCODE_RCP:
-         expand_unary_to_scalarf(ureg, ureg_RCP, &sx, &opcode);
+         expand_unary_to_scalarf(ureg, ureg_RCP, sx, &opcode);
          break;
       case D3D10_SB_OPCODE_LOG:
-         expand_unary_to_scalarf(ureg, ureg_LG2, &sx, &opcode);
+         expand_unary_to_scalarf(ureg, ureg_LG2, sx, &opcode);
          break;
       case DX10_SM5_OPCODE_F16TOF32:
-         expand_f16tof32(ureg, &sx, &opcode);
+         expand_f16tof32(ureg, sx, &opcode);
          break;
       case DX10_SM5_OPCODE_F32TOF16:
-         expand_f32tof16(ureg, &sx, &opcode);
+         expand_f32tof16(ureg, sx, &opcode);
          break;
       case DX10_SM5_OPCODE_FIRSTBIT_HI:
-         expand_firstbit_hi(ureg, &sx, &opcode, false);
+         expand_firstbit_hi(ureg, sx, &opcode, false);
          break;
       case DX10_SM5_OPCODE_FIRSTBIT_SHI:
-         expand_firstbit_hi(ureg, &sx, &opcode, true);
+         expand_firstbit_hi(ureg, sx, &opcode, true);
          break;
       case D3D10_SB_OPCODE_IMUL:
          if (opcode.dst[0].base.type != D3D10_SB_OPERAND_TYPE_NULL) {
             ureg_IMUL_HI(ureg,
-                        translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate),
-                        translate_src_operand(&sx, &opcode.src[0], OF_INT),
-                        translate_src_operand(&sx, &opcode.src[1], OF_INT));
+                        translate_dst_operand(sx, &opcode.dst[0], opcode.saturate),
+                        translate_src_operand(sx, &opcode.src[0], OF_INT),
+                        translate_src_operand(sx, &opcode.src[1], OF_INT));
          }
 
          if (opcode.dst[1].base.type != D3D10_SB_OPERAND_TYPE_NULL) {
             ureg_UMUL(ureg,
-                      translate_dst_operand(&sx, &opcode.dst[1], opcode.saturate),
-                      translate_src_operand(&sx, &opcode.src[0], OF_INT),
-                      translate_src_operand(&sx, &opcode.src[1], OF_INT));
+                      translate_dst_operand(sx, &opcode.dst[1], opcode.saturate),
+                      translate_src_operand(sx, &opcode.src[0], OF_INT),
+                      translate_src_operand(sx, &opcode.src[1], OF_INT));
          }
 
          break;
@@ -3363,12 +4034,12 @@ Shader_tgsi_translate(const unsigned *code,
          struct ureg_dst too_large = ureg_DECL_temporary(ureg);
          struct ureg_dst tmp = ureg_DECL_temporary(ureg);
          ureg_FSGE(ureg, too_large,
-                   translate_src_operand(&sx, &opcode.src[0], OF_FLOAT),
+                   translate_src_operand(sx, &opcode.src[0], OF_FLOAT),
                    ureg_imm1f(ureg, 2147483648.0f));
          ureg_F2I(ureg, tmp,
-                  translate_src_operand(&sx, &opcode.src[0], OF_FLOAT));
+                  translate_src_operand(sx, &opcode.src[0], OF_FLOAT));
          ureg_UCMP(ureg,
-                   translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate),
+                   translate_dst_operand(sx, &opcode.dst[0], opcode.saturate),
                    ureg_src(too_large),
                    ureg_imm1i(ureg, 0x7fffffff),
                    ureg_src(tmp));
@@ -3387,7 +4058,7 @@ Shader_tgsi_translate(const unsigned *code,
          struct ureg_dst too_large = ureg_DECL_temporary(ureg);
          struct ureg_dst tmp = ureg_DECL_temporary(ureg);
          ureg_FSGE(ureg, too_large,
-                   translate_src_operand(&sx, &opcode.src[0], OF_FLOAT),
+                   translate_src_operand(sx, &opcode.src[0], OF_FLOAT),
                    ureg_imm1f(ureg, 4294967296.0f));
          /* clamp negative values + NaN to zero.
           * (Could be done slightly more efficient in llvmpipe due to
@@ -3395,11 +4066,11 @@ Shader_tgsi_translate(const unsigned *code,
           */
          ureg_MAX(ureg, tmp,
                   ureg_imm1f(ureg, 0.0f),
-                  translate_src_operand(&sx, &opcode.src[0], OF_FLOAT));
+                  translate_src_operand(sx, &opcode.src[0], OF_FLOAT));
          ureg_F2U(ureg, tmp,
                   ureg_src(tmp));
          ureg_UCMP(ureg,
-                   translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate),
+                   translate_dst_operand(sx, &opcode.dst[0], opcode.saturate),
                    ureg_src(too_large),
                    ureg_imm1u(ureg, 0xffffffff),
                    ureg_src(tmp));
@@ -3410,66 +4081,92 @@ Shader_tgsi_translate(const unsigned *code,
 
       case D3D10_SB_OPCODE_LD_MS: {
          unsigned resource = opcode.src[1].base.index[0].imm;
+         struct ureg_src sampler;
          struct ureg_dst coord = ureg_DECL_temporary(ureg);
          struct ureg_dst dst =
-            translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate);
+            translate_dst_operand(sx, &opcode.dst[0], opcode.saturate);
          struct ureg_dst tmp;
          struct ureg_dst tex_dst;
 
          assert(opcode.src[1].base.index_dim == 1);
          assert(resource < SHADER_MAX_RESOURCES);
 
-         if (ureg_src_is_undef(sx.samplers[resource]))
-            sx.samplers[resource] = ureg_DECL_sampler(ureg, resource);
-         declare_sampler_view_for_resource(
-            &sx, resource, resource, sx.resources[resource].target);
+         if (sx->sampler_binding_map) {
+            if (!translate_binding_operand_index(
+                   sx, &opcode.src[1], D3D10_SB_OPERAND_TYPE_RESOURCE,
+                   SHADER_MAX_RESOURCES, "resource", &resource))
+               break;
+            sampler = declare_compact_sampler_for_resource(
+               sx, resource, PIPE_MAX_SAMPLERS,
+               (enum tgsi_texture_type)sx->resources[resource].target, NULL);
+         } else {
+            if (ureg_src_is_undef(sx->samplers[resource]))
+               sx->samplers[resource] = ureg_DECL_sampler(ureg, resource);
+            declare_sampler_view_for_resource(
+               sx, resource, resource, sx->resources[resource].target);
+            sampler = sx->samplers[resource];
+         }
 
          ureg_MOV(ureg, coord,
-                  translate_src_operand(&sx, &opcode.src[0], OF_INT));
+                  translate_src_operand(sx, &opcode.src[0], OF_INT));
          ureg_MOV(ureg, ureg_writemask(coord, TGSI_WRITEMASK_W),
-                  ureg_scalar(translate_src_operand(&sx, &opcode.src[2],
+                  ureg_scalar(translate_src_operand(sx, &opcode.src[2],
                                                     OF_INT),
                               TGSI_SWIZZLE_X));
          tex_dst = old_tex_dst_for_resource_swizzle(ureg, dst,
                                                     &opcode.src[1], &tmp);
          ureg_TXF(ureg,
                   tex_dst,
-                  sx.resources[resource].target,
+                  sx->resources[resource].target,
                   ureg_src(coord),
-                  sx.samplers[resource]);
+                  sampler);
          old_tex_apply_resource_swizzle(ureg, dst, &opcode.src[1], tmp);
          ureg_release_temporary(ureg, coord);
       }
          break;
       case D3D10_SB_OPCODE_LD:
-         if (use_old_tex_ops || (st_debug & ST_DEBUG_OLD_TEX_OPS)) {
+         if (sx->sampler_binding_map || use_old_tex_ops ||
+             (st_debug & ST_DEBUG_OLD_TEX_OPS)) {
             unsigned resource = opcode.src[1].base.index[0].imm;
             struct ureg_src coord;
+            struct ureg_src sampler;
             struct ureg_dst dst =
-               translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate);
+               translate_dst_operand(sx, &opcode.dst[0], opcode.saturate);
             struct ureg_dst tmp;
             struct ureg_dst tex_dst;
             assert(opcode.src[1].base.index_dim == 1);
             assert(opcode.src[1].base.index[0].imm < SHADER_MAX_RESOURCES);
 
-            if (ureg_src_is_undef(sx.samplers[resource])) {
-               sx.samplers[resource] =
-                  ureg_DECL_sampler(ureg, resource);
+            if (sx->sampler_binding_map) {
+               if (!translate_binding_operand_index(
+                      sx, &opcode.src[1], D3D10_SB_OPERAND_TYPE_RESOURCE,
+                      SHADER_MAX_RESOURCES, "resource", &resource))
+                  break;
+               sampler = declare_compact_sampler_for_resource(
+                  sx, resource, PIPE_MAX_SAMPLERS,
+                  (enum tgsi_texture_type)sx->resources[resource].target,
+                  NULL);
+            } else {
+               if (ureg_src_is_undef(sx->samplers[resource])) {
+                  sx->samplers[resource] =
+                     ureg_DECL_sampler(ureg, resource);
+               }
+               declare_sampler_view_for_resource(
+                  sx, resource, resource, sx->resources[resource].target);
+               sampler = sx->samplers[resource];
             }
-            declare_sampler_view_for_resource(
-               &sx, resource, resource, sx.resources[resource].target);
 
-            coord = translate_src_operand(&sx, &opcode.src[0], OF_INT);
+            coord = translate_src_operand(sx, &opcode.src[0], OF_INT);
             if (opcode.type == D3D10_SB_OPCODE_LD)
-               coord = translate_load_src_for_txf(sx.resources[resource].target, coord);
+               coord = translate_load_src_for_txf(sx->resources[resource].target, coord);
 
             tex_dst = old_tex_dst_for_resource_swizzle(ureg, dst,
                                                        &opcode.src[1], &tmp);
             ureg_TXF(ureg,
                      tex_dst,
-                     sx.resources[resource].target,
+                     sx->resources[resource].target,
                      coord,
-                     sx.samplers[resource]);
+                     sampler);
             old_tex_apply_resource_swizzle(ureg, dst, &opcode.src[1], tmp);
          }
          else {
@@ -3479,14 +4176,14 @@ Shader_tgsi_translate(const unsigned *code,
             assert(opcode.src[1].base.index_dim == 1);
             assert(resource < SHADER_MAX_RESOURCES);
 
-            srcreg[0] = translate_src_operand(&sx, &opcode.src[0], OF_INT);
-            srcreg[1] = translate_src_operand(&sx, &opcode.src[1], OF_INT);
+            srcreg[0] = translate_src_operand(sx, &opcode.src[0], OF_INT);
+            srcreg[1] = translate_src_operand(sx, &opcode.src[1], OF_INT);
 
             sample_ureg_emit_target(ureg, TGSI_OPCODE_SAMPLE_I, 2, &opcode,
                                     NULL,
-                                    translate_dst_operand(&sx, &opcode.dst[0],
+                                    translate_dst_operand(sx, &opcode.dst[0],
                                                           opcode.saturate),
-                                    srcreg, sx.resources[resource].target);
+                                    srcreg, sx->resources[resource].target);
          }
          break;
 
@@ -3496,9 +4193,9 @@ Shader_tgsi_translate(const unsigned *code,
 
          if (opcode.src[1].base.type ==
              DX10_SM5_OPERAND_TYPE_THREAD_GROUP_SHARED_MEMORY) {
-            struct ureg_src memory = get_tgsm_memory(&sx);
+            struct ureg_src memory = get_tgsm_memory(sx);
             struct ureg_dst dst =
-               translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate);
+               translate_dst_operand(sx, &opcode.dst[0], opcode.saturate);
             struct ureg_dst fetch = ureg_DECL_temporary(ureg);
             struct ureg_dst byte_offset = ureg_dst_undef();
             struct ureg_dst fetch_offset = ureg_dst_undef();
@@ -3506,7 +4203,7 @@ Shader_tgsi_translate(const unsigned *code,
                opcode.dst[0].mask >> D3D10_SB_OPERAND_4_COMPONENT_MASK_SHIFT;
 
             ureg_MOV(ureg, coord,
-                     ureg_scalar(translate_src_operand(&sx, &opcode.src[0], OF_UINT),
+                     ureg_scalar(translate_src_operand(sx, &opcode.src[0], OF_UINT),
                                  TGSI_SWIZZLE_X));
             for (unsigned i = 0; i < 4; i++) {
                unsigned swizzle;
@@ -3525,7 +4222,7 @@ Shader_tgsi_translate(const unsigned *code,
                }
 
                srcreg[0] = memory;
-               srcreg[1] = tgsm_byte_offset(&sx, &opcode.src[1].base,
+               srcreg[1] = tgsm_byte_offset(sx, &opcode.src[1].base,
                                             srcreg[1], &byte_offset);
                struct ureg_dst fetch_dst =
                   ureg_writemask(fetch, TGSI_WRITEMASK_X);
@@ -3552,32 +4249,42 @@ Shader_tgsi_translate(const unsigned *code,
              D3D11_SB_OPERAND_TYPE_UNORDERED_ACCESS_VIEW) {
             unsigned image_index = opcode.src[1].base.index[0].imm;
             struct ureg_dst dst =
-               translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate);
+               translate_dst_operand(sx, &opcode.dst[0], opcode.saturate);
 
             assert(image_index < SHADER_MAX_IMAGES);
 
             ureg_USHR(ureg, coord,
-                      ureg_scalar(translate_src_operand(&sx, &opcode.src[0],
+                      ureg_scalar(translate_src_operand(sx, &opcode.src[0],
                                                         OF_UINT),
                                   TGSI_SWIZZLE_X),
                       ureg_imm1u(ureg, 2));
             image_buffer_load_dwords_ureg_emit(ureg, dst,
-                                               sx.images[image_index].reg,
+                                               sx->images[image_index].reg,
                                                ureg_src(coord),
-                                               sx.images[image_index].target,
-                                               sx.images[image_index].format,
-                                               1);
+                                               sx->images[image_index].target,
+                                               sx->images[image_index].format,
+                                               1, NULL);
             ureg_release_temporary(ureg, coord);
             break;
          }
 
          unsigned resource = opcode.src[1].base.index[0].imm;
+         unsigned view_slot = resource;
 
          assert(resource < SHADER_MAX_RESOURCES);
 
-         if (ureg_src_is_undef(sx.sv[resource])) {
-            sx.sv[resource] =
-               ureg_DECL_sampler_view(ureg, resource, sx.resources[resource].target,
+         if (sx->sampler_binding_map) {
+            if (!translate_binding_operand_index(
+                   sx, &opcode.src[1], D3D10_SB_OPERAND_TYPE_RESOURCE,
+                   SHADER_MAX_RESOURCES, "resource", &resource))
+               break;
+            declare_compact_sampler_for_resource(
+               sx, resource, PIPE_MAX_SAMPLERS,
+               (enum tgsi_texture_type)sx->resources[resource].target,
+               &view_slot);
+         } else if (ureg_src_is_undef(sx->sv[resource])) {
+            sx->sv[resource] =
+               ureg_DECL_sampler_view(ureg, resource, sx->resources[resource].target,
                                       TGSI_RETURN_TYPE_UINT,
                                       TGSI_RETURN_TYPE_UINT,
                                       TGSI_RETURN_TYPE_UINT,
@@ -3585,16 +4292,18 @@ Shader_tgsi_translate(const unsigned *code,
          }
 
          ureg_USHR(ureg, coord,
-                   ureg_scalar(translate_src_operand(&sx, &opcode.src[0], OF_UINT),
+                   ureg_scalar(translate_src_operand(sx, &opcode.src[0], OF_UINT),
                                TGSI_SWIZZLE_X),
                    ureg_imm1u(ureg, 2));
 
          srcreg[0] = ureg_src(coord);
-         srcreg[1] = translate_src_operand(&sx, &opcode.src[1], OF_UINT);
+         srcreg[1] = sx->sampler_binding_map ?
+            compact_sampler_view_src(sx, view_slot, &opcode.src[1]) :
+            translate_src_operand(sx, &opcode.src[1], OF_UINT);
          sample_i_buffer_dwords_ureg_emit(
             ureg, &opcode,
-            translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate),
-            srcreg[0], srcreg[1], sx.resources[resource].target);
+            translate_dst_operand(sx, &opcode.dst[0], opcode.saturate),
+            srcreg[0], srcreg[1], sx->resources[resource].target);
          ureg_release_temporary(ureg, coord);
          break;
       }
@@ -3607,9 +4316,9 @@ Shader_tgsi_translate(const unsigned *code,
          if (opcode.src[2].base.type ==
              DX10_SM5_OPERAND_TYPE_THREAD_GROUP_SHARED_MEMORY) {
             unsigned slot = 0;
-            struct ureg_src memory = get_tgsm_memory(&sx);
+            struct ureg_src memory = get_tgsm_memory(sx);
             struct ureg_dst dst =
-               translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate);
+               translate_dst_operand(sx, &opcode.dst[0], opcode.saturate);
             struct ureg_dst fetch = ureg_DECL_temporary(ureg);
             struct ureg_dst load_offset = ureg_dst_undef();
             struct ureg_dst slot_offset = ureg_dst_undef();
@@ -3624,11 +4333,11 @@ Shader_tgsi_translate(const unsigned *code,
             }
 
             ureg_UMUL(ureg, coord,
-                      ureg_scalar(translate_src_operand(&sx, &opcode.src[0], OF_UINT),
+                      ureg_scalar(translate_src_operand(sx, &opcode.src[0], OF_UINT),
                                   TGSI_SWIZZLE_X),
-                      ureg_imm1u(ureg, sx.tgsm[slot].structured_stride));
+                      ureg_imm1u(ureg, sx->tgsm[slot].structured_stride));
             ureg_UADD(ureg, coord, ureg_src(coord),
-                      ureg_scalar(translate_src_operand(&sx, &opcode.src[1], OF_UINT),
+                      ureg_scalar(translate_src_operand(sx, &opcode.src[1], OF_UINT),
                                   TGSI_SWIZZLE_X));
 
             for (unsigned i = 0; i < 4; i++) {
@@ -3648,7 +4357,7 @@ Shader_tgsi_translate(const unsigned *code,
                }
 
                srcreg[0] = memory;
-               srcreg[1] = tgsm_byte_offset(&sx, &opcode.src[2].base,
+               srcreg[1] = tgsm_byte_offset(sx, &opcode.src[2].base,
                                             srcreg[1], &slot_offset);
                struct ureg_dst fetch_dst =
                   ureg_writemask(fetch, TGSI_WRITEMASK_X);
@@ -3677,39 +4386,51 @@ Shader_tgsi_translate(const unsigned *code,
              D3D11_SB_OPERAND_TYPE_UNORDERED_ACCESS_VIEW) {
             unsigned image_index = opcode.src[2].base.index[0].imm;
             struct ureg_dst dst =
-               translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate);
+               translate_dst_operand(sx, &opcode.dst[0], opcode.saturate);
 
             assert(image_index < SHADER_MAX_IMAGES);
 
             ureg_UMUL(ureg, coord,
-                      ureg_scalar(translate_src_operand(&sx, &opcode.src[0],
+                      ureg_scalar(translate_src_operand(sx, &opcode.src[0],
                                                         OF_UINT),
                                   TGSI_SWIZZLE_X),
                       ureg_imm1u(ureg,
-                                 sx.images[image_index].structured_stride));
+                                 sx->images[image_index].structured_stride));
             ureg_MOV(ureg, byte_offset,
-                     ureg_scalar(translate_src_operand(&sx, &opcode.src[1],
+                     ureg_scalar(translate_src_operand(sx, &opcode.src[1],
                                                        OF_UINT),
                                  TGSI_SWIZZLE_X));
             ureg_UADD(ureg, coord, ureg_src(coord), ureg_src(byte_offset));
+            /* Image-buffer coordinates address R32_UINT texels, not bytes. */
+            ureg_USHR(ureg, coord, ureg_src(coord), ureg_imm1u(ureg, 2));
             image_buffer_load_dwords_ureg_emit(ureg, dst,
-                                               sx.images[image_index].reg,
+                                               sx->images[image_index].reg,
                                                ureg_src(coord),
-                                               sx.images[image_index].target,
-                                               sx.images[image_index].format,
-                                               0);
+                                               sx->images[image_index].target,
+                                               sx->images[image_index].format,
+                                               1, opcode.src[2].swizzle);
             ureg_release_temporary(ureg, byte_offset);
             ureg_release_temporary(ureg, coord);
             break;
          }
 
          unsigned resource = opcode.src[2].base.index[0].imm;
+         unsigned view_slot = resource;
 
          assert(resource < SHADER_MAX_RESOURCES);
 
-         if (ureg_src_is_undef(sx.sv[resource])) {
-            sx.sv[resource] =
-               ureg_DECL_sampler_view(ureg, resource, sx.resources[resource].target,
+         if (sx->sampler_binding_map) {
+            if (!translate_binding_operand_index(
+                   sx, &opcode.src[2], D3D10_SB_OPERAND_TYPE_RESOURCE,
+                   SHADER_MAX_RESOURCES, "resource", &resource))
+               break;
+            declare_compact_sampler_for_resource(
+               sx, resource, PIPE_MAX_SAMPLERS,
+               (enum tgsi_texture_type)sx->resources[resource].target,
+               &view_slot);
+         } else if (ureg_src_is_undef(sx->sv[resource])) {
+            sx->sv[resource] =
+               ureg_DECL_sampler_view(ureg, resource, sx->resources[resource].target,
                                       TGSI_RETURN_TYPE_UINT,
                                       TGSI_RETURN_TYPE_UINT,
                                       TGSI_RETURN_TYPE_UINT,
@@ -3717,21 +4438,23 @@ Shader_tgsi_translate(const unsigned *code,
          }
 
          ureg_UMUL(ureg, coord,
-                   ureg_scalar(translate_src_operand(&sx, &opcode.src[0], OF_UINT),
+                   ureg_scalar(translate_src_operand(sx, &opcode.src[0], OF_UINT),
                                TGSI_SWIZZLE_X),
-                   ureg_imm1u(ureg, sx.resources[resource].structured_stride / 4));
+                   ureg_imm1u(ureg, sx->resources[resource].structured_stride / 4));
          ureg_USHR(ureg, byte_offset,
-                   ureg_scalar(translate_src_operand(&sx, &opcode.src[1], OF_UINT),
+                   ureg_scalar(translate_src_operand(sx, &opcode.src[1], OF_UINT),
                                TGSI_SWIZZLE_X),
                    ureg_imm1u(ureg, 2));
          ureg_UADD(ureg, coord, ureg_src(coord), ureg_src(byte_offset));
 
          srcreg[0] = ureg_src(coord);
-         srcreg[1] = translate_src_operand(&sx, &opcode.src[2], OF_UINT);
+         srcreg[1] = sx->sampler_binding_map ?
+            compact_sampler_view_src(sx, view_slot, &opcode.src[2]) :
+            translate_src_operand(sx, &opcode.src[2], OF_UINT);
          sample_i_buffer_dwords_ureg_emit(
             ureg, &opcode,
-            translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate),
-            srcreg[0], srcreg[1], sx.resources[resource].target);
+            translate_dst_operand(sx, &opcode.dst[0], opcode.saturate),
+            srcreg[0], srcreg[1], sx->resources[resource].target);
          ureg_release_temporary(ureg, byte_offset);
          ureg_release_temporary(ureg, coord);
          break;
@@ -3740,7 +4463,7 @@ Shader_tgsi_translate(const unsigned *code,
       case D3D10_SB_OPCODE_CUSTOMDATA:
          if (opcode.customdata._class ==
              D3D10_SB_CUSTOMDATA_DCL_IMMEDIATE_CONSTANT_BUFFER) {
-            sx.imms =
+            sx->imms =
                ureg_DECL_immediate_block_uint(ureg,
                                               opcode.customdata.u.constbuf.data,
                                               opcode.customdata.u.constbuf.count);
@@ -3753,7 +4476,7 @@ Shader_tgsi_translate(const unsigned *code,
          if (opcode.src[1].base.type == D3D11_SB_OPERAND_TYPE_UNORDERED_ACCESS_VIEW) {
             unsigned image_index = opcode.src[1].base.index[0].imm;
             struct ureg_dst dstreg =
-               translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate);
+               translate_dst_operand(sx, &opcode.dst[0], opcode.saturate);
             struct ureg_dst tmp = ureg_DECL_temporary(ureg);
             struct ureg_src image;
             struct ureg_src query;
@@ -3762,11 +4485,11 @@ Shader_tgsi_translate(const unsigned *code,
             assert(opcode.src[1].base.index_dim == 1);
             assert(image_index < SHADER_MAX_IMAGES);
 
-            image = sx.images[image_index].reg;
+            image = sx->images[image_index].reg;
             ureg_memory_insn(ureg, TGSI_OPCODE_RESQ,
                              &tmp, 1, &image, 1, 0,
-                             sx.images[image_index].target,
-                             sx.images[image_index].format);
+                             sx->images[image_index].target,
+                             sx->images[image_index].format);
 
             query = ureg_src(tmp);
             swizzled_query = query;
@@ -3783,7 +4506,7 @@ Shader_tgsi_translate(const unsigned *code,
                ureg_I2F(ureg, dstreg, swizzled_query);
             } else { /* D3D10_SB_RESINFO_INSTRUCTION_RETURN_RCPFLOAT */
                unsigned dims =
-                  texture_dim_from_tgsi_target(sx.images[image_index].target);
+                  texture_dim_from_tgsi_target(sx->images[image_index].target);
 
                ureg_I2F(ureg, tmp, query);
                query = ureg_src(tmp);
@@ -3800,29 +4523,43 @@ Shader_tgsi_translate(const unsigned *code,
             ureg_release_temporary(ureg, tmp);
             break;
          }
-         if (use_old_tex_ops || (st_debug & ST_DEBUG_OLD_TEX_OPS)) {
+         if (sx->sampler_binding_map || use_old_tex_ops ||
+             (st_debug & ST_DEBUG_OLD_TEX_OPS)) {
             unsigned resource = opcode.src[1].base.index[0].imm;
             struct ureg_dst dstreg =
-               translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate);
+               translate_dst_operand(sx, &opcode.dst[0], opcode.saturate);
             struct ureg_src query;
             struct ureg_src swizzled_query;
+            struct ureg_src sampler;
             struct ureg_dst tmp;
             assert(opcode.src[1].base.index_dim == 1);
             assert(opcode.src[1].base.index[0].imm < SHADER_MAX_RESOURCES);
 
-            if (ureg_src_is_undef(sx.samplers[resource])) {
-               sx.samplers[resource] =
-                  ureg_DECL_sampler(ureg, resource);
+            if (sx->sampler_binding_map) {
+               if (!translate_binding_operand_index(
+                      sx, &opcode.src[1], D3D10_SB_OPERAND_TYPE_RESOURCE,
+                      SHADER_MAX_RESOURCES, "resource", &resource))
+                  break;
+               sampler = declare_compact_sampler_for_resource(
+                  sx, resource, PIPE_MAX_SAMPLERS,
+                  (enum tgsi_texture_type)sx->resources[resource].target,
+                  NULL);
+            } else {
+               if (ureg_src_is_undef(sx->samplers[resource])) {
+                  sx->samplers[resource] =
+                     ureg_DECL_sampler(ureg, resource);
+               }
+               declare_sampler_view_for_resource(
+                  sx, resource, resource, sx->resources[resource].target);
+               sampler = sx->samplers[resource];
             }
-            declare_sampler_view_for_resource(
-               &sx, resource, resource, sx.resources[resource].target);
 
             tmp = ureg_DECL_temporary(ureg);
             ureg_TXQ(ureg,
                      tmp,
-                     sx.resources[resource].target,
-                     translate_src_operand(&sx, &opcode.src[0], OF_UINT),
-                     sx.samplers[resource]);
+                     sx->resources[resource].target,
+                     translate_src_operand(sx, &opcode.src[0], OF_UINT),
+                     sampler);
 
             query = ureg_src(tmp);
             swizzled_query = query;
@@ -3840,7 +4577,7 @@ Shader_tgsi_translate(const unsigned *code,
             }
             else { /* D3D10_SB_RESINFO_INSTRUCTION_RETURN_RCPFLOAT */
                unsigned dims =
-                  texture_dim_from_tgsi_target(sx.resources[resource].target);
+                  texture_dim_from_tgsi_target(sx->resources[resource].target);
 
                ureg_I2F(ureg, tmp, query);
                query = ureg_src(tmp);
@@ -3858,8 +4595,8 @@ Shader_tgsi_translate(const unsigned *code,
          }
          else {
             struct ureg_dst r0 = ureg_DECL_temporary(ureg);
-            struct ureg_src tsrc = translate_src_operand(&sx, &opcode.src[1], OF_UINT);
-            struct ureg_dst dstreg = translate_dst_operand(&sx, &opcode.dst[0],
+            struct ureg_src tsrc = translate_src_operand(sx, &opcode.src[1], OF_UINT);
+            struct ureg_dst dstreg = translate_dst_operand(sx, &opcode.dst[0],
                                                            opcode.saturate);
 
             /* while specs say swizzle is ignored better safe than sorry */
@@ -3869,7 +4606,7 @@ Shader_tgsi_translate(const unsigned *code,
             tsrc.SwizzleW = TGSI_SWIZZLE_W;
 
             ureg_SVIEWINFO(ureg, r0,
-                           translate_src_operand(&sx, &opcode.src[0], OF_UINT),
+                           translate_src_operand(sx, &opcode.src[0], OF_UINT),
                            tsrc);
 
             tsrc = ureg_src(r0);
@@ -3895,7 +4632,7 @@ Shader_tgsi_translate(const unsigned *code,
                 * This is one sick modifier if you ask me!
                 */
                unsigned res_index = opcode.src[1].base.index[0].imm;
-               unsigned target = sx.resources[res_index].target;
+               unsigned target = sx->resources[res_index].target;
                unsigned dims = texture_dim_from_tgsi_target(target);
 
                ureg_I2F(ureg, r0, ureg_src(r0));
@@ -3921,7 +4658,7 @@ Shader_tgsi_translate(const unsigned *code,
 
       case DX10_SM5_OPCODE_BUFINFO: {
          struct ureg_dst dstreg =
-            translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate);
+            translate_dst_operand(sx, &opcode.dst[0], opcode.saturate);
          struct ureg_dst tmp;
 
          assert(opcode.src[0].base.index_dim == 1);
@@ -3930,28 +4667,28 @@ Shader_tgsi_translate(const unsigned *code,
             struct ureg_src image;
 
             assert(image_index < SHADER_MAX_IMAGES);
-            if (sx.images[image_index].target == TGSI_TEXTURE_BUFFER) {
+            if (sx->images[image_index].target == TGSI_TEXTURE_BUFFER) {
                unsigned record = D3D10UMD_BUFINFO_UAV_RECORD_BASE + image_index;
 
                emit_dynamic_buffer_bufinfo(
-                  &sx, dstreg, record);
+                  sx, dstreg, record);
                track_dynamic_structured_bufinfo_stride(
-                  &sx, &opcode.dst[0], record,
-                  sx.images[image_index].structured_stride);
+                  sx, &opcode.dst[0], record,
+                  sx->images[image_index].structured_stride);
                break;
             }
 
             tmp = ureg_DECL_temporary(ureg);
-            image = sx.images[image_index].reg;
+            image = sx->images[image_index].reg;
             ureg_memory_insn(ureg, TGSI_OPCODE_RESQ,
                              &tmp, 1, &image, 1, 0,
-                             sx.images[image_index].target,
-                             sx.images[image_index].format);
-            if (sx.images[image_index].structured_stride) {
+                             sx->images[image_index].target,
+                             sx->images[image_index].format);
+            if (sx->images[image_index].structured_stride) {
                emit_structured_buffer_bufinfo(ureg, dstreg, ureg_src(tmp),
-                                              sx.images[image_index].structured_stride,
-                                              sx.images[image_index].structured_stride);
-            } else if (sx.images[image_index].raw) {
+                                              sx->images[image_index].structured_stride,
+                                              sx->images[image_index].structured_stride);
+            } else if (sx->images[image_index].raw) {
                emit_raw_buffer_bufinfo(ureg, dstreg, ureg_src(tmp));
             } else {
                ureg_MOV(ureg, dstreg, ureg_src(tmp));
@@ -3959,35 +4696,48 @@ Shader_tgsi_translate(const unsigned *code,
             ureg_release_temporary(ureg, tmp);
          } else {
             unsigned resource = opcode.src[0].base.index[0].imm;
+            struct ureg_src sampler;
 
             assert(opcode.src[0].base.type == D3D10_SB_OPERAND_TYPE_RESOURCE);
             assert(resource < SHADER_MAX_RESOURCES);
 
-            if (sx.resources[resource].target == TGSI_TEXTURE_BUFFER) {
+            if (sx->resources[resource].target == TGSI_TEXTURE_BUFFER) {
                unsigned record = D3D10UMD_BUFINFO_SRV_RECORD_BASE + resource;
 
                emit_dynamic_buffer_bufinfo(
-                  &sx, dstreg, record);
+                  sx, dstreg, record);
                track_dynamic_structured_bufinfo_stride(
-                  &sx, &opcode.dst[0], record,
-                  sx.resources[resource].structured_stride);
+                  sx, &opcode.dst[0], record,
+                  sx->resources[resource].structured_stride);
                break;
             }
 
-            if (ureg_src_is_undef(sx.samplers[resource]))
-               sx.samplers[resource] = ureg_DECL_sampler(ureg, resource);
-            declare_sampler_view_for_resource(
-               &sx, resource, resource, sx.resources[resource].target);
+            if (sx->sampler_binding_map) {
+               if (!translate_binding_operand_index(
+                      sx, &opcode.src[0], D3D10_SB_OPERAND_TYPE_RESOURCE,
+                      SHADER_MAX_RESOURCES, "resource", &resource))
+                  break;
+               sampler = declare_compact_sampler_for_resource(
+                  sx, resource, PIPE_MAX_SAMPLERS,
+                  (enum tgsi_texture_type)sx->resources[resource].target,
+                  NULL);
+            } else {
+               if (ureg_src_is_undef(sx->samplers[resource]))
+                  sx->samplers[resource] = ureg_DECL_sampler(ureg, resource);
+               declare_sampler_view_for_resource(
+                  sx, resource, resource, sx->resources[resource].target);
+               sampler = sx->samplers[resource];
+            }
 
             tmp = ureg_DECL_temporary(ureg);
-            ureg_TXQ(ureg, tmp, sx.resources[resource].target,
-                     ureg_imm1u(ureg, 0), sx.samplers[resource]);
-            if (sx.resources[resource].structured_stride) {
+            ureg_TXQ(ureg, tmp, sx->resources[resource].target,
+                     ureg_imm1u(ureg, 0), sampler);
+            if (sx->resources[resource].structured_stride) {
                emit_structured_buffer_bufinfo(ureg, dstreg, ureg_src(tmp),
-                                              sx.resources[resource].structured_stride,
-                                              sx.resources[resource].structured_stride /
+                                              sx->resources[resource].structured_stride,
+                                              sx->resources[resource].structured_stride /
                                               sizeof(uint32_t));
-            } else if (sx.resources[resource].raw) {
+            } else if (sx->resources[resource].raw) {
                emit_raw_buffer_bufinfo(ureg, dstreg, ureg_src(tmp));
             } else {
                ureg_MOV(ureg, dstreg, ureg_src(tmp));
@@ -3997,29 +4747,70 @@ Shader_tgsi_translate(const unsigned *code,
          break;
       }
 
+      case D3D11_SB_OPCODE_EVAL_SAMPLE_INDEX: {
+         const struct Shader_operand *input = &opcode.src[0].base;
+         if (parser.header.type != D3D10_SB_PIXEL_SHADER ||
+             input->type != D3D10_SB_OPERAND_TYPE_INPUT ||
+             input->index_dim != 1 ||
+             input->index[0].index_rep !=
+                D3D10_SB_OPERAND_INDEX_IMMEDIATE32 ||
+             input->index[0].imm >= SHADER_MAX_INPUTS ||
+             !sx->inputs[input->index[0].imm].declared ||
+             sx->inputs[input->index[0].imm].reg.File != TGSI_FILE_INPUT) {
+            YTTRIUM_WARN("yttrium: shader TGSI translation failed "
+                         "owner=d3d10umd-shader component=eval-sample-index "
+                         "reason=unsupported-input-form "
+                         "action=abort-translation\n");
+            sx->translation_failed = true;
+            break;
+         }
+
+         /* Pull the attribute itself, not a temporary containing its ordinary
+          * pixel-center value. TGSI retains the declaration's perspective
+          * mode while INTERP_SAMPLE overrides its interpolation location.
+          */
+         ureg_INTERP_SAMPLE(
+            ureg, translate_dst_operand(sx, &opcode.dst[0], false),
+            translate_src_operand(sx, &opcode.src[0], OF_FLOAT),
+            ureg_scalar(translate_src_operand(sx, &opcode.src[1], OF_UINT),
+                        TGSI_SWIZZLE_X));
+         break;
+      }
+
       case D3D10_1_SB_OPCODE_SAMPLE_INFO: {
          struct ureg_dst dstreg =
-            translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate);
+            translate_dst_operand(sx, &opcode.dst[0], opcode.saturate);
          struct ureg_src src[2];
          struct ureg_dst query_dst = dstreg;
          struct ureg_dst tmp = ureg_dst_undef();
          bool dst_is_float =
             sample_info_writes_float_color0(&opcode.dst[0]);
          unsigned resource;
+         unsigned view_slot;
 
          if (opcode.src[0].base.type == D3D10_SB_OPERAND_TYPE_RASTERIZER) {
-            emit_rasterizer_sample_info(&sx, dstreg, dst_is_float);
+            emit_rasterizer_sample_info(sx, dstreg, dst_is_float);
             break;
          }
 
          assert(opcode.src[0].base.type == D3D10_SB_OPERAND_TYPE_RESOURCE);
          assert(opcode.src[0].base.index_dim == 1);
          resource = opcode.src[0].base.index[0].imm;
+         view_slot = resource;
          assert(resource < SHADER_MAX_RESOURCES);
 
-         if (ureg_src_is_undef(sx.sv[resource])) {
-            sx.sv[resource] =
-               ureg_DECL_sampler_view(ureg, resource, sx.resources[resource].target,
+         if (sx->sampler_binding_map) {
+            if (!translate_binding_operand_index(
+                   sx, &opcode.src[0], D3D10_SB_OPERAND_TYPE_RESOURCE,
+                   SHADER_MAX_RESOURCES, "resource", &resource))
+               break;
+            declare_compact_sampler_for_resource(
+               sx, resource, PIPE_MAX_SAMPLERS,
+               (enum tgsi_texture_type)sx->resources[resource].target,
+               &view_slot);
+         } else if (ureg_src_is_undef(sx->sv[resource])) {
+            sx->sv[resource] =
+               ureg_DECL_sampler_view(ureg, resource, sx->resources[resource].target,
                                       TGSI_RETURN_TYPE_UINT,
                                       TGSI_RETURN_TYPE_UINT,
                                       TGSI_RETURN_TYPE_UINT,
@@ -4032,9 +4823,11 @@ Shader_tgsi_translate(const unsigned *code,
          }
 
          src[0] = ureg_imm1u(ureg, 0);
-         src[1] = translate_src_operand(&sx, &opcode.src[0], OF_UINT);
+         src[1] = sx->sampler_binding_map ?
+            compact_sampler_view_src(sx, view_slot, &opcode.src[0]) :
+            translate_src_operand(sx, &opcode.src[0], OF_UINT);
          ureg_tex_insn(ureg, TGSI_OPCODE_SAMPLE_INFO, &query_dst, 1,
-                       sx.resources[resource].target, NULL, 0, src, 2);
+                       sx->resources[resource].target, NULL, 0, src, 2);
          if (dst_is_float) {
             ureg_I2F(ureg, dstreg,
                      ureg_scalar(ureg_src(tmp), TGSI_SWIZZLE_X));
@@ -4045,9 +4838,10 @@ Shader_tgsi_translate(const unsigned *code,
 
       case D3D10_1_SB_OPCODE_SAMPLE_POS: {
          struct ureg_dst dstreg =
-            translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate);
+            translate_dst_operand(sx, &opcode.dst[0], opcode.saturate);
          struct ureg_src src[2];
          unsigned resource;
+         unsigned view_slot;
 
          if (opcode.src[0].base.type == D3D10_SB_OPERAND_TYPE_RASTERIZER) {
             ureg_MOV(ureg, dstreg, ureg_imm4f(ureg, 0.5f, 0.5f, 0.0f, 0.0f));
@@ -4057,26 +4851,38 @@ Shader_tgsi_translate(const unsigned *code,
          assert(opcode.src[0].base.type == D3D10_SB_OPERAND_TYPE_RESOURCE);
          assert(opcode.src[0].base.index_dim == 1);
          resource = opcode.src[0].base.index[0].imm;
+         view_slot = resource;
          assert(resource < SHADER_MAX_RESOURCES);
 
-         if ((sx.resources[resource].target == TGSI_TEXTURE_2D_MSAA ||
-              sx.resources[resource].target == TGSI_TEXTURE_2D_ARRAY_MSAA) &&
+         if ((sx->resources[resource].target == TGSI_TEXTURE_2D_MSAA ||
+              sx->resources[resource].target == TGSI_TEXTURE_2D_ARRAY_MSAA) &&
              try_emit_standard_4x_sample_position(ureg, dstreg, &opcode.src[1]))
             break;
 
-         if (ureg_src_is_undef(sx.sv[resource])) {
-            sx.sv[resource] =
-               ureg_DECL_sampler_view(ureg, resource, sx.resources[resource].target,
+         if (sx->sampler_binding_map) {
+            if (!translate_binding_operand_index(
+                   sx, &opcode.src[0], D3D10_SB_OPERAND_TYPE_RESOURCE,
+                   SHADER_MAX_RESOURCES, "resource", &resource))
+               break;
+            declare_compact_sampler_for_resource(
+               sx, resource, PIPE_MAX_SAMPLERS,
+               (enum tgsi_texture_type)sx->resources[resource].target,
+               &view_slot);
+         } else if (ureg_src_is_undef(sx->sv[resource])) {
+            sx->sv[resource] =
+               ureg_DECL_sampler_view(ureg, resource, sx->resources[resource].target,
                                       TGSI_RETURN_TYPE_FLOAT,
                                       TGSI_RETURN_TYPE_FLOAT,
                                       TGSI_RETURN_TYPE_FLOAT,
                                       TGSI_RETURN_TYPE_FLOAT);
          }
 
-         src[0] = translate_src_operand(&sx, &opcode.src[0], OF_UINT);
-         src[1] = translate_src_operand(&sx, &opcode.src[1], OF_UINT);
+         src[0] = sx->sampler_binding_map ?
+            compact_sampler_view_src(sx, view_slot, &opcode.src[0]) :
+            translate_src_operand(sx, &opcode.src[0], OF_UINT);
+         src[1] = translate_src_operand(sx, &opcode.src[1], OF_UINT);
          ureg_tex_insn(ureg, TGSI_OPCODE_SAMPLE_POS, &dstreg, 1,
-                       sx.resources[resource].target, NULL, 0, src, 2);
+                       sx->resources[resource].target, NULL, 0, src, 2);
          break;
       }
 
@@ -4099,7 +4905,21 @@ Shader_tgsi_translate(const unsigned *code,
          unsigned compare_src =
             has_dynamic_offset ? 4 : 3;
          unsigned resource = opcode.src[resource_src].base.index[0].imm;
-         enum tgsi_texture_type target = sx.resources[resource].target;
+         unsigned sampler = opcode.src[sampler_src].base.index[0].imm;
+         unsigned binding_slot = resource;
+
+         if (sx->sampler_binding_map &&
+             (!translate_binding_operand_index(
+                 sx, &opcode.src[resource_src],
+                 D3D10_SB_OPERAND_TYPE_RESOURCE, SHADER_MAX_RESOURCES,
+                 "resource", &resource) ||
+              !translate_binding_operand_index(
+                 sx, &opcode.src[sampler_src],
+                 D3D10_SB_OPERAND_TYPE_SAMPLER, SHADER_MAX_SAMPLERS,
+                 "sampler", &sampler)))
+            break;
+
+         enum tgsi_texture_type target = sx->resources[resource].target;
 
          assert(opcode.src[resource_src].base.index_dim == 1);
          assert(opcode.src[sampler_src].base.index_dim == 1);
@@ -4110,41 +4930,53 @@ Shader_tgsi_translate(const unsigned *code,
             const enum tgsi_texture_type shadow_target =
                translate_shadow_texture_target(target);
 
-            LOG_UNSUPPORTED(shadow_target == TGSI_TEXTURE_UNKNOWN);
+            SHADER_TRANSLATION_UNSUPPORTED(
+               sx, shadow_target == TGSI_TEXTURE_UNKNOWN);
             if (shadow_target != TGSI_TEXTURE_UNKNOWN)
                target = shadow_target;
 
             coord = ureg_DECL_temporary(ureg);
             ureg_MOV(ureg, coord,
-                     translate_src_operand(&sx, &opcode.src[0], OF_FLOAT));
+                     translate_src_operand(sx, &opcode.src[0], OF_FLOAT));
             ureg_MOV(ureg,
                      ureg_writemask(coord, shadow_ref_writemask(target)),
-                     translate_src_operand(&sx, &opcode.src[compare_src],
+                     translate_src_operand(sx, &opcode.src[compare_src],
                                            OF_FLOAT));
             srcreg[0] = ureg_src(coord);
          } else {
-            srcreg[0] = translate_src_operand(&sx, &opcode.src[0], OF_FLOAT);
+            srcreg[0] = translate_src_operand(sx, &opcode.src[0], OF_FLOAT);
          }
-         if (ureg_src_is_undef(sx.sv[resource])) {
-            sx.sv[resource] =
+         if (sx->sampler_binding_map) {
+            declare_compact_sampler_for_resource(
+               sx, resource, sampler, target, &binding_slot);
+         } else if (ureg_src_is_undef(sx->sv[resource])) {
+            sx->sv[resource] =
                ureg_DECL_sampler_view(ureg, resource, target,
                                       TGSI_RETURN_TYPE_FLOAT,
                                       TGSI_RETURN_TYPE_FLOAT,
                                       TGSI_RETURN_TYPE_FLOAT,
                                       TGSI_RETURN_TYPE_FLOAT);
          }
-         srcreg[1] = translate_src_operand(&sx, &opcode.src[resource_src], OF_UINT);
-         srcreg[2] = ureg_src_register(TGSI_FILE_SAMPLER_VIEW, resource);
-         srcreg[2] = ureg_swizzle(srcreg[2],
-                                  opcode.src[sampler_src].swizzle[0],
-                                  opcode.src[sampler_src].swizzle[1],
-                                  opcode.src[sampler_src].swizzle[2],
-                                  opcode.src[sampler_src].swizzle[3]);
+         if (sx->sampler_binding_map) {
+            srcreg[1] = compact_sampler_view_src(
+               sx, binding_slot, &opcode.src[resource_src]);
+            srcreg[2] = compact_sampler_view_src(
+               sx, binding_slot, &opcode.src[sampler_src]);
+         } else {
+            srcreg[1] = translate_src_operand(
+               sx, &opcode.src[resource_src], OF_UINT);
+            srcreg[2] = ureg_src_register(TGSI_FILE_SAMPLER_VIEW, resource);
+            srcreg[2] = ureg_swizzle(srcreg[2],
+                                     opcode.src[sampler_src].swizzle[0],
+                                     opcode.src[sampler_src].swizzle[1],
+                                     opcode.src[sampler_src].swizzle[2],
+                                     opcode.src[sampler_src].swizzle[3]);
+         }
          if (has_dynamic_offset)
-            dynamic_offset = translate_src_operand(&sx, &opcode.src[1], OF_INT);
+            dynamic_offset = translate_src_operand(sx, &opcode.src[1], OF_INT);
          sample_ureg_emit_target(ureg, TGSI_OPCODE_TG4, 3, &opcode,
                                  has_dynamic_offset ? &dynamic_offset : NULL,
-                                 translate_dst_operand(&sx, &opcode.dst[0],
+                                 translate_dst_operand(sx, &opcode.dst[0],
                                                        opcode.saturate),
                                  srcreg, target);
          if (!ureg_dst_is_undef(coord))
@@ -4154,32 +4986,51 @@ Shader_tgsi_translate(const unsigned *code,
 
       case D3D10_1_SB_OPCODE_LOD: {
          unsigned resource = opcode.src[1].base.index[0].imm;
+         unsigned sampler = opcode.src[2].base.index[0].imm;
+         unsigned binding_slot = resource;
          struct ureg_src srcreg[2];
 
          assert(opcode.src[1].base.index_dim == 1);
          assert(resource < SHADER_MAX_RESOURCES);
 
-         if (ureg_src_is_undef(sx.sv[resource])) {
-            sx.sv[resource] =
-               ureg_DECL_sampler_view(ureg, resource, sx.resources[resource].target,
+         if (sx->sampler_binding_map &&
+             (!translate_binding_operand_index(
+                 sx, &opcode.src[1], D3D10_SB_OPERAND_TYPE_RESOURCE,
+                 SHADER_MAX_RESOURCES, "resource", &resource) ||
+              !translate_binding_operand_index(
+                 sx, &opcode.src[2], D3D10_SB_OPERAND_TYPE_SAMPLER,
+                 SHADER_MAX_SAMPLERS, "sampler", &sampler)))
+            break;
+
+         if (sx->sampler_binding_map) {
+            declare_compact_sampler_for_resource(
+               sx, resource, sampler,
+               (enum tgsi_texture_type)sx->resources[resource].target,
+               &binding_slot);
+         } else if (ureg_src_is_undef(sx->sv[resource])) {
+            sx->sv[resource] =
+               ureg_DECL_sampler_view(ureg, resource, sx->resources[resource].target,
                                       TGSI_RETURN_TYPE_FLOAT,
                                       TGSI_RETURN_TYPE_FLOAT,
                                       TGSI_RETURN_TYPE_FLOAT,
                                       TGSI_RETURN_TYPE_FLOAT);
          }
 
-         srcreg[0] = translate_src_operand(&sx, &opcode.src[0], OF_FLOAT);
-         srcreg[1] = translate_src_operand(&sx, &opcode.src[1], OF_UINT);
+         srcreg[0] = translate_src_operand(sx, &opcode.src[0], OF_FLOAT);
+         srcreg[1] = sx->sampler_binding_map ?
+            compact_sampler_view_src(sx, binding_slot, &opcode.src[1]) :
+            translate_src_operand(sx, &opcode.src[1], OF_UINT);
          sample_ureg_emit_target(ureg, TGSI_OPCODE_LODQ, ARRAY_SIZE(srcreg),
                                  &opcode, NULL,
-                                 translate_dst_operand(&sx, &opcode.dst[0],
+                                 translate_dst_operand(sx, &opcode.dst[0],
                                                        opcode.saturate),
-                                 srcreg, sx.resources[resource].target);
+                                 srcreg, sx->resources[resource].target);
          break;
       }
 
       case D3D10_SB_OPCODE_SAMPLE:
-         if (use_old_tex_ops || (st_debug & ST_DEBUG_OLD_TEX_OPS)) {
+         if (sx->sampler_binding_map || use_old_tex_ops ||
+             (st_debug & ST_DEBUG_OLD_TEX_OPS)) {
             unsigned resource = opcode.src[1].base.index[0].imm;
             struct ureg_dst dst;
             struct ureg_dst tmp;
@@ -4189,26 +5040,35 @@ Shader_tgsi_translate(const unsigned *code,
             assert(opcode.src[1].base.index_dim == 1);
             assert(resource < SHADER_MAX_RESOURCES);
 
-            dst = translate_dst_operand(&sx, &opcode.dst[0],
+            if (sx->sampler_binding_map &&
+                !translate_binding_operand_index(
+                   sx, &opcode.src[1], D3D10_SB_OPERAND_TYPE_RESOURCE,
+                   SHADER_MAX_RESOURCES, "resource", &resource))
+               break;
+
+            dst = translate_dst_operand(sx, &opcode.dst[0],
                                         opcode.saturate);
-            coord = translate_src_operand(&sx, &opcode.src[0], OF_FLOAT);
-            sampler = translate_old_tex_sampler_for_resource(&sx, resource,
+            coord = translate_src_operand(sx, &opcode.src[0], OF_FLOAT);
+            sampler = translate_old_tex_sampler_for_resource(sx, resource,
                                                             &opcode.src[2]);
 
             tex_dst = old_tex_dst_for_resource_swizzle(ureg, dst,
                                                        &opcode.src[1], &tmp);
-            ureg_TEX(ureg, tex_dst, sx.resources[resource].target, coord,
-                     sampler);
+            struct ureg_src tex_src[] = { coord, sampler };
+            sample_ureg_emit_target(ureg, TGSI_OPCODE_TEX,
+                                    ARRAY_SIZE(tex_src), &opcode, NULL,
+                                    tex_dst, tex_src,
+                                    sx->resources[resource].target);
             old_tex_apply_resource_swizzle(ureg, dst, &opcode.src[1], tmp);
          }
          else {
             struct ureg_src srcreg[3];
-            srcreg[0] = translate_src_operand(&sx, &opcode.src[0], OF_FLOAT);
-            srcreg[1] = translate_src_operand(&sx, &opcode.src[1], OF_UINT);
-            srcreg[2] = translate_src_operand(&sx, &opcode.src[2], OF_UINT);
+            srcreg[0] = translate_src_operand(sx, &opcode.src[0], OF_FLOAT);
+            srcreg[1] = translate_src_operand(sx, &opcode.src[1], OF_UINT);
+            srcreg[2] = translate_src_operand(sx, &opcode.src[2], OF_UINT);
 
             sample_ureg_emit(ureg, TGSI_OPCODE_SAMPLE, 3, &opcode,
-                             translate_dst_operand(&sx, &opcode.dst[0],
+                             translate_dst_operand(sx, &opcode.dst[0],
                                                    opcode.saturate),
                              srcreg);
          }
@@ -4217,18 +5077,36 @@ Shader_tgsi_translate(const unsigned *code,
       case D3D10_SB_OPCODE_SAMPLE_C:
       {
          unsigned resource = opcode.src[1].base.index[0].imm;
-         const uint target = sx.resources[resource].target;
+         unsigned sampler = opcode.src[2].base.index[0].imm;
+         unsigned binding_slot = resource;
+         if (sx->sampler_binding_map &&
+             (!translate_binding_operand_index(
+                 sx, &opcode.src[1], D3D10_SB_OPERAND_TYPE_RESOURCE,
+                 SHADER_MAX_RESOURCES, "resource", &resource) ||
+              !translate_binding_operand_index(
+                 sx, &opcode.src[2], D3D10_SB_OPERAND_TYPE_SAMPLER,
+                 SHADER_MAX_SAMPLERS, "sampler", &sampler)))
+            break;
+
+         const uint target = sx->resources[resource].target;
          const uint shadow_target = translate_shadow_texture_target(target);
+         const uint instruction_target =
+            shadow_target != TGSI_TEXTURE_UNKNOWN ? shadow_target : target;
          struct ureg_src srcreg[4];
 
          assert(opcode.src[1].base.index_dim == 1);
          assert(opcode.src[2].base.index_dim == 1);
          assert(resource < SHADER_MAX_RESOURCES);
 
-         LOG_UNSUPPORTED(shadow_target == TGSI_TEXTURE_UNKNOWN);
+         SHADER_TRANSLATION_UNSUPPORTED(
+            sx, shadow_target == TGSI_TEXTURE_UNKNOWN);
 
-         if (ureg_src_is_undef(sx.sv[resource])) {
-            sx.sv[resource] =
+         if (sx->sampler_binding_map) {
+            declare_compact_sampler_for_resource(
+               sx, resource, sampler,
+               (enum tgsi_texture_type)instruction_target, &binding_slot);
+         } else if (ureg_src_is_undef(sx->sv[resource])) {
+            sx->sv[resource] =
                ureg_DECL_sampler_view(ureg, resource, target,
                                       TGSI_RETURN_TYPE_FLOAT,
                                       TGSI_RETURN_TYPE_FLOAT,
@@ -4236,42 +5114,64 @@ Shader_tgsi_translate(const unsigned *code,
                                       TGSI_RETURN_TYPE_FLOAT);
          }
 
-         srcreg[0] = translate_src_operand(&sx, &opcode.src[0], OF_FLOAT);
-         srcreg[1] = ureg_src_register(TGSI_FILE_SAMPLER_VIEW, resource);
-         srcreg[1] = ureg_swizzle(srcreg[1],
-                                  opcode.src[1].swizzle[0],
-                                  opcode.src[1].swizzle[1],
-                                  opcode.src[1].swizzle[2],
-                                  opcode.src[1].swizzle[3]);
+         srcreg[0] = translate_src_operand(sx, &opcode.src[0], OF_FLOAT);
+         srcreg[1] = sx->sampler_binding_map ?
+            compact_sampler_view_src(sx, binding_slot, &opcode.src[1]) :
+            ureg_src_register(TGSI_FILE_SAMPLER_VIEW, resource);
+         if (!sx->sampler_binding_map)
+            srcreg[1] = ureg_swizzle(srcreg[1],
+                                     opcode.src[1].swizzle[0],
+                                     opcode.src[1].swizzle[1],
+                                     opcode.src[1].swizzle[2],
+                                     opcode.src[1].swizzle[3]);
          assert(opcode.src[1].modifier == D3D10_SB_OPERAND_MODIFIER_NONE);
-         srcreg[2] = ureg_src_register(TGSI_FILE_SAMPLER_VIEW, resource);
-         srcreg[3] = translate_src_operand(&sx, &opcode.src[3], OF_FLOAT);
+         srcreg[2] = ureg_src_register(
+            TGSI_FILE_SAMPLER_VIEW,
+            sx->sampler_binding_map ? binding_slot : resource);
+         srcreg[3] = translate_src_operand(sx, &opcode.src[3], OF_FLOAT);
 
          sample_ureg_emit_target(ureg, TGSI_OPCODE_SAMPLE_C, ARRAY_SIZE(srcreg),
                                  &opcode, NULL,
-                                 translate_dst_operand(&sx, &opcode.dst[0],
+                                 translate_dst_operand(sx, &opcode.dst[0],
                                                        opcode.saturate),
                                  srcreg,
-                                 shadow_target != TGSI_TEXTURE_UNKNOWN ?
-                                 shadow_target : target);
+                                 instruction_target);
          break;
       }
 
       case D3D10_SB_OPCODE_SAMPLE_C_LZ:
       {
          unsigned resource = opcode.src[1].base.index[0].imm;
-         const uint target = sx.resources[resource].target;
+         unsigned sampler = opcode.src[2].base.index[0].imm;
+         unsigned binding_slot = resource;
+         if (sx->sampler_binding_map &&
+             (!translate_binding_operand_index(
+                 sx, &opcode.src[1], D3D10_SB_OPERAND_TYPE_RESOURCE,
+                 SHADER_MAX_RESOURCES, "resource", &resource) ||
+              !translate_binding_operand_index(
+                 sx, &opcode.src[2], D3D10_SB_OPERAND_TYPE_SAMPLER,
+                 SHADER_MAX_SAMPLERS, "sampler", &sampler)))
+            break;
+
+         const uint target = sx->resources[resource].target;
          const uint shadow_target = translate_shadow_texture_target(target);
+         const uint instruction_target =
+            shadow_target != TGSI_TEXTURE_UNKNOWN ? shadow_target : target;
          struct ureg_src srcreg[4];
 
          assert(opcode.src[1].base.index_dim == 1);
          assert(opcode.src[2].base.index_dim == 1);
          assert(resource < SHADER_MAX_RESOURCES);
 
-         LOG_UNSUPPORTED(shadow_target == TGSI_TEXTURE_UNKNOWN);
+         SHADER_TRANSLATION_UNSUPPORTED(
+            sx, shadow_target == TGSI_TEXTURE_UNKNOWN);
 
-         if (ureg_src_is_undef(sx.sv[resource])) {
-            sx.sv[resource] =
+         if (sx->sampler_binding_map) {
+            declare_compact_sampler_for_resource(
+               sx, resource, sampler,
+               (enum tgsi_texture_type)instruction_target, &binding_slot);
+         } else if (ureg_src_is_undef(sx->sv[resource])) {
+            sx->sv[resource] =
                ureg_DECL_sampler_view(ureg, resource, target,
                                       TGSI_RETURN_TYPE_FLOAT,
                                       TGSI_RETURN_TYPE_FLOAT,
@@ -4279,52 +5179,64 @@ Shader_tgsi_translate(const unsigned *code,
                                       TGSI_RETURN_TYPE_FLOAT);
          }
 
-         srcreg[0] = translate_src_operand(&sx, &opcode.src[0], OF_FLOAT);
-         srcreg[1] = ureg_src_register(TGSI_FILE_SAMPLER_VIEW, resource);
-         srcreg[1] = ureg_swizzle(srcreg[1],
-                                  opcode.src[1].swizzle[0],
-                                  opcode.src[1].swizzle[1],
-                                  opcode.src[1].swizzle[2],
-                                  opcode.src[1].swizzle[3]);
+         srcreg[0] = translate_src_operand(sx, &opcode.src[0], OF_FLOAT);
+         srcreg[1] = sx->sampler_binding_map ?
+            compact_sampler_view_src(sx, binding_slot, &opcode.src[1]) :
+            ureg_src_register(TGSI_FILE_SAMPLER_VIEW, resource);
+         if (!sx->sampler_binding_map)
+            srcreg[1] = ureg_swizzle(srcreg[1],
+                                     opcode.src[1].swizzle[0],
+                                     opcode.src[1].swizzle[1],
+                                     opcode.src[1].swizzle[2],
+                                     opcode.src[1].swizzle[3]);
          assert(opcode.src[1].modifier == D3D10_SB_OPERAND_MODIFIER_NONE);
-         srcreg[2] = ureg_src_register(TGSI_FILE_SAMPLER_VIEW, resource);
-         srcreg[3] = translate_src_operand(&sx, &opcode.src[3], OF_FLOAT);
+         srcreg[2] = ureg_src_register(
+            TGSI_FILE_SAMPLER_VIEW,
+            sx->sampler_binding_map ? binding_slot : resource);
+         srcreg[3] = translate_src_operand(sx, &opcode.src[3], OF_FLOAT);
 
          sample_ureg_emit_target(ureg, TGSI_OPCODE_SAMPLE_C_LZ,
                                  ARRAY_SIZE(srcreg), &opcode, NULL,
-                                 translate_dst_operand(&sx, &opcode.dst[0],
+                                 translate_dst_operand(sx, &opcode.dst[0],
                                                        opcode.saturate),
                                  srcreg,
-                                 shadow_target != TGSI_TEXTURE_UNKNOWN ?
-                                 shadow_target : target);
+                                 instruction_target);
          break;
       }
 
       case D3D10_SB_OPCODE_SAMPLE_L:
-         if (use_old_tex_ops || (st_debug & ST_DEBUG_OLD_TEX_OPS)) {
+         if (sx->sampler_binding_map || use_old_tex_ops ||
+             (st_debug & ST_DEBUG_OLD_TEX_OPS)) {
             unsigned resource = opcode.src[1].base.index[0].imm;
             struct ureg_dst dst =
-               translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate);
+               translate_dst_operand(sx, &opcode.dst[0], opcode.saturate);
             struct ureg_dst tmp;
             struct ureg_dst tex_dst;
 
             assert(opcode.src[1].base.index_dim == 1);
             assert(resource < SHADER_MAX_RESOURCES);
 
+            if (sx->sampler_binding_map &&
+                !translate_binding_operand_index(
+                   sx, &opcode.src[1], D3D10_SB_OPERAND_TYPE_RESOURCE,
+                   SHADER_MAX_RESOURCES, "resource", &resource))
+               break;
+
             tex_dst = old_tex_dst_for_resource_swizzle(ureg, dst,
                                                        &opcode.src[1], &tmp);
-            if (sx.resources[resource].target == TGSI_TEXTURE_CUBE_ARRAY) {
+            if (sx->resources[resource].target == TGSI_TEXTURE_CUBE_ARRAY) {
                /* Cube-array coordinates need .w for the array index. */
                struct ureg_src srcreg[3];
-               srcreg[0] = translate_src_operand(&sx, &opcode.src[0], OF_FLOAT);
-               srcreg[1] = translate_src_operand(&sx, &opcode.src[3], OF_FLOAT);
+               srcreg[0] = translate_src_operand(sx, &opcode.src[0], OF_FLOAT);
+               srcreg[1] = translate_src_operand(sx, &opcode.src[3], OF_FLOAT);
                srcreg[2] =
-                  translate_old_tex_sampler_for_resource(&sx, resource,
+                  translate_old_tex_sampler_for_resource(sx, resource,
                                                          &opcode.src[2]);
 
-               ureg_tex_insn(ureg, TGSI_OPCODE_TXL2,
-                             &tex_dst, 1, sx.resources[resource].target, NULL, 0,
-                             srcreg, ARRAY_SIZE(srcreg));
+               sample_ureg_emit_target(ureg, TGSI_OPCODE_TXL2,
+                                       ARRAY_SIZE(srcreg), &opcode, NULL,
+                                       tex_dst, srcreg,
+                                       sx->resources[resource].target);
             } else {
                struct ureg_dst r0 = ureg_DECL_temporary(ureg);
 
@@ -4332,17 +5244,20 @@ Shader_tgsi_translate(const unsigned *code,
                 */
                ureg_MOV(ureg,
                         ureg_writemask(r0, TGSI_WRITEMASK_XYZ),
-                        translate_src_operand(&sx, &opcode.src[0], OF_FLOAT));
+                        translate_src_operand(sx, &opcode.src[0], OF_FLOAT));
                ureg_MOV(ureg,
                         ureg_writemask(r0, TGSI_WRITEMASK_W),
-                        translate_src_operand(&sx, &opcode.src[3], OF_FLOAT));
+                        translate_src_operand(sx, &opcode.src[3], OF_FLOAT));
 
-               ureg_TXL(ureg,
-                        tex_dst,
-                        sx.resources[resource].target,
-                        ureg_src(r0),
-                        translate_old_tex_sampler_for_resource(&sx, resource,
-                                                              &opcode.src[2]));
+               struct ureg_src tex_src[] = {
+                  ureg_src(r0),
+                  translate_old_tex_sampler_for_resource(sx, resource,
+                                                         &opcode.src[2]),
+               };
+               sample_ureg_emit_target(ureg, TGSI_OPCODE_TXL,
+                                       ARRAY_SIZE(tex_src), &opcode, NULL,
+                                       tex_dst, tex_src,
+                                       sx->resources[resource].target);
 
                ureg_release_temporary(ureg, r0);
             }
@@ -4350,97 +5265,117 @@ Shader_tgsi_translate(const unsigned *code,
          }
          else {
             struct ureg_src srcreg[4];
-            srcreg[0] = translate_src_operand(&sx, &opcode.src[0], OF_FLOAT);
-            srcreg[1] = translate_src_operand(&sx, &opcode.src[1], OF_UINT);
-            srcreg[2] = translate_src_operand(&sx, &opcode.src[2], OF_UINT);
-            srcreg[3] = translate_src_operand(&sx, &opcode.src[3], OF_FLOAT);
+            srcreg[0] = translate_src_operand(sx, &opcode.src[0], OF_FLOAT);
+            srcreg[1] = translate_src_operand(sx, &opcode.src[1], OF_UINT);
+            srcreg[2] = translate_src_operand(sx, &opcode.src[2], OF_UINT);
+            srcreg[3] = translate_src_operand(sx, &opcode.src[3], OF_FLOAT);
 
             sample_ureg_emit(ureg, TGSI_OPCODE_SAMPLE_L, 4, &opcode,
-                             translate_dst_operand(&sx, &opcode.dst[0],
+                             translate_dst_operand(sx, &opcode.dst[0],
                                                    opcode.saturate),
                              srcreg);
          }
          break;
 
       case D3D10_SB_OPCODE_SAMPLE_D:
-         if (use_old_tex_ops || (st_debug & ST_DEBUG_OLD_TEX_OPS)) {
+         if (sx->sampler_binding_map || use_old_tex_ops ||
+             (st_debug & ST_DEBUG_OLD_TEX_OPS)) {
             unsigned resource = opcode.src[1].base.index[0].imm;
             struct ureg_dst dst =
-               translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate);
+               translate_dst_operand(sx, &opcode.dst[0], opcode.saturate);
             struct ureg_dst tmp;
             struct ureg_dst tex_dst;
             assert(opcode.src[1].base.index_dim == 1);
             assert(resource < SHADER_MAX_RESOURCES);
 
+            if (sx->sampler_binding_map &&
+                !translate_binding_operand_index(
+                   sx, &opcode.src[1], D3D10_SB_OPERAND_TYPE_RESOURCE,
+                   SHADER_MAX_RESOURCES, "resource", &resource))
+               break;
+
             tex_dst = old_tex_dst_for_resource_swizzle(ureg, dst,
                                                        &opcode.src[1], &tmp);
-            ureg_TXD(ureg,
-                     tex_dst,
-                     sx.resources[resource].target,
-                     translate_src_operand(&sx, &opcode.src[0], OF_FLOAT),
-                     translate_src_operand(&sx, &opcode.src[3], OF_FLOAT),
-                     translate_src_operand(&sx, &opcode.src[4], OF_FLOAT),
-                     translate_old_tex_sampler_for_resource(&sx, resource,
-                                                           &opcode.src[2]));
+            struct ureg_src tex_src[] = {
+               translate_src_operand(sx, &opcode.src[0], OF_FLOAT),
+               translate_src_operand(sx, &opcode.src[3], OF_FLOAT),
+               translate_src_operand(sx, &opcode.src[4], OF_FLOAT),
+               translate_old_tex_sampler_for_resource(sx, resource,
+                                                      &opcode.src[2]),
+            };
+            sample_ureg_emit_target(ureg, TGSI_OPCODE_TXD,
+                                    ARRAY_SIZE(tex_src), &opcode, NULL,
+                                    tex_dst, tex_src,
+                                    sx->resources[resource].target);
             old_tex_apply_resource_swizzle(ureg, dst, &opcode.src[1], tmp);
          }
          else {
             struct ureg_src srcreg[5];
-            srcreg[0] = translate_src_operand(&sx, &opcode.src[0], OF_FLOAT);
-            srcreg[1] = translate_src_operand(&sx, &opcode.src[1], OF_UINT);
-            srcreg[2] = translate_src_operand(&sx, &opcode.src[2], OF_UINT);
-            srcreg[3] = translate_src_operand(&sx, &opcode.src[3], OF_FLOAT);
-            srcreg[4] = translate_src_operand(&sx, &opcode.src[4], OF_FLOAT);
+            srcreg[0] = translate_src_operand(sx, &opcode.src[0], OF_FLOAT);
+            srcreg[1] = translate_src_operand(sx, &opcode.src[1], OF_UINT);
+            srcreg[2] = translate_src_operand(sx, &opcode.src[2], OF_UINT);
+            srcreg[3] = translate_src_operand(sx, &opcode.src[3], OF_FLOAT);
+            srcreg[4] = translate_src_operand(sx, &opcode.src[4], OF_FLOAT);
 
             sample_ureg_emit(ureg, TGSI_OPCODE_SAMPLE_D, 5, &opcode,
-                             translate_dst_operand(&sx, &opcode.dst[0],
+                             translate_dst_operand(sx, &opcode.dst[0],
                                                    opcode.saturate),
                              srcreg);
          }
          break;
 
       case D3D10_SB_OPCODE_SAMPLE_B:
-         if (use_old_tex_ops || (st_debug & ST_DEBUG_OLD_TEX_OPS)) {
+         if (sx->sampler_binding_map || use_old_tex_ops ||
+             (st_debug & ST_DEBUG_OLD_TEX_OPS)) {
             struct ureg_dst r0 = ureg_DECL_temporary(ureg);
             unsigned resource = opcode.src[1].base.index[0].imm;
             struct ureg_dst dst =
-               translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate);
+               translate_dst_operand(sx, &opcode.dst[0], opcode.saturate);
             struct ureg_dst tmp;
             struct ureg_dst tex_dst;
 
             assert(opcode.src[1].base.index_dim == 1);
             assert(resource < SHADER_MAX_RESOURCES);
 
+            if (sx->sampler_binding_map &&
+                !translate_binding_operand_index(
+                   sx, &opcode.src[1], D3D10_SB_OPERAND_TYPE_RESOURCE,
+                   SHADER_MAX_RESOURCES, "resource", &resource))
+               break;
+
             /* Insert LOD bias into .w component.
              */
             ureg_MOV(ureg,
                      ureg_writemask(r0, TGSI_WRITEMASK_XYZ),
-                     translate_src_operand(&sx, &opcode.src[0], OF_FLOAT));
+                     translate_src_operand(sx, &opcode.src[0], OF_FLOAT));
             ureg_MOV(ureg,
                      ureg_writemask(r0, TGSI_WRITEMASK_W),
-                     translate_src_operand(&sx, &opcode.src[3], OF_FLOAT));
+                     translate_src_operand(sx, &opcode.src[3], OF_FLOAT));
 
             tex_dst = old_tex_dst_for_resource_swizzle(ureg, dst,
                                                        &opcode.src[1], &tmp);
-            ureg_TXB(ureg,
-                     tex_dst,
-                     sx.resources[resource].target,
-                     ureg_src(r0),
-                     translate_old_tex_sampler_for_resource(&sx, resource,
-                                                           &opcode.src[2]));
+            struct ureg_src tex_src[] = {
+               ureg_src(r0),
+               translate_old_tex_sampler_for_resource(sx, resource,
+                                                      &opcode.src[2]),
+            };
+            sample_ureg_emit_target(ureg, TGSI_OPCODE_TXB,
+                                    ARRAY_SIZE(tex_src), &opcode, NULL,
+                                    tex_dst, tex_src,
+                                    sx->resources[resource].target);
             old_tex_apply_resource_swizzle(ureg, dst, &opcode.src[1], tmp);
 
             ureg_release_temporary(ureg, r0);
          }
          else {
             struct ureg_src srcreg[4];
-            srcreg[0] = translate_src_operand(&sx, &opcode.src[0], OF_FLOAT);
-            srcreg[1] = translate_src_operand(&sx, &opcode.src[1], OF_UINT);
-            srcreg[2] = translate_src_operand(&sx, &opcode.src[2], OF_UINT);
-            srcreg[3] = translate_src_operand(&sx, &opcode.src[3], OF_FLOAT);
+            srcreg[0] = translate_src_operand(sx, &opcode.src[0], OF_FLOAT);
+            srcreg[1] = translate_src_operand(sx, &opcode.src[1], OF_UINT);
+            srcreg[2] = translate_src_operand(sx, &opcode.src[2], OF_UINT);
+            srcreg[3] = translate_src_operand(sx, &opcode.src[3], OF_FLOAT);
 
             sample_ureg_emit(ureg, TGSI_OPCODE_SAMPLE_B, 4, &opcode,
-                             translate_dst_operand(&sx, &opcode.dst[0],
+                             translate_dst_operand(sx, &opcode.dst[0],
                                                    opcode.saturate),
                              srcreg);
          }
@@ -4448,9 +5383,9 @@ Shader_tgsi_translate(const unsigned *code,
 
       case D3D10_SB_OPCODE_SINCOS: {
          struct ureg_dst src0 = ureg_DECL_temporary(ureg);
-         ureg_MOV(ureg, src0, translate_src_operand(&sx, &opcode.src[0], OF_FLOAT));
+         ureg_MOV(ureg, src0, translate_src_operand(sx, &opcode.src[0], OF_FLOAT));
          if (opcode.dst[0].base.type != D3D10_SB_OPERAND_TYPE_NULL) {
-            struct ureg_dst dst = translate_dst_operand(&sx, &opcode.dst[0],
+            struct ureg_dst dst = translate_dst_operand(sx, &opcode.dst[0],
                                                         opcode.saturate);
             struct ureg_src src = ureg_src(src0);
             ureg_SIN(ureg, ureg_writemask(dst, TGSI_WRITEMASK_X),
@@ -4463,7 +5398,7 @@ Shader_tgsi_translate(const unsigned *code,
                      ureg_scalar(src, TGSI_SWIZZLE_W));
          }
          if (opcode.dst[1].base.type != D3D10_SB_OPERAND_TYPE_NULL) {
-            struct ureg_dst dst = translate_dst_operand(&sx, &opcode.dst[1],
+            struct ureg_dst dst = translate_dst_operand(sx, &opcode.dst[1],
                                                         opcode.saturate);
             struct ureg_src src = ureg_src(src0);
             ureg_COS(ureg, ureg_writemask(dst, TGSI_WRITEMASK_X),
@@ -4482,17 +5417,17 @@ Shader_tgsi_translate(const unsigned *code,
       case D3D10_SB_OPCODE_UDIV: {
          struct ureg_dst src0 = ureg_DECL_temporary(ureg);
          struct ureg_dst src1 = ureg_DECL_temporary(ureg);
-         ureg_MOV(ureg, src0, translate_src_operand(&sx, &opcode.src[0], OF_UINT));
-         ureg_MOV(ureg, src1, translate_src_operand(&sx, &opcode.src[1], OF_UINT));
+         ureg_MOV(ureg, src0, translate_src_operand(sx, &opcode.src[0], OF_UINT));
+         ureg_MOV(ureg, src1, translate_src_operand(sx, &opcode.src[1], OF_UINT));
          if (opcode.dst[0].base.type != D3D10_SB_OPERAND_TYPE_NULL) {
             ureg_UDIV(ureg,
-                      translate_dst_operand(&sx, &opcode.dst[0],
+                      translate_dst_operand(sx, &opcode.dst[0],
                                             opcode.saturate),
                       ureg_src(src0), ureg_src(src1));
          }
          if (opcode.dst[1].base.type != D3D10_SB_OPERAND_TYPE_NULL) {
             ureg_UMOD(ureg,
-                      translate_dst_operand(&sx, &opcode.dst[1],
+                      translate_dst_operand(sx, &opcode.dst[1],
                                             opcode.saturate),
                       ureg_src(src0), ureg_src(src1));
          }
@@ -4503,17 +5438,17 @@ Shader_tgsi_translate(const unsigned *code,
       case D3D10_SB_OPCODE_UMUL: {
          if (opcode.dst[0].base.type != D3D10_SB_OPERAND_TYPE_NULL) {
             ureg_UMUL_HI(ureg,
-                         translate_dst_operand(&sx, &opcode.dst[0],
+                         translate_dst_operand(sx, &opcode.dst[0],
                                                opcode.saturate),
-                         translate_src_operand(&sx, &opcode.src[0], OF_UINT),
-                         translate_src_operand(&sx, &opcode.src[1], OF_UINT));
+                         translate_src_operand(sx, &opcode.src[0], OF_UINT),
+                         translate_src_operand(sx, &opcode.src[1], OF_UINT));
          }
          if (opcode.dst[1].base.type != D3D10_SB_OPERAND_TYPE_NULL) {
             ureg_UMUL(ureg,
-                      translate_dst_operand(&sx, &opcode.dst[1],
+                      translate_dst_operand(sx, &opcode.dst[1],
                                             opcode.saturate),
-                      translate_src_operand(&sx, &opcode.src[0], OF_UINT),
-                      translate_src_operand(&sx, &opcode.src[1], OF_UINT));
+                      translate_src_operand(sx, &opcode.src[0], OF_UINT),
+                      translate_src_operand(sx, &opcode.src[1], OF_UINT));
          }
       }
          break;
@@ -4526,12 +5461,41 @@ Shader_tgsi_translate(const unsigned *code,
          assert(res_index < SHADER_MAX_RESOURCES);
 
          target = translate_resource_dimension(opcode.specific.dcl_resource_dimension);
-         sx.resources[res_index].target = target;
-         sx.resources[res_index].structured_stride = 0;
-         sx.resources[res_index].raw = false;
+         sx->resources[res_index].target = target;
+         sx->resources[res_index].structured_stride = 0;
+         sx->resources[res_index].raw = false;
+         uint8_t mixed_return_component_mask = 0;
          for (unsigned component = 0; component < 4; component++) {
-            sx.resources[res_index].return_type[component] =
-               trans_dcl_ret_type(opcode.dcl_resource_ret_type[component]);
+            if (opcode.dcl_resource_ret_type[component] ==
+                D3D10_SB_RETURN_TYPE_MIXED)
+               mixed_return_component_mask |= 1u << component;
+            sx->resources[res_index].return_type[component] =
+               trans_dcl_ret_type(sx,
+                                  opcode.dcl_resource_ret_type[component]);
+         }
+         sx->resources[res_index].mixed_return_component_mask =
+            mixed_return_component_mask;
+         if (mixed_return_component_mask) {
+            YTTRIUM_WARN("yttrium: WARNING: shader resource typeless return "
+                         "mapped to float owner=d3d10umd stage=%u resource=%u "
+                         "dimension=%u return_types=%u,%u,%u,%u\n",
+                         parser.header.type, res_index,
+                         opcode.specific.dcl_resource_dimension,
+                         opcode.dcl_resource_ret_type[0],
+                         opcode.dcl_resource_ret_type[1],
+                         opcode.dcl_resource_ret_type[2],
+                         opcode.dcl_resource_ret_type[3]);
+         }
+         if (sx->sampler_binding_map && target == TGSI_TEXTURE_BUFFER &&
+             mixed_return_component_mask &&
+             mixed_return_component_mask != TGSI_WRITEMASK_XYZW) {
+            YTTRIUM_WARN("yttrium: shader TGSI translation failed "
+                         "owner=d3d10umd-shader component=mixed-buffer-return "
+                         "reason=partial-component-mask stage=%u resource=%u "
+                         "mask=0x%x action=abort-translation\n",
+                         parser.header.type, res_index,
+                         mixed_return_component_mask);
+            sx->translation_failed = true;
          }
          break;
       }
@@ -4544,14 +5508,14 @@ Shader_tgsi_translate(const unsigned *code,
          assert(image_index < SHADER_MAX_IMAGES);
 
          target = translate_resource_dimension(opcode.specific.dcl_resource_dimension);
-         sx.images[image_index].target = target;
-         sx.images[image_index].structured_stride = 0;
-         sx.images[image_index].raw = false;
-         sx.images[image_index].format =
-            trans_image_format(opcode.dcl_resource_ret_type[0]);
-         sx.images[image_index].reg =
+         sx->images[image_index].target = target;
+         sx->images[image_index].structured_stride = 0;
+         sx->images[image_index].raw = false;
+         sx->images[image_index].format =
+            trans_image_format(sx, opcode.dcl_resource_ret_type[0]);
+         sx->images[image_index].reg =
             ureg_DECL_image(ureg, image_index, target,
-                            sx.images[image_index].format, true, false);
+                            sx->images[image_index].format, true, false);
          break;
       }
 
@@ -4562,15 +5526,24 @@ Shader_tgsi_translate(const unsigned *code,
          assert(opcode.dst[0].base.index_dim == 1);
          assert(image_index < SHADER_MAX_IMAGES);
 
-         sx.images[image_index].target = TGSI_TEXTURE_BUFFER;
-         sx.images[image_index].raw =
+         sx->images[image_index].target = TGSI_TEXTURE_BUFFER;
+         sx->images[image_index].raw =
             opcode.type == DX10_SM5_OPCODE_DCL_UAV_RAW;
-         sx.images[image_index].structured_stride = 0;
-         if (opcode.type == DX10_SM5_OPCODE_DCL_UAV_STRUCTURED)
-            sx.images[image_index].structured_stride =
+         sx->images[image_index].structured_stride = 0;
+         if (opcode.type == DX10_SM5_OPCODE_DCL_UAV_STRUCTURED) {
+            sx->images[image_index].structured_stride =
                opcode.specific.dcl_structured_stride;
-         sx.images[image_index].format = PIPE_FORMAT_R32_UINT;
-         sx.images[image_index].reg =
+            if (!sx->images[image_index].structured_stride ||
+                (sx->images[image_index].structured_stride & 3)) {
+               YTTRIUM_WARN("yttrium: shader translation rejected owner=d3d10umd "
+                            "reason=invalid-structured-uav-dword-stride slot=%u stride=%u\n",
+                            image_index, sx->images[image_index].structured_stride);
+               sx->translation_failed = true;
+               break;
+            }
+         }
+         sx->images[image_index].format = PIPE_FORMAT_R32_UINT;
+         sx->images[image_index].reg =
             ureg_DECL_image(ureg, image_index, TGSI_TEXTURE_BUFFER,
                             PIPE_FORMAT_R32_UINT, true, false);
          break;
@@ -4583,15 +5556,19 @@ Shader_tgsi_translate(const unsigned *code,
          assert(opcode.dst[0].base.index_dim == 1);
          assert(res_index < SHADER_MAX_RESOURCES);
 
-         sx.resources[res_index].target = TGSI_TEXTURE_BUFFER;
-         sx.resources[res_index].raw =
+         sx->resources[res_index].target = TGSI_TEXTURE_BUFFER;
+         sx->resources[res_index].raw =
             opcode.type == DX10_SM5_OPCODE_DCL_RESOURCE_RAW;
-         sx.resources[res_index].structured_stride = 0;
+         sx->resources[res_index].structured_stride = 0;
          if (opcode.type == DX10_SM5_OPCODE_DCL_RESOURCE_STRUCTURED)
-            sx.resources[res_index].structured_stride =
+            sx->resources[res_index].structured_stride =
                opcode.specific.dcl_structured_stride;
-         if (!(use_old_tex_ops || (st_debug & ST_DEBUG_OLD_TEX_OPS))) {
-            sx.sv[res_index] =
+         for (unsigned component = 0; component < 4; component++)
+            sx->resources[res_index].return_type[component] =
+               TGSI_RETURN_TYPE_UINT;
+         if (!(sx->sampler_binding_map || use_old_tex_ops ||
+               (st_debug & ST_DEBUG_OLD_TEX_OPS))) {
+            sx->sv[res_index] =
                ureg_DECL_sampler_view(ureg, res_index, TGSI_TEXTURE_BUFFER,
                                       TGSI_RETURN_TYPE_UINT,
                                       TGSI_RETURN_TYPE_UINT,
@@ -4623,9 +5600,11 @@ Shader_tgsi_translate(const unsigned *code,
          assert(opcode.dst[0].base.index_dim == 1);
          assert(opcode.dst[0].base.index[0].imm < SHADER_MAX_SAMPLERS);
 
-         sx.samplers[opcode.dst[0].base.index[0].imm] =
-            ureg_DECL_sampler(ureg,
-                              opcode.dst[0].base.index[0].imm);
+         if (!sx->sampler_binding_map) {
+            sx->samplers[opcode.dst[0].base.index[0].imm] =
+               ureg_DECL_sampler(ureg,
+                                 opcode.dst[0].base.index[0].imm);
+         }
          break;
 
       case D3D10_SB_OPCODE_DCL_GS_OUTPUT_PRIMITIVE_TOPOLOGY:
@@ -4633,19 +5612,19 @@ Shader_tgsi_translate(const unsigned *code,
 
          switch (opcode.specific.dcl_gs_output_primitive_topology) {
          case D3D10_SB_PRIMITIVE_TOPOLOGY_POINTLIST:
-            ureg_property(sx.ureg,
+            ureg_property(sx->ureg,
                           TGSI_PROPERTY_GS_OUTPUT_PRIM,
                           MESA_PRIM_POINTS);
             break;
 
          case D3D10_SB_PRIMITIVE_TOPOLOGY_LINESTRIP:
-            ureg_property(sx.ureg,
+            ureg_property(sx->ureg,
                           TGSI_PROPERTY_GS_OUTPUT_PRIM,
                           MESA_PRIM_LINE_STRIP);
             break;
 
          case D3D10_SB_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP:
-            ureg_property(sx.ureg,
+            ureg_property(sx->ureg,
                           TGSI_PROPERTY_GS_OUTPUT_PRIM,
                           MESA_PRIM_TRIANGLE_STRIP);
             break;
@@ -4662,36 +5641,36 @@ Shader_tgsi_translate(const unsigned *code,
           */
          switch (opcode.specific.dcl_gs_input_primitive) {
          case D3D10_SB_PRIMITIVE_POINT:
-            declare_vertices_in(&sx, 1);
-            ureg_property(sx.ureg,
+            declare_vertices_in(sx, 1);
+            ureg_property(sx->ureg,
                           TGSI_PROPERTY_GS_INPUT_PRIM,
                           MESA_PRIM_POINTS);
             break;
 
          case D3D10_SB_PRIMITIVE_LINE:
-            declare_vertices_in(&sx, 2);
-            ureg_property(sx.ureg,
+            declare_vertices_in(sx, 2);
+            ureg_property(sx->ureg,
                           TGSI_PROPERTY_GS_INPUT_PRIM,
                           MESA_PRIM_LINES);
             break;
 
          case D3D10_SB_PRIMITIVE_TRIANGLE:
-            declare_vertices_in(&sx, 3);
-            ureg_property(sx.ureg,
+            declare_vertices_in(sx, 3);
+            ureg_property(sx->ureg,
                           TGSI_PROPERTY_GS_INPUT_PRIM,
                           MESA_PRIM_TRIANGLES);
             break;
 
          case D3D10_SB_PRIMITIVE_LINE_ADJ:
-            declare_vertices_in(&sx, 4);
-            ureg_property(sx.ureg,
+            declare_vertices_in(sx, 4);
+            ureg_property(sx->ureg,
                           TGSI_PROPERTY_GS_INPUT_PRIM,
                           MESA_PRIM_LINES_ADJACENCY);
             break;
 
          case D3D10_SB_PRIMITIVE_TRIANGLE_ADJ:
-            declare_vertices_in(&sx, 6);
-            ureg_property(sx.ureg,
+            declare_vertices_in(sx, 6);
+            ureg_property(sx->ureg,
                           TGSI_PROPERTY_GS_INPUT_PRIM,
                           MESA_PRIM_TRIANGLES_ADJACENCY);
             break;
@@ -4704,7 +5683,7 @@ Shader_tgsi_translate(const unsigned *code,
       case D3D10_SB_OPCODE_DCL_MAX_OUTPUT_VERTEX_COUNT:
          assert(parser.header.type == D3D10_SB_GEOMETRY_SHADER);
 
-         ureg_property(sx.ureg,
+         ureg_property(sx->ureg,
                        TGSI_PROPERTY_GS_MAX_OUTPUT_VERTICES,
                        opcode.specific.dcl_max_output_vertex_count);
          break;
@@ -4712,53 +5691,60 @@ Shader_tgsi_translate(const unsigned *code,
       case D3D11_SB_OPCODE_DCL_GS_INSTANCE_COUNT:
          assert(parser.header.type == D3D10_SB_GEOMETRY_SHADER);
 
-         ureg_property(sx.ureg,
+         ureg_property(sx->ureg,
                        TGSI_PROPERTY_GS_INVOCATIONS,
                        opcode.specific.dcl_gs_instance_count);
          break;
 
       case D3D10_SB_OPCODE_DCL_INPUT:
          if (parser.header.type == D3D10_SB_VERTEX_SHADER) {
-            dcl_vs_input(&sx, ureg, &opcode.dst[0]);
+            dcl_vs_input(sx, ureg, &opcode.dst[0]);
          } else if (parser.header.type == D3D10_SB_PIXEL_SHADER) {
-            dcl_ps_input(&sx, ureg, &opcode.dst[0],
+            dcl_ps_input(sx, ureg, &opcode.dst[0],
                          D3D10_SB_INTERPOLATION_UNDEFINED);
          } else if (parser.header.type == DX10_SM5_COMPUTE_SHADER) {
             /* Compute system-value inputs are declared lazily as TGSI system values. */
          } else if (parser.header.type == DX11_SM5_HULL_SHADER ||
                     parser.header.type == DX11_SM5_DOMAIN_SHADER) {
-            dcl_tess_input(&sx, ureg, &opcode.dst[0]);
+            dcl_tess_input(sx, ureg, &opcode.dst[0]);
          } else {
             assert(parser.header.type == D3D10_SB_GEOMETRY_SHADER);
-            dcl_gs_input(&sx, ureg, &opcode.dst[0]);
+            dcl_gs_input(sx, ureg, &opcode.dst[0]);
          }
          break;
 
       case D3D10_SB_OPCODE_DCL_INPUT_SGV:
          assert(parser.header.type == D3D10_SB_VERTEX_SHADER);
-         dcl_sgv_input(&sx, ureg, &opcode.dst[0], opcode.dcl_siv_name);
+         dcl_sgv_input(sx, ureg, &opcode.dst[0], opcode.dcl_siv_name);
          break;
 
       case D3D10_SB_OPCODE_DCL_INPUT_SIV:
-         assert(parser.header.type == D3D10_SB_GEOMETRY_SHADER);
-         dcl_siv_input(&sx, ureg, &opcode.dst[0], opcode.dcl_siv_name);
+         if (parser.header.type == DX11_SM5_DOMAIN_SHADER &&
+             opcode.dst[0].base.type ==
+                DX11_SM5_OPERAND_TYPE_INPUT_PATCH_CONSTANT) {
+            dcl_tes_tess_factor_input(sx, ureg, &opcode.dst[0],
+                                       opcode.dcl_siv_name);
+         } else {
+            assert(parser.header.type == D3D10_SB_GEOMETRY_SHADER);
+            dcl_siv_input(sx, ureg, &opcode.dst[0], opcode.dcl_siv_name);
+         }
          break;
 
       case D3D10_SB_OPCODE_DCL_INPUT_PS:
          assert(parser.header.type == D3D10_SB_PIXEL_SHADER);
-         dcl_ps_input(&sx, ureg, &opcode.dst[0],
+         dcl_ps_input(sx, ureg, &opcode.dst[0],
                       opcode.specific.dcl_in_ps_interp);
          break;
 
       case D3D10_SB_OPCODE_DCL_INPUT_PS_SGV:
          assert(parser.header.type == D3D10_SB_PIXEL_SHADER);
-         dcl_ps_sgv_input(&sx, ureg, &opcode.dst[0],
+         dcl_ps_sgv_input(sx, ureg, &opcode.dst[0],
                           opcode.dcl_siv_name);
          break;
 
       case D3D10_SB_OPCODE_DCL_INPUT_PS_SIV:
          assert(parser.header.type == D3D10_SB_PIXEL_SHADER);
-         dcl_ps_siv_input(&sx, ureg, &opcode.dst[0],
+         dcl_ps_siv_input(sx, ureg, &opcode.dst[0],
                           opcode.dcl_siv_name,
                           opcode.specific.dcl_in_ps_interp);
          break;
@@ -4770,39 +5756,37 @@ Shader_tgsi_translate(const unsigned *code,
                /* Depth output. */
                assert(opcode.dst[0].base.index_dim == 0);
 
-               sx.output_depth = ureg_DECL_output_masked(ureg, TGSI_SEMANTIC_POSITION, 0, TGSI_WRITEMASK_Z, 0, 1);
-               sx.output_depth = ureg_writemask(sx.output_depth, TGSI_WRITEMASK_Z);
+               sx->output_depth = ureg_DECL_output_masked(ureg, TGSI_SEMANTIC_POSITION, 0, TGSI_WRITEMASK_Z, 0, 1);
+               sx->output_depth = ureg_writemask(sx->output_depth, TGSI_WRITEMASK_Z);
             } else if (is_output_coverage_mask_operand_type(
                           opcode.dst[0].base.type)) {
                assert(opcode.dst[0].base.index_dim == 0);
 
-               sx.output_coverage_mask = get_output_coverage_mask(&sx);
+               sx->output_coverage_mask = get_output_coverage_mask(sx);
             } else {
                /* Color outputs. */
                assert(opcode.dst[0].base.index_dim == 1);
                assert(opcode.dst[0].base.index[0].imm < SHADER_MAX_OUTPUTS);
 
-               dcl_base_output(&sx, ureg,
+               dcl_base_output(sx, ureg,
                                ureg_DECL_output(ureg,
                                                 TGSI_SEMANTIC_COLOR,
                                                 opcode.dst[0].base.index[0].imm),
                                &opcode.dst[0]);
             }
          } else if (parser.header.type == DX11_SM5_HULL_SHADER) {
-            dcl_tcs_output(&sx, ureg, &opcode.dst[0]);
+            dcl_tcs_output(sx, ureg, &opcode.dst[0]);
          } else {
             assert(opcode.dst[0].base.index_dim == 1);
             assert(opcode.dst[0].base.index[0].imm < SHADER_MAX_OUTPUTS);
 
-            if (output_mapping) {
-               unsigned nr_outputs = ureg_get_nr_outputs(ureg);
-               output_mapping[nr_outputs]
-                  = opcode.dst[0].base.index[0].imm;
-            }
-            dcl_base_output(&sx, ureg,
-                            ureg_DECL_output(ureg,
-                                             TGSI_SEMANTIC_GENERIC,
-                                             opcode.dst[0].base.index[0].imm),
+            const unsigned d3d_output = opcode.dst[0].base.index[0].imm;
+            struct ureg_dst tgsi_output =
+               ureg_DECL_output(ureg, TGSI_SEMANTIC_GENERIC, d3d_output);
+            if (output_mapping)
+               output_mapping[d3d_output] = tgsi_output.Index;
+            dcl_base_output(sx, ureg,
+                            tgsi_output,
                             &opcode.dst[0]);
          }
          break;
@@ -4813,89 +5797,102 @@ Shader_tgsi_translate(const unsigned *code,
 
          if (parser.header.type == DX11_SM5_HULL_SHADER &&
              tcs_tess_factor_writemask(opcode.dcl_siv_name)) {
-            dcl_tcs_tess_factor_output(&sx, ureg, &opcode.dst[0],
+            dcl_tcs_tess_factor_output(sx, ureg, &opcode.dst[0],
                                        opcode.dcl_siv_name);
             break;
          }
 
-         if (output_mapping) {
-            unsigned nr_outputs = ureg_get_nr_outputs(ureg);
-            output_mapping[nr_outputs]
-               = opcode.dst[0].base.index[0].imm;
-         }
          if (opcode.dcl_siv_name == D3D10_SB_NAME_CLIP_DISTANCE ||
              opcode.dcl_siv_name == D3D10_SB_NAME_CULL_DISTANCE) {
             const unsigned writemask =
                opcode.dst[0].mask >>
                D3D10_SB_OPERAND_4_COMPONENT_MASK_SHIFT;
             const unsigned component_count = util_bitcount(writemask);
-            unsigned numcliporcull = sx.num_clip_distances_declared +
-                                     sx.num_cull_distances_declared;
-            if (sx.num_clip_distance_mappings <
-                ARRAY_SIZE(sx.clip_distance_mapping)) {
-               sx.clip_distance_mapping[sx.num_clip_distance_mappings].d3d =
+            unsigned numcliporcull = sx->num_clip_distances_declared +
+                                     sx->num_cull_distances_declared;
+            if (sx->num_clip_distance_mappings <
+                ARRAY_SIZE(sx->clip_distance_mapping)) {
+               sx->clip_distance_mapping[sx->num_clip_distance_mappings].d3d =
                   opcode.dst[0].base.index[0].imm;
-               sx.clip_distance_mapping[sx.num_clip_distance_mappings].tgsi =
+               sx->clip_distance_mapping[sx->num_clip_distance_mappings].tgsi =
                   numcliporcull / 4;
-               sx.num_clip_distance_mappings++;
+               sx->num_clip_distance_mappings++;
             } else {
                debug_printf("%s: too many combined clip/cull distance outputs d3d=%u count=%u max=%zu\n",
                             __func__, opcode.dst[0].base.index[0].imm,
                             numcliporcull,
-                            ARRAY_SIZE(sx.clip_distance_mapping));
+                            ARRAY_SIZE(sx->clip_distance_mapping));
             }
             if (opcode.dcl_siv_name == D3D10_SB_NAME_CLIP_DISTANCE) {
-               sx.num_clip_distances_declared += component_count;
+               sx->num_clip_distances_declared += component_count;
                /* re-emit should be safe... */
                ureg_property(ureg, TGSI_PROPERTY_NUM_CLIPDIST_ENABLED,
-                             sx.num_clip_distances_declared);
+                             sx->num_clip_distances_declared);
             } else {
-               sx.num_cull_distances_declared += component_count;
+               sx->num_cull_distances_declared += component_count;
                ureg_property(ureg, TGSI_PROPERTY_NUM_CULLDIST_ENABLED,
-                             sx.num_cull_distances_declared);
+                             sx->num_cull_distances_declared);
             }
          }
 
-         dcl_base_output(&sx, ureg,
-                         ureg_DECL_output_masked(
-                            ureg,
-                            translate_system_name(opcode.dcl_siv_name),
-                            translate_semantic_index(&sx, opcode.dcl_siv_name,
-                                                     &opcode.dst[0]),
-                            opcode.dst[0].mask >> D3D10_SB_OPERAND_4_COMPONENT_MASK_SHIFT,
-                            0, 1),
-                         &opcode.dst[0]);
+         {
+            const unsigned d3d_output = opcode.dst[0].base.index[0].imm;
+            unsigned mask = opcode.dst[0].mask >>
+               D3D10_SB_OPERAND_4_COMPONENT_MASK_SHIFT;
+            if (parser.header.type == D3D10_SB_GEOMETRY_SHADER &&
+                is_gs_scalar_output_name(opcode.dcl_siv_name)) {
+               dcl_gs_scalar_output(sx, &opcode.dst[0]);
+               mask = TGSI_WRITEMASK_X;
+            }
+            struct ureg_dst tgsi_output =
+               ureg_DECL_output_masked(
+                  ureg,
+                  translate_system_name(sx, opcode.dcl_siv_name),
+                  translate_semantic_index(sx, opcode.dcl_siv_name,
+                                           &opcode.dst[0]),
+                  mask,
+                  0, 1);
+            if (output_mapping)
+               output_mapping[d3d_output] = tgsi_output.Index;
+            dcl_base_output(sx, ureg, tgsi_output, &opcode.dst[0]);
+         }
          break;
 
       case D3D10_SB_OPCODE_DCL_OUTPUT_SGV:
          assert(opcode.dst[0].base.index_dim == 1);
          assert(opcode.dst[0].base.index[0].imm < SHADER_MAX_OUTPUTS);
 
-         if (output_mapping) {
-            unsigned nr_outputs = ureg_get_nr_outputs(ureg);
-            output_mapping[nr_outputs]
-               = opcode.dst[0].base.index[0].imm;
+         {
+            const unsigned d3d_output = opcode.dst[0].base.index[0].imm;
+            const bool gs_scalar =
+               parser.header.type == D3D10_SB_GEOMETRY_SHADER &&
+               is_gs_scalar_output_name(opcode.dcl_siv_name);
+            if (gs_scalar)
+               dcl_gs_scalar_output(sx, &opcode.dst[0]);
+            struct ureg_dst tgsi_output =
+               ureg_DECL_output_masked(
+                  ureg, translate_system_name(sx, opcode.dcl_siv_name),
+                  0, gs_scalar ? TGSI_WRITEMASK_X : TGSI_WRITEMASK_XYZW,
+                  0, 1);
+            if (output_mapping)
+               output_mapping[d3d_output] = tgsi_output.Index;
+            dcl_base_output(sx, ureg, tgsi_output, &opcode.dst[0]);
          }
-         dcl_base_output(&sx, ureg,
-                         ureg_DECL_output(ureg,
-                                          translate_system_name(opcode.dcl_siv_name),
-                                          0),
-                         &opcode.dst[0]);
          break;
 
       case D3D10_SB_OPCODE_DCL_TEMPS:
          {
             uint i;
 
-            assert(opcode.specific.dcl_num_temps + sx.declared_temps <=
+            assert(opcode.specific.dcl_num_temps + sx->declared_temps <=
                    SHADER_MAX_TEMPS);
 
-            sx.temp_offset = sx.declared_temps;
+            sx->temp_offset = sx->declared_temps;
 
             for (i = 0; i < opcode.specific.dcl_num_temps; i++) {
-               sx.temps[sx.declared_temps + i] = ureg_DECL_temporary(ureg);
+               sx->temps[sx->declared_temps + i] = ureg_DECL_temporary(ureg);
             }
-            sx.declared_temps += opcode.specific.dcl_num_temps;
+            sx->declared_temps += opcode.specific.dcl_num_temps;
          }
          break;
 
@@ -4908,29 +5905,29 @@ Shader_tgsi_translate(const unsigned *code,
 
             assert(opcode.specific.dcl_indexable_temp.index <
                    SHADER_MAX_INDEXABLE_TEMPS);
-            assert(opcode.specific.dcl_indexable_temp.count + sx.declared_temps <=
+            assert(opcode.specific.dcl_indexable_temp.count + sx->declared_temps <=
                    SHADER_MAX_TEMPS);
 
-            sx.indexable_temp_offsets[opcode.specific.dcl_indexable_temp.index] =
-               sx.declared_temps;
+            sx->indexable_temp_offsets[opcode.specific.dcl_indexable_temp.index] =
+               sx->declared_temps;
 
             for (i = 0; i < opcode.specific.dcl_indexable_temp.count; i++) {
-               sx.temps[sx.declared_temps + i] = ureg_DECL_temporary(ureg);
+               sx->temps[sx->declared_temps + i] = ureg_DECL_temporary(ureg);
             }
-            sx.declared_temps += opcode.specific.dcl_indexable_temp.count;
+            sx->declared_temps += opcode.specific.dcl_indexable_temp.count;
          }
          break;
       case D3D10_SB_OPCODE_IF: {
          unsigned label = 0;
          if (opcode.specific.test_boolean == D3D10_SB_INSTRUCTION_TEST_ZERO) {
             struct ureg_src src =
-               translate_src_operand(&sx, &opcode.src[0], OF_INT);
+               translate_src_operand(sx, &opcode.src[0], OF_INT);
             struct ureg_dst src_nz = ureg_DECL_temporary(ureg);
             ureg_USEQ(ureg, src_nz, src, ureg_imm1u(ureg, 0));
             ureg_UIF(ureg, ureg_src(src_nz), &label);
             ureg_release_temporary(ureg, src_nz);;
          } else {
-            ureg_UIF(ureg, translate_src_operand(&sx, &opcode.src[0], OF_INT), &label);
+            ureg_UIF(ureg, translate_src_operand(sx, &opcode.src[0], OF_INT), &label);
          }
       }
          break;
@@ -4944,14 +5941,14 @@ Shader_tgsi_translate(const unsigned *code,
          assert(operand_is_scalar(&opcode.src[0]));
          if (opcode.specific.test_boolean == D3D10_SB_INSTRUCTION_TEST_ZERO) {
             struct ureg_src src =
-               translate_src_operand(&sx, &opcode.src[0], OF_INT);
+               translate_src_operand(sx, &opcode.src[0], OF_INT);
             struct ureg_dst src_nz = ureg_DECL_temporary(ureg);
             ureg_USEQ(ureg, src_nz, src, ureg_imm1u(ureg, 0));
             ureg_UIF(ureg, ureg_src(src_nz), &label);
             ureg_release_temporary(ureg, src_nz);
          }
          else {
-            ureg_UIF(ureg, translate_src_operand(&sx, &opcode.src[0], OF_INT), &label);
+            ureg_UIF(ureg, translate_src_operand(sx, &opcode.src[0], OF_INT), &label);
          }
          switch (opcode.type) {
          case D3D10_SB_OPCODE_RETC:
@@ -4964,7 +5961,7 @@ Shader_tgsi_translate(const unsigned *code,
             unsigned label = opcode.src[1].base.index[0].imm;
             unsigned tgsi_token_label = 0;
             ureg_CAL(ureg, &tgsi_token_label);
-            Shader_add_call(&sx, label, tgsi_token_label);
+            Shader_add_call(sx, label, tgsi_token_label);
          }
             break;
          case D3D10_SB_OPCODE_DISCARD:
@@ -4993,33 +5990,37 @@ Shader_tgsi_translate(const unsigned *code,
          tgsi_inst_no = ureg_get_instruction_number(ureg);
          ureg_BGNSUB(ureg);
          inside_sub = true;
-         Shader_add_label(&sx, label, tgsi_inst_no);
+         Shader_add_label(sx, label, tgsi_inst_no);
       }
          break;
       case D3D10_SB_OPCODE_CALL: {
          unsigned label = opcode.src[0].base.index[0].imm;
          unsigned tgsi_token_label = 0;
          ureg_CAL(ureg, &tgsi_token_label);
-         Shader_add_call(&sx, label, tgsi_token_label);
+         Shader_add_call(sx, label, tgsi_token_label);
       }
          break;
       case D3D10_SB_OPCODE_EMIT:
+         emit_gs_scalar_output_stores(sx);
          ureg_EMIT(ureg, ureg_imm1u(ureg, 0));
          break;
       case D3D10_SB_OPCODE_CUT:
          ureg_ENDPRIM(ureg, ureg_imm1u(ureg, 0));
          break;
       case D3D10_SB_OPCODE_EMITTHENCUT:
+         emit_gs_scalar_output_stores(sx);
          ureg_EMIT(ureg, ureg_imm1u(ureg, 0));
          ureg_ENDPRIM(ureg, ureg_imm1u(ureg, 0));
          break;
       case D3D11_SB_OPCODE_EMIT_STREAM:
+         emit_gs_scalar_output_stores(sx);
          ureg_EMIT(ureg, ureg_imm1u(ureg, opcode.specific.stream));
          break;
       case D3D11_SB_OPCODE_CUT_STREAM:
          ureg_ENDPRIM(ureg, ureg_imm1u(ureg, opcode.specific.stream));
          break;
       case D3D11_SB_OPCODE_EMITTHENCUT_STREAM:
+         emit_gs_scalar_output_stores(sx);
          ureg_EMIT(ureg, ureg_imm1u(ureg, opcode.specific.stream));
          ureg_ENDPRIM(ureg, ureg_imm1u(ureg, opcode.specific.stream));
          break;
@@ -5029,20 +6030,20 @@ Shader_tgsi_translate(const unsigned *code,
       case DX10_SM5_OPCODE_IBFE: {
          struct ureg_dst width = ureg_DECL_temporary(ureg);
          struct ureg_dst offset = ureg_DECL_temporary(ureg);
-         struct ureg_dst dst = translate_dst_operand(&sx, &opcode.dst[0],
+         struct ureg_dst dst = translate_dst_operand(sx, &opcode.dst[0],
                                                      opcode.saturate);
          struct ureg_src src[3];
          enum dx10_opcode_format format =
             opcode.type == DX10_SM5_OPCODE_IBFE ? OF_INT : OF_UINT;
 
          ureg_AND(ureg, width,
-                  translate_src_operand(&sx, &opcode.src[0], OF_UINT),
+                  translate_src_operand(sx, &opcode.src[0], OF_UINT),
                   ureg_imm1u(ureg, 31));
          ureg_AND(ureg, offset,
-                  translate_src_operand(&sx, &opcode.src[1], OF_UINT),
+                  translate_src_operand(sx, &opcode.src[1], OF_UINT),
                   ureg_imm1u(ureg, 31));
 
-         src[0] = translate_src_operand(&sx, &opcode.src[2], format);
+         src[0] = translate_src_operand(sx, &opcode.src[2], format);
          src[1] = ureg_src(offset);
          src[2] = ureg_src(width);
          ureg_insn(ureg,
@@ -5058,16 +6059,16 @@ Shader_tgsi_translate(const unsigned *code,
          struct ureg_dst offset = ureg_DECL_temporary(ureg);
 
          ureg_AND(ureg, width,
-                  translate_src_operand(&sx, &opcode.src[0], OF_UINT),
+                  translate_src_operand(sx, &opcode.src[0], OF_UINT),
                   ureg_imm1u(ureg, 31));
          ureg_AND(ureg, offset,
-                  translate_src_operand(&sx, &opcode.src[1], OF_UINT),
+                  translate_src_operand(sx, &opcode.src[1], OF_UINT),
                   ureg_imm1u(ureg, 31));
          ureg_BFI(ureg,
-                  translate_dst_operand(&sx, &opcode.dst[0],
+                  translate_dst_operand(sx, &opcode.dst[0],
                                         opcode.saturate),
-                  translate_src_operand(&sx, &opcode.src[3], OF_UINT),
-                  translate_src_operand(&sx, &opcode.src[2], OF_UINT),
+                  translate_src_operand(sx, &opcode.src[3], OF_UINT),
+                  translate_src_operand(sx, &opcode.src[2], OF_UINT),
                   ureg_src(offset), ureg_src(width));
          ureg_release_temporary(ureg, width);
          ureg_release_temporary(ureg, offset);
@@ -5076,11 +6077,11 @@ Shader_tgsi_translate(const unsigned *code,
       case DX10_SM5_OPCODE_SWAPC: {
          struct ureg_dst src1_tmp = ureg_DECL_temporary(ureg);
          struct ureg_dst src2_tmp = ureg_DECL_temporary(ureg);
-         struct ureg_src cond = translate_src_operand(&sx, &opcode.src[0],
+         struct ureg_src cond = translate_src_operand(sx, &opcode.src[0],
                                                       OF_UINT);
-         struct ureg_src src1 = translate_src_operand(&sx, &opcode.src[1],
+         struct ureg_src src1 = translate_src_operand(sx, &opcode.src[1],
                                                       OF_UINT);
-         struct ureg_src src2 = translate_src_operand(&sx, &opcode.src[2],
+         struct ureg_src src2 = translate_src_operand(sx, &opcode.src[2],
                                                       OF_UINT);
 
          ureg_MOV(ureg, src1_tmp, src1);
@@ -5089,11 +6090,11 @@ Shader_tgsi_translate(const unsigned *code,
          src2 = ureg_src(src2_tmp);
 
          ureg_UCMP(ureg,
-                   translate_dst_operand(&sx, &opcode.dst[0],
+                   translate_dst_operand(sx, &opcode.dst[0],
                                          opcode.saturate),
                    cond, src2, src1);
          ureg_UCMP(ureg,
-                   translate_dst_operand(&sx, &opcode.dst[1],
+                   translate_dst_operand(sx, &opcode.dst[1],
                                          opcode.saturate),
                    cond, src1, src2);
          ureg_release_temporary(ureg, src1_tmp);
@@ -5102,7 +6103,7 @@ Shader_tgsi_translate(const unsigned *code,
       }
       case D3D11_SB_OPCODE_LD_UAV_TYPED: {
          unsigned image_index = opcode.src[1].base.index[0].imm;
-         struct ureg_dst dst = translate_dst_operand(&sx, &opcode.dst[0],
+         struct ureg_dst dst = translate_dst_operand(sx, &opcode.dst[0],
                                                      opcode.saturate);
          struct ureg_dst load = ureg_DECL_temporary(ureg);
          struct ureg_src src[2];
@@ -5110,12 +6111,12 @@ Shader_tgsi_translate(const unsigned *code,
          assert(opcode.src[1].base.index_dim == 1);
          assert(image_index < SHADER_MAX_IMAGES);
 
-         src[0] = sx.images[image_index].reg;
-         src[1] = translate_src_operand(&sx, &opcode.src[0], OF_UINT);
+         src[0] = sx->images[image_index].reg;
+         src[1] = translate_src_operand(sx, &opcode.src[0], OF_UINT);
          ureg_memory_insn(ureg, TGSI_OPCODE_LOAD,
                           &load, 1, src, ARRAY_SIZE(src), 0,
-                          sx.images[image_index].target,
-                          sx.images[image_index].format);
+                          sx->images[image_index].target,
+                          sx->images[image_index].format);
          ureg_MOV(ureg, dst, ureg_src(load));
          ureg_release_temporary(ureg, load);
          break;
@@ -5128,13 +6129,13 @@ Shader_tgsi_translate(const unsigned *code,
          assert(opcode.dst[0].base.index_dim == 1);
          assert(image_index < SHADER_MAX_IMAGES);
 
-         dst = ureg_dst(sx.images[image_index].reg);
-         src[0] = translate_src_operand(&sx, &opcode.src[0], OF_UINT);
-         src[1] = translate_src_operand(&sx, &opcode.src[1], OF_UINT);
+         dst = ureg_dst(sx->images[image_index].reg);
+         src[0] = translate_src_operand(sx, &opcode.src[0], OF_UINT);
+         src[1] = translate_src_operand(sx, &opcode.src[1], OF_UINT);
          ureg_memory_insn(ureg, TGSI_OPCODE_STORE,
                           &dst, 1, src, ARRAY_SIZE(src), 0,
-                          sx.images[image_index].target,
-                          sx.images[image_index].format);
+                          sx->images[image_index].target,
+                          sx->images[image_index].format);
          break;
       }
       case DX10_SM5_OPCODE_STORE_RAW: {
@@ -5150,13 +6151,13 @@ Shader_tgsi_translate(const unsigned *code,
              DX10_SM5_OPERAND_TYPE_THREAD_GROUP_SHARED_MEMORY) {
             struct ureg_dst byte_offset = ureg_dst_undef();
 
-            dst = ureg_dst(get_tgsm_memory(&sx));
+            dst = ureg_dst(get_tgsm_memory(sx));
             index = ureg_DECL_temporary(ureg);
             coord = ureg_DECL_temporary(ureg);
             ureg_MOV(ureg, index,
-                     ureg_scalar(translate_src_operand(&sx, &opcode.src[0], OF_UINT),
+                     ureg_scalar(translate_src_operand(sx, &opcode.src[0], OF_UINT),
                                  TGSI_SWIZZLE_X));
-            data = translate_src_operand(&sx, &opcode.src[1], OF_UINT);
+            data = translate_src_operand(sx, &opcode.src[1], OF_UINT);
             for (unsigned i = 0; i < 4; i++) {
                if (!(writemask & (1u << i)))
                   continue;
@@ -5167,7 +6168,7 @@ Shader_tgsi_translate(const unsigned *code,
                } else {
                   src[0] = ureg_src(index);
                }
-               src[0] = tgsm_byte_offset(&sx, &opcode.dst[0].base,
+               src[0] = tgsm_byte_offset(sx, &opcode.dst[0].base,
                                          src[0], &byte_offset);
                src[1] = ureg_scalar(data, i);
                struct ureg_dst scalar_dst =
@@ -5190,14 +6191,14 @@ Shader_tgsi_translate(const unsigned *code,
          assert(opcode.dst[0].base.index_dim == 1);
          assert(image_index < SHADER_MAX_IMAGES);
 
-         dst = ureg_dst(sx.images[image_index].reg);
+         dst = ureg_dst(sx->images[image_index].reg);
          index = ureg_DECL_temporary(ureg);
          coord = ureg_DECL_temporary(ureg);
          ureg_USHR(ureg, index,
-                   ureg_scalar(translate_src_operand(&sx, &opcode.src[0], OF_UINT),
+                   ureg_scalar(translate_src_operand(sx, &opcode.src[0], OF_UINT),
                                TGSI_SWIZZLE_X),
                    ureg_imm1u(ureg, 2));
-         data = translate_src_operand(&sx, &opcode.src[1], OF_UINT);
+         data = translate_src_operand(sx, &opcode.src[1], OF_UINT);
          for (unsigned i = 0; i < 4; i++) {
             if (!(writemask & (1u << i)))
                continue;
@@ -5210,8 +6211,8 @@ Shader_tgsi_translate(const unsigned *code,
             src[1] = ureg_scalar(data, i);
             ureg_memory_insn(ureg, TGSI_OPCODE_STORE,
                              &dst, 1, src, ARRAY_SIZE(src), 0,
-                             sx.images[image_index].target,
-                             sx.images[image_index].format);
+                             sx->images[image_index].target,
+                             sx->images[image_index].format);
          }
          ureg_release_temporary(ureg, coord);
          ureg_release_temporary(ureg, index);
@@ -5235,17 +6236,17 @@ Shader_tgsi_translate(const unsigned *code,
             if (!tgsm_operand_slot(&opcode.dst[0].base, &slot))
                break;
 
-            dst = ureg_dst(get_tgsm_memory(&sx));
+            dst = ureg_dst(get_tgsm_memory(sx));
             coord = ureg_DECL_temporary(ureg);
             byte_offset = ureg_DECL_temporary(ureg);
             ureg_UMUL(ureg, coord,
-                      ureg_scalar(translate_src_operand(&sx, &opcode.src[0], OF_UINT),
+                      ureg_scalar(translate_src_operand(sx, &opcode.src[0], OF_UINT),
                                   TGSI_SWIZZLE_X),
-                      ureg_imm1u(ureg, sx.tgsm[slot].structured_stride));
+                      ureg_imm1u(ureg, sx->tgsm[slot].structured_stride));
             ureg_UADD(ureg, coord, ureg_src(coord),
-                      ureg_scalar(translate_src_operand(&sx, &opcode.src[1], OF_UINT),
+                      ureg_scalar(translate_src_operand(sx, &opcode.src[1], OF_UINT),
                                   TGSI_SWIZZLE_X));
-            data = translate_src_operand(&sx, &opcode.src[2], OF_UINT);
+            data = translate_src_operand(sx, &opcode.src[2], OF_UINT);
 
             for (unsigned i = 0; i < 4; i++) {
                if (!(writemask & (1u << i)))
@@ -5260,7 +6261,7 @@ Shader_tgsi_translate(const unsigned *code,
                   src[0] = ureg_src(coord);
                }
 
-               src[0] = tgsm_byte_offset(&sx, &opcode.dst[0].base,
+               src[0] = tgsm_byte_offset(sx, &opcode.dst[0].base,
                                          src[0], &slot_offset);
                src[1] = ureg_scalar(data, i);
                struct ureg_dst scalar_dst =
@@ -5286,7 +6287,7 @@ Shader_tgsi_translate(const unsigned *code,
          assert(opcode.dst[0].base.index_dim == 1);
          assert(image_index < SHADER_MAX_IMAGES);
 
-         dst = ureg_dst(sx.images[image_index].reg);
+         dst = ureg_dst(sx->images[image_index].reg);
          coord = ureg_DECL_temporary(ureg);
          byte_offset = ureg_DECL_temporary(ureg);
          struct ureg_dst store_offset = ureg_dst_undef();
@@ -5295,14 +6296,16 @@ Shader_tgsi_translate(const unsigned *code,
             opcode.dst[0].mask >> D3D10_SB_OPERAND_4_COMPONENT_MASK_SHIFT;
 
          ureg_UMUL(ureg, coord,
-                   ureg_scalar(translate_src_operand(&sx, &opcode.src[0], OF_UINT),
+                   ureg_scalar(translate_src_operand(sx, &opcode.src[0], OF_UINT),
                                TGSI_SWIZZLE_X),
-                   ureg_imm1u(ureg, sx.images[image_index].structured_stride));
+                   ureg_imm1u(ureg, sx->images[image_index].structured_stride));
          ureg_MOV(ureg, byte_offset,
-                  ureg_scalar(translate_src_operand(&sx, &opcode.src[1], OF_UINT),
+                  ureg_scalar(translate_src_operand(sx, &opcode.src[1], OF_UINT),
                               TGSI_SWIZZLE_X));
          ureg_UADD(ureg, coord, ureg_src(coord), ureg_src(byte_offset));
-         data = translate_src_operand(&sx, &opcode.src[2], OF_UINT);
+         /* The D3D structure offset is in bytes; the R32_UINT view is not. */
+         ureg_USHR(ureg, coord, ureg_src(coord), ureg_imm1u(ureg, 2));
+         data = translate_src_operand(sx, &opcode.src[2], OF_UINT);
          for (unsigned i = 0; i < 4; i++) {
             if (!(writemask & (1u << i)))
                continue;
@@ -5310,7 +6313,7 @@ Shader_tgsi_translate(const unsigned *code,
                if (ureg_dst_is_undef(store_offset))
                   store_offset = ureg_DECL_temporary(ureg);
                ureg_UADD(ureg, store_offset, ureg_src(coord),
-                         ureg_imm1u(ureg, i * 4));
+                         ureg_imm1u(ureg, i));
                src[0] = ureg_src(store_offset);
             } else {
                src[0] = ureg_src(coord);
@@ -5318,8 +6321,8 @@ Shader_tgsi_translate(const unsigned *code,
             src[1] = ureg_scalar(data, i);
             ureg_memory_insn(ureg, TGSI_OPCODE_STORE,
                              &dst, 1, src, ARRAY_SIZE(src), 0,
-                             sx.images[image_index].target,
-                             sx.images[image_index].format);
+                             sx->images[image_index].target,
+                             sx->images[image_index].format);
          }
          if (!ureg_dst_is_undef(store_offset))
             ureg_release_temporary(ureg, store_offset);
@@ -5352,7 +6355,7 @@ Shader_tgsi_translate(const unsigned *code,
          unsigned image_dst = imm_atomic ? 1 : 0;
          unsigned image_index = opcode.dst[image_dst].base.index[0].imm;
          struct ureg_dst result = imm_atomic ?
-            translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate) :
+            translate_dst_operand(sx, &opcode.dst[0], opcode.saturate) :
             ureg_DECL_temporary(ureg);
          struct ureg_dst coord_tmp;
          struct ureg_src src[4];
@@ -5371,16 +6374,31 @@ Shader_tgsi_translate(const unsigned *code,
 
          switch (opcode.type) {
          case DX10_SM5_OPCODE_IMM_ATOMIC_ALLOC:
-         case DX10_SM5_OPCODE_IMM_ATOMIC_CONSUME:
-            /*
-             * Do not lower UAV counter alloc/consume to native image atomics
-             * here without first reproducing the previous host-side hang.
-             * The hidden-counter-buffer ATOMUADD experiment wedged the host
-             * amdgpu gfx ring from virgl_render_server; the Wine repro is kept
-             * on the emulation path in Shader.cpp until that is diagnosed.
+         case DX10_SM5_OPCODE_IMM_ATOMIC_CONSUME: {
+            /* Use a typed 2D image, NOT the buffer-image atomic path that
+             * previously hung the host.  The view owns its GPU counter and
+             * the binding map keeps it separate from application UAVs.
              */
-            ureg_MOV(ureg, result, ureg_imm1u(ureg, 0));
+            assert(sx->counter_image_slots[image_index]);
+            const bool consume =
+               opcode.type == DX10_SM5_OPCODE_IMM_ATOMIC_CONSUME;
+            const struct ureg_src counter_src[3] = {
+               sx->counter_images[image_index],
+               ureg_imm4u(ureg, 0, 0, 0, 0),
+               ureg_imm1u(ureg, consume ? ~0u : 1),
+            };
+            struct ureg_dst old = ureg_DECL_temporary(ureg);
+            ureg_memory_insn(ureg, TGSI_OPCODE_ATOMUADD,
+                             &old, 1, counter_src, ARRAY_SIZE(counter_src),
+                             0, TGSI_TEXTURE_2D, PIPE_FORMAT_R32_UINT);
+            if (consume)
+               ureg_UADD(ureg, result, ureg_scalar(ureg_src(old), 0),
+                         ureg_imm1u(ureg, ~0u));
+            else
+               ureg_MOV(ureg, result, ureg_scalar(ureg_src(old), 0));
+            ureg_release_temporary(ureg, old);
             break;
+         }
          case DX10_SM5_OPCODE_ATOMIC_AND:
          case DX10_SM5_OPCODE_IMM_ATOMIC_AND:
             tgsi_opcode = TGSI_OPCODE_ATOMAND;
@@ -5436,53 +6454,69 @@ Shader_tgsi_translate(const unsigned *code,
             unsigned slot = 0;
             struct ureg_dst byte_offset = ureg_dst_undef();
 
-            src[0] = get_tgsm_memory(&sx);
+            src[0] = get_tgsm_memory(sx);
             coord_tmp = ureg_DECL_temporary(ureg);
             release_coord_tmp = true;
             if (tgsm_operand_slot(&opcode.dst[image_dst].base, &slot) &&
-                sx.tgsm[slot].structured_stride) {
+                sx->tgsm[slot].structured_stride) {
                struct ureg_src addr =
-                  translate_src_operand(&sx, &opcode.src[0], OF_UINT);
+                  translate_src_operand(sx, &opcode.src[0], OF_UINT);
                ureg_UMUL(ureg, coord_tmp,
                          ureg_scalar(addr, TGSI_SWIZZLE_X),
-                         ureg_imm1u(ureg, sx.tgsm[slot].structured_stride));
+                         ureg_imm1u(ureg, sx->tgsm[slot].structured_stride));
                ureg_UADD(ureg, coord_tmp, ureg_src(coord_tmp),
                          ureg_scalar(addr, TGSI_SWIZZLE_Y));
             } else {
                ureg_MOV(ureg, coord_tmp,
-                        ureg_scalar(translate_src_operand(&sx, &opcode.src[0], OF_UINT),
+                        ureg_scalar(translate_src_operand(sx, &opcode.src[0], OF_UINT),
                                     TGSI_SWIZZLE_X));
             }
-            src[1] = tgsm_byte_offset(&sx, &opcode.dst[image_dst].base,
+            src[1] = tgsm_byte_offset(sx, &opcode.dst[image_dst].base,
                                       ureg_src(coord_tmp), &byte_offset);
-            src[2] = translate_src_operand(&sx, &opcode.src[1], data_format);
+            src[2] = translate_src_operand(sx, &opcode.src[1], data_format);
             if (num_src == 4)
-               src[3] = translate_src_operand(&sx, &opcode.src[2], data_format);
+               src[3] = translate_src_operand(sx, &opcode.src[2], data_format);
             ureg_memory_insn(ureg, tgsi_opcode,
                              &result, 1, src, num_src, 0,
                              TGSI_TEXTURE_BUFFER, PIPE_FORMAT_R32_UINT);
             if (!ureg_dst_is_undef(byte_offset))
                ureg_release_temporary(ureg, byte_offset);
          } else {
-            src[0] = sx.images[image_index].reg;
-            if (sx.images[image_index].target == TGSI_TEXTURE_BUFFER) {
+            src[0] = sx->images[image_index].reg;
+            struct ureg_src addr =
+               translate_src_operand(sx, &opcode.src[0], OF_UINT);
+            if (sx->images[image_index].target == TGSI_TEXTURE_BUFFER &&
+                (sx->images[image_index].raw ||
+                 sx->images[image_index].structured_stride)) {
                coord_tmp = ureg_DECL_temporary(ureg);
                release_coord_tmp = true;
-               ureg_USHR(ureg, coord_tmp,
-                         ureg_scalar(translate_src_operand(&sx, &opcode.src[0], OF_UINT),
-                                     TGSI_SWIZZLE_X),
-                         ureg_imm1u(ureg, 2));
+               if (sx->images[image_index].structured_stride) {
+                  /* Structured addresses are (element, byte offset). The
+                   * R32_UINT backing view instead addresses dword texels. */
+                  ureg_UMUL(ureg, coord_tmp,
+                            ureg_scalar(addr, TGSI_SWIZZLE_X),
+                            ureg_imm1u(ureg,
+                               sx->images[image_index].structured_stride));
+                  ureg_UADD(ureg, coord_tmp, ureg_src(coord_tmp),
+                            ureg_scalar(addr, TGSI_SWIZZLE_Y));
+               } else {
+                  ureg_MOV(ureg, coord_tmp,
+                           ureg_scalar(addr, TGSI_SWIZZLE_X));
+               }
+               ureg_USHR(ureg, coord_tmp, ureg_src(coord_tmp),
+                          ureg_imm1u(ureg, 2));
                src[1] = ureg_src(coord_tmp);
             } else {
-               src[1] = translate_src_operand(&sx, &opcode.src[0], OF_UINT);
+               /* Typed buffers and textures already use element coordinates. */
+               src[1] = addr;
             }
-            src[2] = translate_src_operand(&sx, &opcode.src[1], data_format);
+            src[2] = translate_src_operand(sx, &opcode.src[1], data_format);
             if (num_src == 4)
-               src[3] = translate_src_operand(&sx, &opcode.src[2], data_format);
+               src[3] = translate_src_operand(sx, &opcode.src[2], data_format);
             ureg_memory_insn(ureg, tgsi_opcode,
                              &result, 1, src, num_src, 0,
-                             sx.images[image_index].target,
-                             sx.images[image_index].format);
+                             sx->images[image_index].target,
+                             sx->images[image_index].format);
          }
          if (release_coord_tmp)
             ureg_release_temporary(ureg, coord_tmp);
@@ -5491,7 +6525,10 @@ Shader_tgsi_translate(const unsigned *code,
          break;
       }
       case D3D10_SB_OPCODE_DCL_INDEX_RANGE:
-         dcl_input_index_range(&sx, &opcode);
+         if (opcode.dst[0].base.type == D3D10_SB_OPERAND_TYPE_OUTPUT)
+            dcl_tcs_tess_factor_index_range(sx, &opcode);
+         else
+            dcl_input_index_range(sx, &opcode);
          break;
       case D3D10_SB_OPCODE_DCL_GLOBAL_FLAGS:
          if (opcode.specific.global_flags.force_early_depth_stencil) {
@@ -5520,18 +6557,18 @@ Shader_tgsi_translate(const unsigned *code,
                goto fail;
             }
 
-            if (try_emit_dynamic_structured_bufinfo_stride(&sx, &opcode))
+            if (try_emit_dynamic_structured_bufinfo_stride(sx, &opcode))
                break;
 
             /* Destination operands. */
             for (i = 0; i < opcode.num_dst; i++) {
-               dst[i] = translate_dst_operand(&sx, &opcode.dst[i],
+               dst[i] = translate_dst_operand(sx, &opcode.dst[i],
                                               opcode.saturate);
             }
 
             /* Source operands. */
             for (i = 0; i < opcode.num_src; i++) {
-               src[i] = translate_src_operand(&sx, &opcode.src[i], ox->format);
+               src[i] = translate_src_operand(sx, &opcode.src[i], ox->format);
             }
 
             /*
@@ -5596,48 +6633,82 @@ Shader_tgsi_translate(const unsigned *code,
          }
       }
 
-      if (sx.translation_failed) {
+      if (sx->translation_failed) {
          Shader_opcode_free(&opcode);
          goto fail;
       }
 
-      advance_dynamic_structured_bufinfo_stride(&sx);
+      emit_tcs_indexed_output_stores(sx);
+      advance_dynamic_structured_bufinfo_stride(sx);
       Shader_opcode_free(&opcode);
+   }
+
+   if (parser.failed) {
+      YTTRIUM_WARN("yttrium: shader TGSI translation failed "
+                   "owner=d3d10umd-shader component=parser stage=%u "
+                   "offset=%u shader_size=%u action=abort-translation\n",
+                   parser.header.type,
+                   (unsigned)(parser.curr - parser.code),
+                   parser.header.size);
+      goto fail;
+   }
+
+   /* Declarations may share a D3D register across generic and scalar system
+    * semantics. Publish the whole-register SO mirror only after all of them
+    * have been translated, so declaration order cannot overwrite it.
+    */
+   if (output_mapping && sx->has_gs_scalar_outputs) {
+      for (unsigned output = 0; output < SHADER_MAX_OUTPUTS; ++output) {
+         if (sx->outputs[output].gs_scalar_mask)
+            output_mapping[output] = sx->outputs[output].gs_packed_output.Index;
+      }
+   }
+   if (sx->has_gs_scalar_outputs &&
+       ureg_get_nr_outputs(ureg) > PIPE_MAX_SHADER_OUTPUTS) {
+      YTTRIUM_WARN("yttrium: shader TGSI translation failed "
+                   "owner=d3d10umd-shader component=gs-scalar-output "
+                   "reason=output-limit outputs=%u limit=%u "
+                   "action=abort-translation\n",
+                   ureg_get_nr_outputs(ureg), PIPE_MAX_SHADER_OUTPUTS);
+      goto fail;
    }
 
    if (inside_sub) {
       ureg_ENDSUB(ureg);
    }
 
-   tcs_end_patch_phase(&sx, ureg);
+   tcs_end_patch_phase(sx, ureg);
 
    if (parser.header.type == DX11_SM5_HULL_SHADER)
-      tcs_set_clip_cull_properties(&sx, ureg);
+      tcs_set_clip_cull_properties(sx, ureg);
 
    if (parser.header.type == DX11_SM5_DOMAIN_SHADER) {
       emit_tessellation_properties(
          ureg, tessellation_properties ?
-                  tessellation_properties : &sx.tessellation_properties);
+                  tessellation_properties : &sx->tessellation_properties);
    }
 
    ureg_END(ureg);
 
-   for (i = 0; i < sx.num_calls; ++i) {
-      for (j = 0; j < sx.num_labels; ++j) {
-         if (sx.calls[i].d3d_label == sx.labels[j].d3d_label) {
-            ureg_fixup_label(sx.ureg,
-                             sx.calls[i].tgsi_label_token,
-                             sx.labels[j].tgsi_insn_no);
+   for (i = 0; i < sx->num_calls; ++i) {
+      for (j = 0; j < sx->num_labels; ++j) {
+         if (sx->calls[i].d3d_label == sx->labels[j].d3d_label) {
+            ureg_fixup_label(sx->ureg,
+                             sx->calls[i].tgsi_label_token,
+                             sx->labels[j].tgsi_insn_no);
             break;
          }
       }
-      ASSERT(j < sx.num_labels);
+      ASSERT(j < sx->num_labels);
    }
-   FREE(sx.labels);
-   FREE(sx.calls);
+   FREE(sx->labels);
+   FREE(sx->calls);
 
    if (shared_memory_size)
-      *shared_memory_size = sx.shared_memory_size;
+      *shared_memory_size = sx->shared_memory_size;
+   if (counter_image_slots)
+      memcpy(counter_image_slots, sx->counter_image_slots,
+             sizeof(sx->counter_image_slots));
 
    tokens = ureg_get_tokens(ureg, &nr_tokens);
    assert(tokens);
@@ -5647,12 +6718,14 @@ Shader_tgsi_translate(const unsigned *code,
       tgsi_dump(tokens, 0);
    }
 
+   FREE(sx);
    return tokens;
 
 fail:
-   FREE(sx.labels);
-   FREE(sx.calls);
+   FREE(sx->labels);
+   FREE(sx->calls);
    if (ureg)
       ureg_destroy(ureg);
+   FREE(sx);
    return NULL;
 }

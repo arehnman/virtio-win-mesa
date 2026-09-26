@@ -354,6 +354,7 @@ impl PipeContext {
             ir_type: pipe_shader_ir::PIPE_SHADER_IR_NIR,
             prog: nir.dup_for_driver().cast(),
             static_shared_mem: static_local_mem,
+            sampler_binding_map: ptr::null(),
         };
         unsafe { self.pipe.as_ref().create_compute_state.unwrap()(self.pipe.as_ptr(), &state) }
     }

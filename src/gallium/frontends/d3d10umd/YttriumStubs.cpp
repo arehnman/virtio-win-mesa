@@ -35,8 +35,11 @@ bool
 yttrium_gdi_flush_async_present(
    struct pipe_context *ctx,
    const char *label,
-   const struct yttrium_gdi_present_publish_request *publish)
+   const struct yttrium_gdi_present_publish_request *publish,
+   struct yttrium_gdi_flush_issuance **issued)
 {
+   if (issued)
+      *issued = NULL;
    (void)ctx;
    (void)label;
    (void)publish;

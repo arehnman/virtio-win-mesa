@@ -84,6 +84,10 @@ void
 yttrium_destroy_context_upload_staging(struct pipe_screen *pscreen,
                                        struct yttrium_context *yctx);
 
+void
+yttrium_destroy_context_image_copy_staging(struct pipe_screen *pscreen,
+                                           struct yttrium_context *yctx);
+
 void *
 yttrium_transfer_map(struct pipe_context *ctx,
                      struct pipe_resource *resource,
@@ -100,6 +104,10 @@ void
 yttrium_transfer_flush_region(struct pipe_context *ctx,
                               struct pipe_transfer *transfer,
                               const struct pipe_box *box);
+
+bool
+yttrium_resource_publish_private_draw_buffer(struct pipe_context *ctx,
+                                             struct yttrium_resource *res);
 
 void
 yttrium_buffer_subdata(struct pipe_context *ctx,

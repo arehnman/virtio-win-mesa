@@ -20,6 +20,7 @@
 
 #include "yttrium_internal.h"
 #include "yttrium_context.h"
+#include "yttrium_gdi_public.h"
 #include "yttrium_options.h"
 #include "yttrium_pipeline.h"
 #include "yttrium_present.h"
@@ -27,6 +28,35 @@
 #include "yttrium_shader.h"
 #include "yttrium_trace.h"
 #include "yttrium_venus.h"
+
+static void
+yttrium_record_draw_failure(struct yttrium_context *yctx)
+{
+   if (yctx)
+      InterlockedExchange(&yctx->draw_failure, 1);
+}
+
+bool
+yttrium_gdi_take_draw_failure(struct pipe_context *ctx)
+{
+   if (!ctx)
+      return false;
+
+   /* u_threaded_context exposes its driver context without draining queued
+    * work.  The atomic latch is specifically meant to preserve asynchronous
+    * submission, so do not use threaded_context_unwrap_sync here. */
+   if (ctx->callback) {
+      struct pipe_context *driver = threaded_context(ctx)->pipe;
+
+      if (!driver || driver->draw_vbo != yttrium_draw_vbo)
+         return false;
+      ctx = driver;
+   } else if (ctx->draw_vbo != yttrium_draw_vbo) {
+      return false;
+   }
+
+   return InterlockedExchange(&yttrium_context(ctx)->draw_failure, 0) != 0;
+}
 
 static float
 yttrium_absf(float value)
@@ -75,6 +105,17 @@ yttrium_get_stream_output_dummy_target(struct pipe_context *ctx)
    return yttrium_resource(yctx->so_dummy_target);
 }
 
+static bool
+yttrium_has_live_stream_output_target(const struct yttrium_context *yctx)
+{
+   for (unsigned i = 0; i < yctx->num_so_targets; i++) {
+      if (yctx->so_targets[i])
+         return true;
+   }
+
+   return false;
+}
+
 static struct yttrium_resource *
 yttrium_get_uav_only_dummy_target(struct pipe_context *ctx,
                                   unsigned width,
@@ -88,16 +129,24 @@ yttrium_get_uav_only_dummy_target(struct pipe_context *ctx,
    height = MAX2(height, 1u);
    samples = MAX2(samples, 1u);
 
-   if (yctx->uav_only_dummy_target &&
-       yctx->uav_only_dummy_width == width &&
-       yctx->uav_only_dummy_height == height &&
-       yctx->uav_only_dummy_samples == samples)
-      return yttrium_resource(yctx->uav_only_dummy_target);
-
-   pipe_resource_reference(&yctx->uav_only_dummy_target, NULL);
-   yctx->uav_only_dummy_width = 0;
-   yctx->uav_only_dummy_height = 0;
-   yctx->uav_only_dummy_samples = 0;
+   unsigned count = 0;
+   uint64_t cached_size = 0;
+   for (unsigned i = 0; i < ARRAY_SIZE(yctx->uav_only_dummy_targets); i++) {
+      struct pipe_resource *target = yctx->uav_only_dummy_targets[i];
+      if (!target)
+         break;
+      if (target->width0 == width && target->height0 == height &&
+          MAX2(target->nr_samples, 1u) == samples) {
+         /* Move references, without dropping ownership of the hit. */
+         for (unsigned j = i; j > 0; j--)
+            yctx->uav_only_dummy_targets[j] =
+               yctx->uav_only_dummy_targets[j - 1];
+         yctx->uav_only_dummy_targets[0] = target;
+         return yttrium_resource(target);
+      }
+      cached_size += yttrium_resource(target)->venus.allocation_size;
+      count++;
+   }
 
    memset(&templ, 0, sizeof(templ));
    templ.target = PIPE_TEXTURE_2D;
@@ -112,146 +161,36 @@ yttrium_get_uav_only_dummy_target(struct pipe_context *ctx,
    templ.usage = PIPE_USAGE_DEFAULT;
    templ.bind = PIPE_BIND_RENDER_TARGET;
 
-   yctx->uav_only_dummy_target =
+   struct pipe_resource *target =
       ctx->screen->resource_create(ctx->screen, &templ);
-   if (!yctx->uav_only_dummy_target) {
+   if (!target) {
       YTTRIUM_WARN("yttrium: uav-only dummy render target allocation failed width=%u height=%u samples=%u\n",
                    width, height, samples);
       return NULL;
    }
 
-   yctx->uav_only_dummy_width = width;
-   yctx->uav_only_dummy_height = height;
-   yctx->uav_only_dummy_samples = samples;
-   return yttrium_resource(yctx->uav_only_dummy_target);
-}
-
-static VkBlendFactor
-yttrium_pipe_blend_factor(enum pipe_blendfactor factor)
-{
-   switch (factor) {
-   case PIPE_BLENDFACTOR_ONE:
-      return VK_BLEND_FACTOR_ONE;
-   case PIPE_BLENDFACTOR_SRC_COLOR:
-      return VK_BLEND_FACTOR_SRC_COLOR;
-   case PIPE_BLENDFACTOR_SRC_ALPHA:
-      return VK_BLEND_FACTOR_SRC_ALPHA;
-   case PIPE_BLENDFACTOR_DST_ALPHA:
-      return VK_BLEND_FACTOR_DST_ALPHA;
-   case PIPE_BLENDFACTOR_DST_COLOR:
-      return VK_BLEND_FACTOR_DST_COLOR;
-   case PIPE_BLENDFACTOR_SRC_ALPHA_SATURATE:
-      return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
-   case PIPE_BLENDFACTOR_CONST_COLOR:
-      return VK_BLEND_FACTOR_CONSTANT_COLOR;
-   case PIPE_BLENDFACTOR_CONST_ALPHA:
-      return VK_BLEND_FACTOR_CONSTANT_ALPHA;
-   case PIPE_BLENDFACTOR_SRC1_COLOR:
-      return VK_BLEND_FACTOR_SRC1_COLOR;
-   case PIPE_BLENDFACTOR_SRC1_ALPHA:
-      return VK_BLEND_FACTOR_SRC1_ALPHA;
-   case PIPE_BLENDFACTOR_ZERO:
-      return VK_BLEND_FACTOR_ZERO;
-   case PIPE_BLENDFACTOR_INV_SRC_COLOR:
-      return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
-   case PIPE_BLENDFACTOR_INV_SRC_ALPHA:
-      return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-   case PIPE_BLENDFACTOR_INV_DST_ALPHA:
-      return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
-   case PIPE_BLENDFACTOR_INV_DST_COLOR:
-      return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
-   case PIPE_BLENDFACTOR_INV_CONST_COLOR:
-      return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
-   case PIPE_BLENDFACTOR_INV_CONST_ALPHA:
-      return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
-   case PIPE_BLENDFACTOR_INV_SRC1_COLOR:
-      return VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR;
-   case PIPE_BLENDFACTOR_INV_SRC1_ALPHA:
-      return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
-   default:
-      YTTRIUM_LOG("yttrium: unsupported blend factor %u, using ONE\n",
-                   factor);
-      return VK_BLEND_FACTOR_ONE;
+   /* Alternating UAV raster sizes must not allocate a new image on every
+    * pass: its image ID is also part of the graphics-pipeline cache key.
+    * These are write-masked scratch attachments, so ordered draws can reuse
+    * them without preserving any application-visible contents.
+    *
+    * Bound this cache's retained allocation sizes to 64 MiB, except for a
+    * single larger target required by the current draw. Eviction drops only
+    * our reference; cached pipelines and in-flight batches keep theirs.
+    */
+   const uint64_t target_size = yttrium_resource(target)->venus.allocation_size;
+   const uint64_t cache_budget = 64ull * 1024 * 1024;
+   while (count && (count == ARRAY_SIZE(yctx->uav_only_dummy_targets) ||
+                    cached_size + target_size > cache_budget)) {
+      count--;
+      cached_size -=
+         yttrium_resource(yctx->uav_only_dummy_targets[count])->venus.allocation_size;
+      pipe_resource_reference(&yctx->uav_only_dummy_targets[count], NULL);
    }
-}
-
-static VkBlendOp
-yttrium_pipe_blend_op(enum pipe_blend_func func)
-{
-   switch (func) {
-   case PIPE_BLEND_ADD:
-      return VK_BLEND_OP_ADD;
-   case PIPE_BLEND_SUBTRACT:
-      return VK_BLEND_OP_SUBTRACT;
-   case PIPE_BLEND_REVERSE_SUBTRACT:
-      return VK_BLEND_OP_REVERSE_SUBTRACT;
-   case PIPE_BLEND_MIN:
-      return VK_BLEND_OP_MIN;
-   case PIPE_BLEND_MAX:
-      return VK_BLEND_OP_MAX;
-   default:
-      YTTRIUM_LOG("yttrium: unsupported blend op %u, using ADD\n", func);
-      return VK_BLEND_OP_ADD;
-   }
-}
-
-static VkLogicOp
-yttrium_pipe_logic_op(unsigned logic_op)
-{
-   switch (logic_op) {
-   case PIPE_LOGICOP_CLEAR:
-      return VK_LOGIC_OP_CLEAR;
-   case PIPE_LOGICOP_NOR:
-      return VK_LOGIC_OP_NOR;
-   case PIPE_LOGICOP_AND_INVERTED:
-      return VK_LOGIC_OP_AND_INVERTED;
-   case PIPE_LOGICOP_COPY_INVERTED:
-      return VK_LOGIC_OP_COPY_INVERTED;
-   case PIPE_LOGICOP_AND_REVERSE:
-      return VK_LOGIC_OP_AND_REVERSE;
-   case PIPE_LOGICOP_INVERT:
-      return VK_LOGIC_OP_INVERT;
-   case PIPE_LOGICOP_XOR:
-      return VK_LOGIC_OP_XOR;
-   case PIPE_LOGICOP_NAND:
-      return VK_LOGIC_OP_NAND;
-   case PIPE_LOGICOP_AND:
-      return VK_LOGIC_OP_AND;
-   case PIPE_LOGICOP_EQUIV:
-      return VK_LOGIC_OP_EQUIVALENT;
-   case PIPE_LOGICOP_NOOP:
-      return VK_LOGIC_OP_NO_OP;
-   case PIPE_LOGICOP_OR_INVERTED:
-      return VK_LOGIC_OP_OR_INVERTED;
-   case PIPE_LOGICOP_COPY:
-      return VK_LOGIC_OP_COPY;
-   case PIPE_LOGICOP_OR_REVERSE:
-      return VK_LOGIC_OP_OR_REVERSE;
-   case PIPE_LOGICOP_OR:
-      return VK_LOGIC_OP_OR;
-   case PIPE_LOGICOP_SET:
-      return VK_LOGIC_OP_SET;
-   default:
-      YTTRIUM_LOG("yttrium: unsupported logic op %u, using COPY\n", logic_op);
-      return VK_LOGIC_OP_COPY;
-   }
-}
-
-static VkColorComponentFlags
-yttrium_pipe_colormask(unsigned colormask)
-{
-   VkColorComponentFlags vk_mask = 0;
-
-   if (colormask & PIPE_MASK_R)
-      vk_mask |= VK_COLOR_COMPONENT_R_BIT;
-   if (colormask & PIPE_MASK_G)
-      vk_mask |= VK_COLOR_COMPONENT_G_BIT;
-   if (colormask & PIPE_MASK_B)
-      vk_mask |= VK_COLOR_COMPONENT_B_BIT;
-   if (colormask & PIPE_MASK_A)
-      vk_mask |= VK_COLOR_COMPONENT_A_BIT;
-
-   return vk_mask;
+   for (unsigned i = count; i > 0; i--)
+      yctx->uav_only_dummy_targets[i] = yctx->uav_only_dummy_targets[i - 1];
+   yctx->uav_only_dummy_targets[0] = target;
+   return yttrium_resource(target);
 }
 
 static VkPrimitiveTopology
@@ -264,12 +203,20 @@ yttrium_pipe_topology(unsigned mode)
       return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
    case MESA_PRIM_LINE_STRIP:
       return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+   case MESA_PRIM_LINES_ADJACENCY:
+      return VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY;
+   case MESA_PRIM_LINE_STRIP_ADJACENCY:
+      return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
    case MESA_PRIM_TRIANGLES:
       return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
    case MESA_PRIM_PATCHES:
       return VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
    case MESA_PRIM_TRIANGLE_STRIP:
       return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+   case MESA_PRIM_TRIANGLES_ADJACENCY:
+      return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
+   case MESA_PRIM_TRIANGLE_STRIP_ADJACENCY:
+      return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
    case MESA_PRIM_TRIANGLE_FAN:
       return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
    default:
@@ -364,7 +311,9 @@ yttrium_topology_supports_primitive_restart(VkPrimitiveTopology topology)
 {
    switch (topology) {
    case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP:
+   case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY:
    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY:
    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN:
       return true;
    default:
@@ -532,33 +481,26 @@ yttrium_make_venus_draw_state(struct yttrium_context *yctx,
       state->logic_op_enable =
          blend->logicop_enable &&
          yttrium_venus_logic_op_enabled(screen->venus) ? VK_TRUE : VK_FALSE;
-      state->logic_op = yttrium_pipe_logic_op(blend->logicop_func);
+      state->logic_op = yctx->blend->logic_op;
       state->alpha_to_coverage_enable =
          blend->alpha_to_coverage ? VK_TRUE : VK_FALSE;
 
-      for (uint32_t i = 0; i < PIPE_MAX_COLOR_BUFS; i++) {
-         const uint32_t rt_index = blend->independent_blend_enable ? i : 0;
-         const struct pipe_rt_blend_state *rt = &blend->rt[rt_index];
-
-         state->rt_blend_enable[i] =
-            rt->blend_enable ? VK_TRUE : VK_FALSE;
-         state->rt_color_write_mask[i] =
-            yttrium_pipe_colormask(rt->colormask);
-         state->rt_src_color_blend_factor[i] =
-            yttrium_pipe_blend_factor(rt->rgb_src_factor);
-         state->rt_dst_color_blend_factor[i] =
-            yttrium_pipe_blend_factor(rt->rgb_dst_factor);
-         state->rt_color_blend_op[i] =
-            yttrium_pipe_blend_op(rt->rgb_func);
-         state->rt_src_alpha_blend_factor[i] =
-            yttrium_pipe_blend_factor(util_blendfactor_to_alpha(
-                                         rt->alpha_src_factor));
-         state->rt_dst_alpha_blend_factor[i] =
-            yttrium_pipe_blend_factor(util_blendfactor_to_alpha(
-                                         rt->alpha_dst_factor));
-         state->rt_alpha_blend_op[i] =
-            yttrium_pipe_blend_op(rt->alpha_func);
-      }
+      memcpy(state->rt_blend_enable, yctx->blend->rt_blend_enable,
+             sizeof(state->rt_blend_enable));
+      memcpy(state->rt_color_write_mask, yctx->blend->rt_color_write_mask,
+             sizeof(state->rt_color_write_mask));
+      memcpy(state->rt_src_color_blend_factor, yctx->blend->rt_src_color_blend_factor,
+             sizeof(state->rt_src_color_blend_factor));
+      memcpy(state->rt_dst_color_blend_factor, yctx->blend->rt_dst_color_blend_factor,
+             sizeof(state->rt_dst_color_blend_factor));
+      memcpy(state->rt_color_blend_op, yctx->blend->rt_color_blend_op,
+             sizeof(state->rt_color_blend_op));
+      memcpy(state->rt_src_alpha_blend_factor, yctx->blend->rt_src_alpha_blend_factor,
+             sizeof(state->rt_src_alpha_blend_factor));
+      memcpy(state->rt_dst_alpha_blend_factor, yctx->blend->rt_dst_alpha_blend_factor,
+             sizeof(state->rt_dst_alpha_blend_factor));
+      memcpy(state->rt_alpha_blend_op, yctx->blend->rt_alpha_blend_op,
+             sizeof(state->rt_alpha_blend_op));
 
       state->blend_enable = state->rt_blend_enable[0];
       state->color_write_mask = state->rt_color_write_mask[0];
@@ -1563,6 +1505,14 @@ yttrium_draw_vbo(struct pipe_context *ctx,
    struct pipe_surface *cbuf = NULL;
    struct yttrium_resource *res = NULL;
 
+   /* The threaded indirect packet only initializes start.  Do not inspect
+    * direct-only count/bias fields in diagnostics or fallback probes. */
+   struct pipe_draw_start_count_bias indirect_draw = { 0 };
+   if (indirect) {
+      indirect_draw.start = draws ? draws[0].start : 0;
+      draws = &indirect_draw;
+   }
+
    /* Off unless RT_STATS_EVERY is set; see yttrium_report_rt_stats. */
    yttrium_report_rt_stats(yctx, info, draws);
 
@@ -1578,11 +1528,13 @@ yttrium_draw_vbo(struct pipe_context *ctx,
       yctx->fb.zsbuf.texture ? yttrium_resource(yctx->fb.zsbuf.texture) :
       NULL;
    /*
-    * The stream-output dummy is a fixed 1x1 colour target, used only to give
-    * a draw with nothing bound something to attach.  A depth buffer is
-    * something to attach, so prefer it: taking the dummy while zsbuf is bound
-    * fabricates a 1x1 colour attachment next to a full-size depth attachment,
-    * and the render area can then match neither.
+    * The fixed 1x1 stream-output dummy gives the draw path a resource to own
+    * and track when no framebuffer attachment exists.  When at least one SO
+    * target is live it is only an anchor: targetless_stream_output below
+    * keeps it out of the Vulkan render pass.  Preserve the old attachment
+    * route for an all-NULL SO binding with no fragment image, which may still
+    * carry query work.
+    * A depth buffer is already a usable anchor and attachment, so prefer it.
     *
     * Superposition streams with a depth buffer bound and no colour target,
     * which failed every such pipeline - 169327 of them, all with a zs, all
@@ -1590,39 +1542,55 @@ yttrium_draw_vbo(struct pipe_context *ctx,
     * With zs preferred, res == zs_res selects the depth-only path below,
     * which attaches no colour target at all.
     */
-   const bool stream_output_only =
-      !res && !zs_res && yctx->num_so_targets;
+   const bool has_live_so_target =
+      !res && !zs_res && yttrium_has_live_stream_output_target(yctx);
+   struct yttrium_resource *fragment_image =
+      !res && !zs_res && !has_live_so_target ?
+      yttrium_first_fragment_shader_image(yctx) : NULL;
+   /* State restoration may rebind all SO slots as NULL.  Those slots do not
+    * own the draw and must not hide a fragment UAV behind the fixed 1x1 SO
+    * dummy.  Keep the existing no-UAV query route unchanged. */
+   const bool stream_output_requested =
+      !res && !zs_res && yctx->num_so_targets &&
+      (has_live_so_target || !fragment_image);
+   const bool targetless_stream_output =
+      stream_output_requested && has_live_so_target;
    bool uav_only_dummy_target = false;
    unsigned uav_only_dummy_samples = 1;
 
    const struct yttrium_shader_state *vs = yctx->shaders[MESA_SHADER_VERTEX];
    const struct yttrium_shader_state *fs = yctx->shaders[MESA_SHADER_FRAGMENT];
-   yttrium_trace_draw_vbo(info ? info->mode : 0,
-                          num_draws,
-                          draws && num_draws ? draws[0].count : 0,
-                          info ? info->instance_count : 0,
-                          info ? info->start_instance : 0,
-                          cbuf,
-                          false,
-                          0,
-                          vs ? vs->info.num_inputs : 0,
-                          vs ? vs->info.num_outputs : 0,
-                          fs ? fs->info.num_inputs : 0,
-                          fs ? fs->info.num_outputs : 0,
-                          yttrium_count_sampler_views(
-                             yctx, MESA_SHADER_FRAGMENT),
-                          yttrium_count_sampler_states(
-                             yctx, MESA_SHADER_FRAGMENT));
-   if (stream_output_only)
+   if (yttrium_trace_is_enabled()) {
+      yttrium_trace_draw_vbo(info ? info->mode : 0,
+                             num_draws,
+                             draws && num_draws ? draws[0].count : 0,
+                             info ? info->instance_count : 0,
+                             info ? info->start_instance : 0,
+                             cbuf,
+                             false,
+                             0,
+                             vs ? vs->info.num_inputs : 0,
+                             vs ? vs->info.num_outputs : 0,
+                             fs ? fs->info.num_inputs : 0,
+                             fs ? fs->info.num_outputs : 0,
+                             yttrium_count_sampler_views(
+                                yctx, MESA_SHADER_FRAGMENT),
+                             yttrium_count_sampler_states(
+                                yctx, MESA_SHADER_FRAGMENT));
+   }
+   if (stream_output_requested)
       res = yttrium_get_stream_output_dummy_target(ctx);
    else if (!res && zs_res)
       res = zs_res;
    else if (!res)
-      res = yttrium_first_fragment_shader_image(yctx);
+      res = fragment_image;
 
+   /* A fragment image selected above is a UAV anchor, not a bound color
+    * target, even when the resource was created with render-target support. */
    bool color_target =
-      res && (res->display_target ||
-              yttrium_resource_is_venus_color_attachment(res));
+      res && res != fragment_image &&
+      (res->display_target ||
+       yttrium_resource_is_venus_color_attachment(res));
    bool depth_target =
       res && res == zs_res &&
       yttrium_resource_is_venus_depth_attachment(res);
@@ -1651,6 +1619,7 @@ yttrium_draw_vbo(struct pipe_context *ctx,
                          drops, yctx->fb.width, yctx->fb.height,
                          uav_only_dummy_samples, info ? info->mode : 0,
                          num_draws);
+         yttrium_record_draw_failure(yctx);
          return;
       }
 
@@ -1673,6 +1642,8 @@ yttrium_draw_vbo(struct pipe_context *ctx,
                       yctx->num_so_targets, yctx->fb.width, yctx->fb.height,
                       info ? info->mode : 0, num_draws);
       yttrium_record_draw_queries(ctx, info, indirect, draws, num_draws);
+      if (targetless_stream_output)
+         yttrium_record_draw_failure(yctx);
       return;
    }
    if (!color_target && !depth_target && !storage_image_target &&
@@ -1687,6 +1658,7 @@ yttrium_draw_vbo(struct pipe_context *ctx,
                       res->base.target, res->venus.vk_format,
                       res->venus.width, res->venus.height,
                       res == zs_res, info ? info->mode : 0, num_draws);
+      yttrium_record_draw_failure(yctx);
       return;
    }
 
@@ -1695,6 +1667,8 @@ yttrium_draw_vbo(struct pipe_context *ctx,
       info ? yttrium_pipe_topology(info->mode) :
              VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
    yttrium_make_venus_draw_state(yctx, res, topology, &draw_state);
+   draw_state.targetless_stream_output =
+      targetless_stream_output ? VK_TRUE : VK_FALSE;
    if (uav_only_dummy_target) {
       draw_state.rasterization_samples = uav_only_dummy_samples;
       draw_state.forced_sample_count = 0;
@@ -1744,6 +1718,7 @@ yttrium_draw_vbo(struct pipe_context *ctx,
                             res->venus_res_id,
                             res->classic_display,
                             res->venus.buffer_backed);
+            yttrium_record_draw_failure(yctx);
             return;
          }
       }
@@ -1771,5 +1746,6 @@ yttrium_draw_vbo(struct pipe_context *ctx,
                       draw_state.forced_sample_count,
                       draw_state.rasterization_samples,
                       info ? info->mode : 0, num_draws);
+      yttrium_record_draw_failure(yctx);
    }
 }

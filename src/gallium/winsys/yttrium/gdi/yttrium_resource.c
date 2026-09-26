@@ -26,6 +26,17 @@
 #include "yttrium_present.h"
 #include "yttrium_trace.h"
 
+static bool
+yttrium_copy_venus_buffer_to_cpu(struct pipe_context *ctx,
+                                 struct yttrium_resource *ysrc,
+                                 struct yttrium_resource *ydst,
+                                 uint32_t src_offset, uint32_t dst_offset,
+                                 uint32_t size);
+
+static bool
+yttrium_prepare_gpu_copy_buffer(struct pipe_context *ctx,
+                                 struct yttrium_resource *res);
+
 /*
  * Process-unique id stamped on every resource, so index bounds cache entries
  * cannot be aliased by a later resource landing on a recycled address.
@@ -1133,6 +1144,45 @@ yttrium_resource_uses_mapped_venus_buffer(const struct yttrium_resource *res)
           res->data && res->data == res->map && res->map_is_blob;
 }
 
+bool
+yttrium_resource_publish_private_draw_buffer(struct pipe_context *ctx,
+                                             struct yttrium_resource *res)
+{
+   if (!res || !res->private_immutable_draw_buffer || !res->data_dirty)
+      return true;
+
+   struct yttrium_screen *screen =
+      ctx && ctx->screen ? yttrium_screen(ctx->screen) : NULL;
+   if (!screen || !screen->venus || !res->data || !res->size ||
+       !res->venus.initialized || !res->venus.buffer_backed ||
+       !res->venus.buffer) {
+      YTTRIUM_WARN("yttrium: ERROR: private immutable draw buffer publication failed owner=yttrium_resource component=immutable-draw-buffer reason=invalid-publication-state action=fail-draw resource=%p data=%p size=0x%llx initialized=%u buffer_backed=%u buffer_id=%llu\n",
+                   (void *)res, res->data,
+                   (unsigned long long)res->size,
+                   res->venus.initialized, res->venus.buffer_backed,
+                   (unsigned long long)res->venus.buffer_obj.id);
+      return false;
+   }
+
+   /*
+    * Immutable buffers are initialized once.  Publish the complete CPU
+    * backing rather than only the reported map range so bytes not explicitly
+    * touched by a partial initialization retain the zeroed guest contents.
+    */
+   if (!yttrium_venus_update_buffer(screen->venus, &res->venus, 0,
+                                    res->size, res->data)) {
+      YTTRIUM_WARN("yttrium: ERROR: private immutable draw buffer publication failed owner=yttrium_resource component=immutable-draw-buffer reason=venus-buffer-update-failed action=fail-draw resource=%p memory_id=%llu buffer_id=%llu size=0x%llx\n",
+                   (void *)res,
+                   (unsigned long long)res->venus.memory_obj.id,
+                   (unsigned long long)res->venus.buffer_obj.id,
+                   (unsigned long long)res->size);
+      return false;
+   }
+
+   res->data_dirty = false;
+   return true;
+}
+
 static bool
 yttrium_create_guest_allocation(struct pipe_screen *pscreen,
                                 struct yttrium_resource *res,
@@ -1309,7 +1359,8 @@ yttrium_resource_create(struct pipe_screen *pscreen,
       templ->target == PIPE_BUFFER &&
       !stream_output_buffer && !ordered_worker_upload_buffer &&
       (templ->bind & (PIPE_BIND_VERTEX_BUFFER |
-                      PIPE_BIND_INDEX_BUFFER)) != 0;
+                      PIPE_BIND_INDEX_BUFFER |
+                      PIPE_BIND_COMMAND_ARGS_BUFFER)) != 0;
    const bool replacement_candidate =
       buffer_replacement_enabled && allocation_backed_buffer &&
       !shared_target &&
@@ -1544,13 +1595,15 @@ yttrium_resource_create(struct pipe_screen *pscreen,
       }
 
       if (allocation_backed_buffer && !res->replacement_storage) {
+         const bool command_args_buffer =
+            (templ->bind & PIPE_BIND_COMMAND_ARGS_BUFFER) != 0;
          const bool venus_bind_buffer =
             yttrium_gdi_debug_get_bool_option(
                "D3D10UMD_YTTRIUM_BIND_VERTEX_BUFFER", true);
          const bool bind_buffer_dynamic =
             templ->usage == PIPE_USAGE_DYNAMIC ||
             templ->usage == PIPE_USAGE_STREAM;
-         if (venus_bind_buffer && !bind_buffer_dynamic) {
+         if (command_args_buffer || (venus_bind_buffer && !bind_buffer_dynamic)) {
             VkBufferUsageFlags bind_usage = 0;
             if (templ->bind & PIPE_BIND_VERTEX_BUFFER)
                bind_usage |= VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
@@ -1565,14 +1618,38 @@ yttrium_resource_create(struct pipe_screen *pscreen,
             if (templ->bind & PIPE_BIND_COMMAND_ARGS_BUFFER)
                bind_usage |= VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
 
+            const unsigned draw_bind_mask =
+               PIPE_BIND_VERTEX_BUFFER | PIPE_BIND_INDEX_BUFFER;
+            const bool private_immutable_draw_buffer =
+               templ->usage == PIPE_USAGE_IMMUTABLE &&
+               (templ->bind & draw_bind_mask) != 0 &&
+               (templ->bind & ~draw_bind_mask) == 0;
+            uint64_t *out_memory_id = private_immutable_draw_buffer ?
+               NULL : &res->venus_mem_id;
+
             if (bind_usage &&
                 !yttrium_venus_create_bind_buffer(screen->venus, &res->venus,
                                                   res->size, bind_usage,
-                                                  &res->venus_mem_id)) {
+                                                  out_memory_id)) {
+               if (command_args_buffer) {
+                  YTTRIUM_WARN("yttrium: command buffer allocation failed owner=yttrium_resource reason=native-indirect-buffer-create-failed action=abort-resource\n");
+                  yttrium_resource_free(res);
+                  return NULL;
+               }
+               if (private_immutable_draw_buffer) {
+                  YTTRIUM_WARN("yttrium: ERROR: private immutable draw buffer create failed owner=resource_create component=immutable-draw-buffer reason=venus_bind_buffer_create_failed action=abort-resource resource=%p size=0x%llx bind=0x%x usage=0x%x\n",
+                               (void *)res,
+                               (unsigned long long)res->size,
+                               templ->bind, bind_usage);
+                  yttrium_resource_free(res);
+                  return NULL;
+               }
                YTTRIUM_WARN("yttrium: WARNING: allocation-backed buffer owner=resource_create direct_bind=create_failed path=per_draw_upload reason=venus_bind_buffer_create_failed resource=%p size=0x%llx bind=0x%x usage=0x%x\n",
                             (void *)res,
                             (unsigned long long)res->size,
                             templ->bind, bind_usage);
+            } else if (private_immutable_draw_buffer) {
+               res->private_immutable_draw_buffer = true;
             }
          }
 
@@ -1600,6 +1677,10 @@ yttrium_resource_create(struct pipe_screen *pscreen,
 
          res->data = res->map;
          memset(res->data, 0, res->size);
+         if (res->private_immutable_draw_buffer) {
+            res->data_dirty = true;
+            res->contents_serial++;
+         }
          YTTRIUM_LOG("yttrium: allocation-backed buffer resource=%p hAllocation=0x%lx res_id=%u data=%p size=0x%llx bind=0x%x\n",
                      (void *)res,
                      (unsigned long)res->hAllocation,
@@ -1724,8 +1805,14 @@ yttrium_resource_create(struct pipe_screen *pscreen,
                      res->base.bind,
                      res->venus.initialized,
                      (unsigned long long)res->venus.image_obj.id);
-         res->data_dirty = true;
-         res->contents_serial++;
+         /* A newly allocated stream-output shadow does not initialize its
+          * separate device-local buffer.  Only a real CPU write should make
+          * that shadow authoritative; transfer_unmap publishes such writes.
+          */
+         if (!stream_output_buffer) {
+            res->data_dirty = true;
+            res->contents_serial++;
+         }
          if (ordered_worker_upload_buffer &&
              !ordered_worker_upload_direct_backing)
              res->owns_allocation = false;
@@ -2587,6 +2674,78 @@ yttrium_destroy_context_upload_staging(struct pipe_screen *pscreen,
    yctx->upload_staging_offset = 0;
 }
 
+void
+yttrium_destroy_context_image_copy_staging(struct pipe_screen *pscreen,
+                                           struct yttrium_context *yctx)
+{
+   struct yttrium_screen *screen = yttrium_screen(pscreen);
+
+   if (!yctx)
+      return;
+
+   yttrium_venus_resource_fini(screen->venus, NULL,
+                               &yctx->image_copy_staging, NULL);
+   yctx->image_copy_staging_mem_id = 0;
+   yctx->image_copy_staging_size = 0;
+}
+
+static bool
+yttrium_ensure_context_image_copy_staging(struct pipe_context *ctx,
+                                          uint64_t required_size)
+{
+   struct yttrium_context *yctx = yttrium_context(ctx);
+   struct yttrium_screen *screen = yttrium_screen(ctx->screen);
+   const VkBufferUsageFlags staging_usage =
+      VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+      VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+   if (!required_size)
+      return false;
+
+   if (yctx->image_copy_staging.initialized &&
+       yctx->image_copy_staging.buffer_backed &&
+       yctx->image_copy_staging.buffer &&
+       yctx->image_copy_staging.memory &&
+       yctx->image_copy_staging.memory_obj.id &&
+       yctx->image_copy_staging_mem_id ==
+          yctx->image_copy_staging.memory_obj.id &&
+       (yctx->image_copy_staging.buffer_usage & staging_usage) ==
+          staging_usage &&
+       yctx->image_copy_staging_size >= required_size)
+      return true;
+
+   /* resource_fini flushes the current batch and retires the old allocation
+    * against its latest user, so growing this scratch buffer cannot free an
+    * in-flight transfer.
+    */
+   yttrium_destroy_context_image_copy_staging(ctx->screen, yctx);
+
+   /* This scratch is consumed only by Vulkan transfer commands.  Keep it
+    * private and device-local: exporting host-visible memory puts every
+    * image-buffer-image round trip through a CPU-mappable heap even though
+    * neither the CPU nor the KMD maps the allocation.
+    */
+   if (!yttrium_venus_create_bind_buffer(
+          screen->venus, &yctx->image_copy_staging, required_size,
+          staging_usage, NULL)) {
+      YTTRIUM_WARN("yttrium: resource_copy_region image compatible copy unavailable owner=yttrium_resource_copy_region reason=create-private-device-local-staging-failed action=return-to-resource-copy-dispatch size=0x%llx\n",
+                   (unsigned long long)required_size);
+      return false;
+   }
+
+   yctx->image_copy_staging_mem_id =
+      yctx->image_copy_staging.memory_obj.id;
+   yctx->image_copy_staging_size =
+      yctx->image_copy_staging.image_size;
+   YTTRIUM_LOG("yttrium: private device-local image copy staging buffer res_id=%u mem_id=0x%llx buffer_id=0x%llx size=0x%llx usage=0x%x\n",
+               (uint32_t)yctx->image_copy_staging_mem_id,
+               (unsigned long long)yctx->image_copy_staging_mem_id,
+               (unsigned long long)yctx->image_copy_staging.buffer_obj.id,
+               (unsigned long long)yctx->image_copy_staging_size,
+               yctx->image_copy_staging.buffer_usage);
+   return true;
+}
+
 static bool
 yttrium_ensure_context_upload_staging(struct pipe_context *ctx,
                                       uint64_t required_size,
@@ -2794,6 +2953,7 @@ yttrium_transfer_map(struct pipe_context *ctx,
             goto read_map_failed;
          }
 
+         ytransfer->readback.cpu_readback = true;
          if (!yttrium_venus_create_display_buffer(rscreen->venus,
                                                  &ytransfer->readback,
                                                  rb_size, &rb_mem_id)) {
@@ -2908,8 +3068,28 @@ yttrium_transfer_map(struct pipe_context *ctx,
       return ytransfer->staging;
    }
 
+   if (resource->target == PIPE_BUFFER && res->gpu_buffer_written &&
+       !yttrium_resource_uses_mapped_venus_buffer(res)) {
+      /* Map is an explicit CPU access.  A detached shadow cannot answer it
+       * after a GPU counter write, nor preserve neighbours of a partial write. */
+      const bool full_discard = (usage & PIPE_MAP_WRITE) &&
+         !(usage & PIPE_MAP_READ) && box->x == 0 &&
+         (unsigned)box->width == resource->width0 &&
+         (usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE);
+      if (!full_discard &&
+          !yttrium_copy_venus_buffer_to_cpu(ctx, res, res, 0, 0,
+                                            resource->width0)) {
+         YTTRIUM_WARN("yttrium: buffer CPU map failed owner=yttrium_resource reason=gpu-authoritative-readback-failed action=fail-map\n");
+         pipe_resource_reference(&transfer->resource, NULL);
+         FREE(ytransfer);
+         *ptransfer = NULL;
+         return NULL;
+      }
+      res->data_dirty = false;
+   }
+
    if (resource->target == PIPE_BUFFER &&
-       (usage & PIPE_MAP_WRITE) &&
+       ((usage & PIPE_MAP_WRITE) || res->gpu_buffer_written) &&
        yttrium_resource_uses_mapped_venus_buffer(res) &&
        ctx && ctx->screen) {
       /*
@@ -2927,14 +3107,21 @@ yttrium_transfer_map(struct pipe_context *ctx,
        */
       const bool direct_bind_map_hazard =
          (usage & (PIPE_MAP_DISCARD_RANGE |
-                   PIPE_MAP_DISCARD_WHOLE_RESOURCE)) != 0;
+                   PIPE_MAP_DISCARD_WHOLE_RESOURCE)) != 0 &&
+         !(resource->bind & PIPE_BIND_COMMAND_ARGS_BUFFER);
       if (direct_bind_map_hazard && !res->direct_bind_unsafe)
          res->direct_bind_unsafe = true;
 
       struct yttrium_screen *screen = yttrium_screen(ctx->screen);
-      if (screen && screen->venus && !(usage & PIPE_MAP_UNSYNCHRONIZED))
-         yttrium_venus_wait_resource(screen->venus, &res->venus,
-                                     "mapped buffer transfer");
+      if (screen && screen->venus && !(usage & PIPE_MAP_UNSYNCHRONIZED) &&
+          !yttrium_venus_wait_resource(screen->venus, &res->venus,
+                                        "mapped buffer transfer")) {
+         YTTRIUM_WARN("yttrium: buffer CPU map failed owner=yttrium_resource reason=native-buffer-wait-failed action=fail-map\n");
+         pipe_resource_reference(&transfer->resource, NULL);
+         FREE(ytransfer);
+         *ptransfer = NULL;
+         return NULL;
+      }
    }
 
    if (resource->target == PIPE_BUFFER) {
@@ -3015,6 +3202,67 @@ yttrium_transfer_unmap(struct pipe_context *ctx, struct pipe_transfer *transfer)
          owner->data_dirty = true;
          /* A mapped write publishes a new resource-owned UBO version. */
          owner->contents_serial++;
+
+         /*
+          * Stream-output and GPU-written counter destinations can have a
+          * device-local Venus buffer and a detached CPU shadow.  A HOST_WRITE
+          * dependency cannot make writes
+          * to that shadow visible to the device-local buffer, so publish the
+          * exact mapped range while the CPU bytes are authoritative.  This is
+          * also the path used by D3D10 CreateResource initial data.
+          *
+          * Do not defer this as a whole-buffer upload until a later draw:
+          * after transform feedback has written the resource, the detached
+          * shadow is stale and must never overwrite the GPU-produced bytes.
+          */
+         const bool detached_stream_output =
+            owner->base.target == PIPE_BUFFER &&
+            ((owner->base.bind & PIPE_BIND_STREAM_OUTPUT) ||
+             owner->gpu_buffer_written) &&
+            !yttrium_resource_uses_mapped_venus_buffer(owner);
+         if (detached_stream_output) {
+            struct yttrium_screen *screen =
+               ctx && ctx->screen ? yttrium_screen(ctx->screen) : NULL;
+            const bool nonnegative_range =
+               transfer->box.x >= 0 && transfer->box.width > 0;
+            const uint64_t write_offset =
+               nonnegative_range ? (uint64_t)transfer->box.x : 0;
+            const uint64_t write_size =
+               nonnegative_range ? (uint64_t)transfer->box.width : 0;
+            const bool range_valid =
+               nonnegative_range && write_offset <= owner->size &&
+               write_size <= owner->size - write_offset;
+            const bool update_aligned =
+               range_valid && !(write_offset & 3) &&
+               (!(write_size & 3) || write_offset + write_size == owner->size);
+            const bool publication_state_valid =
+               screen && screen->venus && owner->venus.initialized &&
+               owner->venus.buffer_backed && owner->venus.buffer &&
+               (owner->venus.buffer_usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            const bool published =
+               publication_state_valid && update_aligned &&
+               yttrium_venus_update_buffer(
+                  screen->venus, &owner->venus, write_offset, write_size,
+                  (const uint8_t *)owner->data + write_offset);
+
+            if (published) {
+               owner->data_dirty = false;
+               owner->venus.contents_initialized = true;
+            } else {
+               YTTRIUM_WARN("yttrium: ERROR: native buffer CPU write publication failed owner=yttrium_resource component=native-buffer reason=venus-range-update-failed action=fail-next-draw resource=%p data=%p offset=0x%llx size=0x%llx resource_size=0x%llx initialized=%u buffer_backed=%u buffer_id=%llu usage=0x%x range_valid=%u aligned=%u\n",
+                            (void *)owner, owner->data,
+                            (unsigned long long)write_offset,
+                            (unsigned long long)write_size,
+                            (unsigned long long)owner->size,
+                            owner->venus.initialized,
+                            owner->venus.buffer_backed,
+                            (unsigned long long)owner->venus.buffer_obj.id,
+                            owner->venus.buffer_usage, range_valid,
+                            update_aligned);
+               if (ctx)
+                  InterlockedExchange(&yttrium_context(ctx)->draw_failure, 1);
+            }
+         }
       }
    }
 
@@ -3046,9 +3294,13 @@ yttrium_buffer_subdata(struct pipe_context *ctx,
 
    const bool mapped_venus_buffer =
       yttrium_resource_uses_mapped_venus_buffer(res);
-   if (mapped_venus_buffer && screen && screen->venus)
-      yttrium_venus_wait_resource(screen->venus, &res->venus,
-                                  "mapped buffer subdata");
+   if (mapped_venus_buffer && screen && screen->venus &&
+       !yttrium_venus_wait_resource(screen->venus, &res->venus,
+                                     "mapped buffer subdata")) {
+      YTTRIUM_WARN("yttrium: buffer CPU update failed owner=yttrium_resource reason=native-buffer-wait-failed action=fail-draw\n");
+      InterlockedExchange(&yttrium_context(ctx)->draw_failure, 1);
+      return;
+   }
 
    if (res->data) {
       memcpy((uint8_t *)res->data + offset, data, size);
@@ -3062,9 +3314,17 @@ yttrium_buffer_subdata(struct pipe_context *ctx,
    if (mapped_venus_buffer)
       return;
 
-   if (screen && res->venus.initialized && res->venus.buffer_backed)
-      yttrium_venus_update_buffer(screen->venus, &res->venus, offset, size,
-                                  data);
+   if (!res->private_immutable_draw_buffer && screen &&
+       res->venus.initialized && res->venus.buffer_backed) {
+      if (!yttrium_venus_update_buffer(screen->venus, &res->venus, offset,
+                                        size, data)) {
+         YTTRIUM_WARN("yttrium: buffer upload failed owner=yttrium_resource reason=partial-buffer-update-failed action=fail-draw\n");
+         InterlockedExchange(&yttrium_context(ctx)->draw_failure, 1);
+      } else if (res->gpu_buffer_written) {
+         /* Only this range of the detached shadow is current. */
+         res->data_dirty = false;
+      }
+   }
 }
 
 void
@@ -3185,9 +3445,13 @@ yttrium_clear_buffer(struct pipe_context *ctx,
 
    const bool mapped_venus_buffer =
       yttrium_resource_uses_mapped_venus_buffer(res);
-   if (mapped_venus_buffer && screen && screen->venus)
-      yttrium_venus_wait_resource(screen->venus, &res->venus,
-                                  "mapped buffer clear");
+   if (mapped_venus_buffer && screen && screen->venus &&
+       !yttrium_venus_wait_resource(screen->venus, &res->venus,
+                                     "mapped buffer clear")) {
+      YTTRIUM_WARN("yttrium: buffer clear failed owner=yttrium_resource reason=native-buffer-wait-failed action=fail-draw\n");
+      InterlockedExchange(&yttrium_context(ctx)->draw_failure, 1);
+      return;
+   }
 
    if (res->data) {
       uint8_t *dst = (uint8_t *)res->data + offset;
@@ -3206,8 +3470,11 @@ yttrium_clear_buffer(struct pipe_context *ctx,
 
    if (lowered_clear_size == 4 && !(offset & 3) && !(size & 3)) {
       if (yttrium_venus_clear_buffer(screen->venus, &res->venus, offset, size,
-                                     *(const uint32_t *)lowered_clear_value))
+                                     *(const uint32_t *)lowered_clear_value)) {
+         if (res->gpu_buffer_written)
+            res->data_dirty = false;
          return;
+      }
    }
 
    if ((offset & 3) || (size & 3) || !size)
@@ -3222,8 +3489,9 @@ yttrium_clear_buffer(struct pipe_context *ctx,
       memcpy(upload + off, clear_value, MIN2((unsigned)clear_value_size,
                                              size - off));
 
-   yttrium_venus_update_buffer(screen->venus, &res->venus, offset, size,
-                               upload);
+   if (yttrium_venus_update_buffer(screen->venus, &res->venus, offset, size,
+                                     upload) && res->gpu_buffer_written)
+      res->data_dirty = false;
 
    if (upload != stack_data)
       FREE(upload);
@@ -3308,6 +3576,12 @@ yttrium_clear_render_target(struct pipe_context *ctx,
                                              dstx, dsty, width, height);
          if (cleared)
             return;
+      }
+
+      if (res->base.flags & YTTRIUM_GDI_RESOURCE_FLAG_UAV_COUNTER) {
+         YTTRIUM_WARN("yttrium: counter reset failed owner=yttrium_resource reason=native-image-clear-failed action=fail-draw\n");
+         InterlockedExchange(&yttrium_context(ctx)->draw_failure, 1);
+         return;
       }
 
       if (!res->display_target)
@@ -3612,6 +3886,7 @@ yttrium_copy_venus_image_to_cpu(struct pipe_context *ctx,
    if (!readback_size)
       return false;
 
+   readback.cpu_readback = true;
    if (!yttrium_venus_create_display_buffer(screen->venus, &readback,
                                             readback_size,
                                             &readback_mem_id)) {
@@ -3648,6 +3923,7 @@ yttrium_copy_venus_image_to_cpu(struct pipe_context *ctx,
    }
 
    if (d24s8_readback) {
+      stencil_readback.cpu_readback = true;
       if (!yttrium_venus_create_display_buffer(screen->venus,
                                                &stencil_readback,
                                                stencil_readback_size,
@@ -3802,6 +4078,18 @@ yttrium_copy_venus_buffer_to_cpu(struct pipe_context *ctx,
        dst_offset > ydst->size || size > ydst->size - dst_offset)
       return false;
 
+   /* A newly initialized CPU-backed buffer may not have been bound for a
+    * draw yet. Publish its current bytes before reading the native buffer;
+    * allocation alone does not make the native contents authoritative.
+    */
+   if (!yttrium_prepare_gpu_copy_buffer(ctx, ysrc)) {
+      YTTRIUM_WARN("yttrium: buffer readback failed owner=yttrium_resource "
+                   "reason=source-publication-failed action=fail-draw\n");
+      InterlockedExchange(&yttrium_context(ctx)->draw_failure, 1);
+      return false;
+   }
+
+   readback.cpu_readback = true;
    if (!yttrium_venus_create_display_buffer(screen->venus, &readback, size,
                                             &readback_mem_id)) {
       YTTRIUM_WARN("yttrium: resource_copy_region buffer to CPU failed to create readback buffer src_res_id=%u size=0x%x\n",
@@ -3856,8 +4144,10 @@ yttrium_resource_formats_compatible(enum pipe_format src_format,
    if (src_format == dst_format)
       return true;
 
-   if (src_format == PIPE_FORMAT_Z16_UNORM &&
-       dst_format == PIPE_FORMAT_R16_UNORM)
+   if ((src_format == PIPE_FORMAT_Z16_UNORM &&
+        dst_format == PIPE_FORMAT_R16_UNORM) ||
+       (src_format == PIPE_FORMAT_Z32_FLOAT &&
+        dst_format == PIPE_FORMAT_R32_FLOAT))
       return true;
 
    const enum pipe_format src_linear = util_format_linear(src_format);
@@ -3901,12 +4191,8 @@ yttrium_copy_venus_image_via_buffer(struct pipe_context *ctx,
                                     uint32_t width,
                                     uint32_t height)
 {
+   struct yttrium_context *yctx = yttrium_context(ctx);
    struct yttrium_screen *screen = yttrium_screen(ctx->screen);
-   struct yttrium_venus_resource staging;
-   uint64_t staging_mem_id = 0;
-   bool ok = false;
-
-   memset(&staging, 0, sizeof(staging));
 
    if (!ysrc || !ydst || ysrc->classic_display || ydst->classic_display ||
        !ysrc->venus.initialized || ysrc->venus.buffer_backed ||
@@ -3916,6 +4202,16 @@ yttrium_copy_venus_image_via_buffer(struct pipe_context *ctx,
    if (!yttrium_resource_formats_compatible(ysrc->base.format,
                                             ydst->base.format))
       return false;
+   if (ysrc->base.nr_samples > 1 || ydst->base.nr_samples > 1 ||
+       ysrc->venus.samples != VK_SAMPLE_COUNT_1_BIT ||
+       ydst->venus.samples != VK_SAMPLE_COUNT_1_BIT) {
+      YTTRIUM_WARN("yttrium: resource_copy_region image compatible copy unsupported owner=yttrium_resource_copy_region reason=multisampled_image_to_buffer src_res_id=%u src_format=%u src_samples=%u src_vk_samples=0x%x dst_res_id=%u dst_format=%u dst_samples=%u dst_vk_samples=0x%x\n",
+                   ysrc->venus_res_id, ysrc->base.format,
+                   ysrc->base.nr_samples, ysrc->venus.samples,
+                   ydst->venus_res_id, ydst->base.format,
+                   ydst->base.nr_samples, ydst->venus.samples);
+      return false;
+   }
 
    const unsigned cpp = util_format_get_blocksize(ydst->base.format);
    const uint32_t staging_stride =
@@ -3925,39 +4221,38 @@ yttrium_copy_venus_image_via_buffer(struct pipe_context *ctx,
    if (!cpp || !staging_stride || !rows || !staging_size)
       return false;
 
-   if (!yttrium_venus_create_display_buffer(screen->venus, &staging,
-                                            staging_size, &staging_mem_id)) {
-      YTTRIUM_WARN("yttrium: resource_copy_region image compatible copy failed to create staging buffer src_res_id=%u dst_res_id=%u size=0x%llx\n",
+   if (!yttrium_ensure_context_image_copy_staging(ctx, staging_size)) {
+      YTTRIUM_WARN("yttrium: resource_copy_region image compatible copy failed to get context staging buffer src_res_id=%u dst_res_id=%u size=0x%llx\n",
                    ysrc->venus_res_id, ydst->venus_res_id,
                    (unsigned long long)staging_size);
       return false;
    }
 
+   struct yttrium_venus_resource *staging = &yctx->image_copy_staging;
+   const uint32_t staging_res_id =
+      (uint32_t)yctx->image_copy_staging_mem_id;
+
    if (!yttrium_venus_copy_image_region_to_display_buffer(
-          screen->venus, &ysrc->venus, &staging,
-          ysrc->venus_res_id, (uint32_t)staging_mem_id,
+          screen->venus, &ysrc->venus, staging,
+          ysrc->venus_res_id, staging_res_id,
           src_level, src_layer, src_x, src_y, 0, 0, width, height,
           ysrc->base.format, staging_stride)) {
       YTTRIUM_WARN("yttrium: resource_copy_region image compatible copy failed image-to-buffer src_res_id=%u dst_res_id=%u\n",
                    ysrc->venus_res_id, ydst->venus_res_id);
-      goto out;
+      return false;
    }
 
    if (!yttrium_venus_copy_buffer_to_display_image(
-          screen->venus, &staging, &ydst->venus,
-          (uint32_t)staging_mem_id, ydst->venus_res_id,
+          screen->venus, staging, &ydst->venus,
+          staging_res_id, ydst->venus_res_id,
           0, staging_stride, 0, dst_level, dstx, dsty, dstz, width, height,
           1, ydst->base.format)) {
       YTTRIUM_WARN("yttrium: resource_copy_region image compatible copy failed buffer-to-image src_res_id=%u dst_res_id=%u\n",
                    ysrc->venus_res_id, ydst->venus_res_id);
-      goto out;
+      return false;
    }
 
-   ok = true;
-
-out:
-   yttrium_venus_resource_fini(screen->venus, NULL, &staging, NULL);
-   return ok;
+   return true;
 }
 
 static void
@@ -3972,6 +4267,9 @@ yttrium_trace_copy_target(struct pipe_context *ctx,
                           uint32_t width,
                           uint32_t height)
 {
+   if (!yttrium_trace_is_enabled())
+      return;
+
    yttrium_trace_resource_copy_target(
       copy_id, stage, path,
       ysrc ? ysrc->hAllocation : 0,
@@ -3994,6 +4292,80 @@ yttrium_trace_copy_target(struct pipe_context *ctx,
       0);
 }
 
+/* Publish initial CPU bytes before a partial GPU write.  In particular, the
+ * instance count adjacent to CopyStructureCount's four-byte destination must
+ * survive.  A buffer already written by the GPU must not be reinitialized from
+ * its detached CPU shadow. */
+static bool
+yttrium_prepare_gpu_copy_buffer(struct pipe_context *ctx,
+                                 struct yttrium_resource *res)
+{
+   struct yttrium_screen *screen = yttrium_screen(ctx->screen);
+   if (!res || res->base.target != PIPE_BUFFER || !res->size)
+      return false;
+
+   if (!res->venus.initialized) {
+      const VkBufferUsageFlags usage =
+         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+         VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
+         VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
+         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+      if (!yttrium_venus_create_bind_buffer(screen->venus, &res->venus,
+                                             res->size, usage, NULL))
+         return false;
+      res->venus.owner = &res->base;
+      res->venus_res_id = (uint32_t)res->venus.memory_obj.id;
+   }
+   if (!res->venus.buffer_backed || !res->venus.buffer ||
+       !(res->venus.buffer_usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT))
+      return false;
+
+   if (res->data_dirty) {
+      if (!res->data)
+         return false;
+      if (!yttrium_resource_uses_mapped_venus_buffer(res) &&
+          !yttrium_venus_update_buffer(screen->venus, &res->venus, 0,
+                                        res->base.width0, res->data))
+         return false;
+      res->data_dirty = false;
+      res->venus.contents_initialized = true;
+   }
+   return true;
+}
+
+static void
+yttrium_copy_uav_counter(struct pipe_context *ctx,
+                          struct yttrium_resource *dst, unsigned dst_level,
+                          unsigned dstx, unsigned dsty, unsigned dstz,
+                          struct yttrium_resource *src, unsigned src_level,
+                          const struct pipe_box *box)
+{
+   struct yttrium_screen *screen = yttrium_screen(ctx->screen);
+   if (!dst || !src || !box || dst->base.target != PIPE_BUFFER ||
+       src->base.target != PIPE_TEXTURE_2D ||
+       src->base.format != PIPE_FORMAT_R32_UINT ||
+       src->base.width0 != 1 || src->base.height0 != 1 ||
+       src->base.array_size != 1 || src->base.last_level != 0 ||
+       dst_level || src_level || dsty || dstz || (dstx & 3) ||
+       dstx > dst->base.width0 || 4 > dst->base.width0 - dstx ||
+       box->x || box->y || box->z || box->width != 1 ||
+       box->height != 1 || box->depth != 1 ||
+       !yttrium_prepare_gpu_copy_buffer(ctx, dst) ||
+       !yttrium_venus_copy_image_region_to_display_buffer(
+          screen->venus, &src->venus, &dst->venus,
+          src->venus_res_id, dst->venus_res_id,
+          0, 0, 0, 0, dstx / 4, 0, 1, 1, PIPE_FORMAT_R32_UINT, 4)) {
+      YTTRIUM_WARN("yttrium: counter copy failed owner=yttrium_resource reason=native-four-byte-image-copy-failed offset=%u action=fail-draw\n", dstx);
+      InterlockedExchange(&yttrium_context(ctx)->draw_failure, 1);
+      return;
+   }
+   dst->gpu_buffer_written = true;
+   dst->data_dirty = false;
+   dst->venus.contents_initialized = true;
+   dst->contents_serial++;
+}
+
 void
 yttrium_resource_copy_region(struct pipe_context *ctx,
                              struct pipe_resource *dst,
@@ -4008,6 +4380,15 @@ yttrium_resource_copy_region(struct pipe_context *ctx,
    struct yttrium_resource *ysrc = yttrium_resource(src);
    uint32_t copy_id = 0;
    uint32_t copy_path = 0;
+
+   /* This is an internal CopyStructureCount operation, not a texture-format
+    * reinterpretation or a CPU readback.  Buffer x is a byte offset. */
+   if (ysrc && (ysrc->base.flags & YTTRIUM_GDI_RESOURCE_FLAG_UAV_COUNTER) &&
+       dst && dst->target == PIPE_BUFFER) {
+      yttrium_copy_uav_counter(ctx, ydst, dst_level, dstx, dsty, dstz,
+                                 ysrc, src_level, src_box);
+      return;
+   }
 
    const bool buffer_copy =
       src && dst && src->target == PIPE_BUFFER && dst->target == PIPE_BUFFER;
@@ -4073,6 +4454,27 @@ yttrium_resource_copy_region(struct pipe_context *ctx,
    yttrium_trace_copy_target(ctx, copy_id, YTTRIUM_TRACE_RESOURCE_COPY_BEGIN,
                              0, ysrc, ydst, dstx, dsty, width, height);
 
+   /* Counter results copied onward to another GPU buffer remain GPU-owned.
+    * Explicit staging/readback destinations retain the normal CPU-map path. */
+   if (buffer_copy && ydst->base.usage != PIPE_USAGE_STAGING &&
+       (ysrc->gpu_buffer_written || ydst->gpu_buffer_written) &&
+       !(ysrc->base.flags & PIPE_RESOURCE_FLAG_SINGLE_THREAD_USE)) {
+      if (!yttrium_prepare_gpu_copy_buffer(ctx, ysrc) ||
+          !yttrium_prepare_gpu_copy_buffer(ctx, ydst) ||
+          !yttrium_venus_copy_buffer_to_buffer(screen->venus,
+                                                &ysrc->venus, &ydst->venus,
+                                                src_x, dstx, width)) {
+         YTTRIUM_WARN("yttrium: GPU buffer copy failed owner=yttrium_resource reason=counter-buffer-copy-failed action=fail-draw\n");
+         InterlockedExchange(&yttrium_context(ctx)->draw_failure, 1);
+         return;
+      }
+      ydst->gpu_buffer_written = true;
+      ydst->data_dirty = false;
+      ydst->venus.contents_initialized = true;
+      ydst->contents_serial++;
+      return;
+   }
+
    /*
     * u_threaded_context's private uploader remains mapped across allocations,
     * so its CPU bytes are authoritative before transfer-unmap.  Copy those
@@ -4084,6 +4486,21 @@ yttrium_resource_copy_region(struct pipe_context *ctx,
        ysrc->data && ydst->data &&
        src_x <= ysrc->size && width <= ysrc->size - src_x &&
        dstx <= ydst->size && width <= ydst->size - dstx) {
+      if (ydst->gpu_buffer_written) {
+         /* The uploader's host bytes are authoritative, but the destination
+          * may still be read by an earlier indirect draw.  Record a GPU upload
+          * rather than writing its mapped pages ahead of that draw. */
+         if (!yttrium_venus_update_buffer(
+                screen->venus, &ydst->venus, dstx, width,
+                (const uint8_t *)ysrc->data + src_x)) {
+            YTTRIUM_WARN("yttrium: ordered GPU buffer upload failed owner=yttrium_resource reason=counter-buffer-upload-failed action=fail-draw\n");
+            InterlockedExchange(&yttrium_context(ctx)->draw_failure, 1);
+            return;
+         }
+         ydst->data_dirty = false;
+         ydst->contents_serial++;
+         return;
+      }
       memmove((uint8_t *)ydst->data + dstx,
               (const uint8_t *)ysrc->data + src_x, width);
       yttrium_trace_resource_copy(YTTRIUM_TRACE_COPY_CPU_TO_CPU,
@@ -4100,6 +4517,91 @@ yttrium_resource_copy_region(struct pipe_context *ctx,
        yttrium_copy_venus_buffer_to_cpu(ctx, ysrc, ydst, src_x, dstx,
                                         width)) {
       copy_path = YTTRIUM_TRACE_COPY_BUFFER_TO_CPU;
+      goto copied;
+   }
+
+   /*
+    * D3D permits a depth resource to be copied into a format-compatible
+    * shader resource.  Sampler-only textures begin life with CPU storage so
+    * their initial contents can be uploaded when an image is created lazily.
+    * The copy itself must create that image when it is the first GPU use;
+    * waiting for a sampling draw routes the copy through CPU storage and
+    * turns every full-size depth copy into a synchronous GPU readback.
+    *
+    * A complete overwrite lets the destination image become authoritative.
+    * Drop only driver-owned heap storage here: merely clearing data_dirty
+    * would leave a stale, non-NULL shadow that transfer_map and later CPU
+    * copies would incorrectly treat as current.  A destination whose shadow
+    * has already been retired stays on this GPU path on subsequent copies.
+    */
+   const bool full_depth_to_sampled_image_copy =
+      ysrc != ydst &&
+      ysrc->base.target == PIPE_TEXTURE_2D &&
+      ydst->base.target == PIPE_TEXTURE_2D &&
+      ysrc->base.format == PIPE_FORMAT_Z32_FLOAT &&
+      ydst->base.format == PIPE_FORMAT_R32_FLOAT &&
+      src_level == 0 && dst_level == 0 &&
+      src_x == 0 && src_y == 0 && src_layer == 0 &&
+      dstx == 0 && dsty == 0 && dstz == 0 &&
+      width == ysrc->base.width0 && height == ysrc->base.height0 &&
+      width == ydst->base.width0 && height == ydst->base.height0 &&
+      ysrc->base.last_level == 0 && ydst->base.last_level == 0 &&
+      ysrc->base.array_size == 1 && ydst->base.array_size == 1 &&
+      ysrc->base.depth0 == 1 && ydst->base.depth0 == 1 &&
+      ysrc->base.nr_samples <= 1 && ydst->base.nr_samples <= 1 &&
+      ysrc->base.nr_storage_samples <= 1 &&
+      ydst->base.nr_storage_samples <= 1 &&
+      ysrc->venus.samples == VK_SAMPLE_COUNT_1_BIT &&
+      ysrc->venus.initialized && !ysrc->venus.buffer_backed &&
+      ysrc->venus.image && ysrc->venus.contents_initialized &&
+      !ysrc->classic_display && !ysrc->data_dirty &&
+      (!ydst->venus.initialized ||
+       (!ydst->venus.buffer_backed && ydst->venus.image &&
+        ydst->venus.samples == VK_SAMPLE_COUNT_1_BIT)) &&
+      !ydst->classic_display && !ydst->display_target &&
+      !ydst->primary_target &&
+      ydst->base.bind == PIPE_BIND_SAMPLER_VIEW &&
+      ydst->base.usage == PIPE_USAGE_DEFAULT &&
+      (!ydst->data ||
+       (ydst->data_capacity >= ydst->size && ydst->owns_data)) &&
+      !ydst->map && !ydst->hAllocation && !ydst->hResource &&
+      !ydst->hAllocationResource && !ydst->hResourceIsD3D9Runtime &&
+      !ydst->replacement_storage && !ydst->replacement_owner;
+
+   if (full_depth_to_sampled_image_copy) {
+      if (!ydst->venus.initialized) {
+         uint64_t allocation_size = 0;
+         if (!yttrium_venus_create_sampled_texture_image(
+                screen->venus, &ydst->venus, ydst->base.target,
+                width, height, 1, 1, 1, ydst->base.format,
+                &allocation_size)) {
+            YTTRIUM_WARN("yttrium: resource_copy_region failed owner=yttrium_resource_copy_region reason=depth-copy-destination-image-create-failed dst=%p extent=%ux%u\n",
+                         (void *)ydst, width, height);
+            goto unsupported;
+         }
+         ydst->venus_mem_id = ydst->venus.memory_obj.id;
+         ydst->venus_res_id = (uint32_t)ydst->venus.memory_obj.id;
+      }
+
+      if (!yttrium_copy_venus_image_via_buffer(ctx, ysrc, ydst, src_level,
+                                               src_x, src_y, src_layer,
+                                               dst_level, dstx, dsty, dstz,
+                                               width, height)) {
+         YTTRIUM_WARN("yttrium: resource_copy_region failed owner=yttrium_resource_copy_region reason=depth-to-sampled-gpu-copy-failed src_res_id=%u dst_res_id=%u extent=%ux%u\n",
+                      ysrc->venus_res_id, ydst->venus_res_id, width, height);
+         goto unsupported;
+      }
+
+      if (ydst->data)
+         YTTRIUM_LOG("yttrium: resource_copy_region retired CPU shadow after full GPU depth-to-sampled copy dst=%p res_id=%u data=%p capacity=0x%llx extent=%ux%u\n",
+                     (void *)ydst, ydst->venus_res_id, ydst->data,
+                     (unsigned long long)ydst->data_capacity, width, height);
+      FREE(ydst->data);
+      ydst->data = NULL;
+      ydst->data_capacity = 0;
+      ydst->owns_data = false;
+      ydst->data_dirty = false;
+      copy_path = YTTRIUM_TRACE_COPY_DISPLAY_IMAGE_TO_DISPLAY_IMAGE;
       goto copied;
    }
 
@@ -4264,6 +4766,7 @@ yttrium_resource_copy_region(struct pipe_context *ctx,
       goto copied;
    }
 
+unsupported:
    yttrium_trace_copy_target(ctx, copy_id,
                              YTTRIUM_TRACE_RESOURCE_COPY_UNSUPPORTED_STAGE,
                              0, ysrc, ydst, dstx, dsty, width, height);
@@ -4305,6 +4808,21 @@ yttrium_resource_copy_region(struct pipe_context *ctx,
    return;
 
 copied:
+   if (buffer_copy && ydst->gpu_buffer_written && ydst->data &&
+       (copy_path == YTTRIUM_TRACE_COPY_CPU_TO_CPU ||
+        copy_path == YTTRIUM_TRACE_COPY_BUFFER_TO_CPU)) {
+      /* Ordered uploader writes carry only this byte range.  Do not publish
+       * untouched shadow bytes over an adjacent GPU-written counter. */
+      if (!yttrium_resource_uses_mapped_venus_buffer(ydst) &&
+          !yttrium_venus_update_buffer(screen->venus, &ydst->venus, dstx,
+                                        width, (uint8_t *)ydst->data + dstx)) {
+         YTTRIUM_WARN("yttrium: buffer range publication failed owner=yttrium_resource reason=counter-buffer-range-upload-failed action=fail-draw\n");
+         InterlockedExchange(&yttrium_context(ctx)->draw_failure, 1);
+      }
+      ydst->data_dirty = false;
+      ydst->contents_serial++;
+      return;
+   }
    if (ydst && ydst->data &&
        (copy_path == YTTRIUM_TRACE_COPY_CPU_TO_CPU ||
         copy_path == YTTRIUM_TRACE_COPY_DISPLAY_IMAGE_TO_CPU ||

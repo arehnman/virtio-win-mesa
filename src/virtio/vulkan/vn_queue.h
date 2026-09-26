@@ -34,8 +34,9 @@ struct vn_queue {
    VkSemaphore sparse_semaphore;
    uint64_t sparse_semaphore_counter;
 
-   /* for vn_queue_submission storage */
+   /* Serializes app and internal WSI submissions using cached storage. */
    struct vn_cached_storage storage;
+   simple_mtx_t submission_mutex;
 
    /* for async queue present */
    struct {

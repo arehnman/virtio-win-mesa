@@ -99,7 +99,7 @@ static void
 tc_batch_check(UNUSED struct tc_batch *batch)
 {
    tc_assert(batch->sentinel == TC_SENTINEL);
-   tc_assert(batch->num_total_slots <= TC_SLOTS_PER_BATCH);
+   tc_assert(batch->num_total_slots < batch->tc->batch_capacity_slots);
 }
 
 static void
@@ -523,7 +523,7 @@ tc_add_call_end(struct tc_batch *next)
     * of the batch. It's for calls that always look at the next call and this
     * stops them looking farther ahead.
     */
-   assert(next->num_total_slots < TC_SLOTS_PER_BATCH);
+   assert(next->num_total_slots < next->tc->batch_capacity_slots);
    struct tc_call_base *call =
       (struct tc_call_base*)&next->slots[next->num_total_slots];
    call->call_id = TC_END_BATCH;
@@ -597,12 +597,13 @@ tc_add_sized_call(struct threaded_context *tc, enum tc_call_id id,
 {
    TC_TRACE_SCOPE(id);
    struct tc_batch *next = &tc->batch_slots[tc->next];
-   assert(num_slots <= TC_SLOTS_PER_BATCH - 1);
+   assert(num_slots <= tc->batch_capacity_slots - 1);
+   assert(resv_slots <= tc->batch_capacity_slots - 1 - num_slots);
    tc_debug_check(tc);
 
    unsigned batch_size_slots = tc->batch_size_slots;
    if (num_slots + resv_slots > batch_size_slots - 1)
-      batch_size_slots = TC_SLOTS_PER_BATCH;
+      batch_size_slots = tc->batch_capacity_slots;
 
    if (unlikely(next->num_total_slots + num_slots + resv_slots >
                 batch_size_slots - 1)) {
@@ -3901,7 +3902,8 @@ tc_call_draw_single(struct pipe_context *pipe, void *call)
    /* If at least 2 consecutive draw calls can be merged... */
    if (next->base.call_id == TC_CALL_draw_single) {
       if (is_next_call_a_mergeable_draw(first, next)) {
-         /* The maximum number of merged draws is given by the batch size. */
+         /* Keep scratch at the default size; a larger batch continues at
+          * the first unconsumed packet after this bounded merge. */
          struct pipe_draw_start_count_bias multi[TC_SLOTS_PER_BATCH / call_size(tc_draw_single)];
          unsigned num_draws = 2;
          bool index_bias_varies = first->index_bias != next->index_bias;
@@ -3916,7 +3918,8 @@ tc_call_draw_single(struct pipe_context *pipe, void *call)
 
          /* Find how many other draws can be merged. */
          next = get_next_call(next, tc_draw_single);
-         for (; is_next_call_a_mergeable_draw(first, next);
+         for (; num_draws < ARRAY_SIZE(multi) &&
+                is_next_call_a_mergeable_draw(first, next);
               next = get_next_call(next, tc_draw_single), num_draws++) {
             /* u_threaded_context stores start/count in min/max_index for single draws. */
             multi[num_draws].start = next->info.min_index;
@@ -4420,7 +4423,8 @@ tc_call_draw_vstate_single(struct pipe_context *pipe, void *call)
 
    /* If at least 2 consecutive draw calls can be merged... */
    if (is_next_call_a_mergeable_draw_vstate(first, next)) {
-      /* The maximum number of merged draws is given by the batch size. */
+      /* Bound scratch independently of payload capacity. Remaining packets
+       * retain their vertex-state references for the next execution call. */
       struct pipe_draw_start_count_bias draws[TC_SLOTS_PER_BATCH /
                                               call_size(tc_draw_vstate_single)];
       unsigned num_draws = 2;
@@ -4430,7 +4434,8 @@ tc_call_draw_vstate_single(struct pipe_context *pipe, void *call)
 
       /* Find how many other draws can be merged. */
       next = get_next_call(next, tc_draw_vstate_single);
-      for (; is_next_call_a_mergeable_draw_vstate(first, next);
+      for (; num_draws < ARRAY_SIZE(draws) &&
+             is_next_call_a_mergeable_draw_vstate(first, next);
            next = get_next_call(next, tc_draw_vstate_single),
            num_draws++)
          draws[num_draws] = next->draw;
@@ -5625,10 +5630,48 @@ threaded_context_create(struct pipe_context *pipe,
    if (!debug_get_bool_option("GALLIUM_THREAD", true))
       return pipe;
 
-   tc = CALLOC_STRUCT(threaded_context);
-   if (!tc) {
+   const unsigned capacity = options && options->batch_capacity_slots ?
+      options->batch_capacity_slots : TC_SLOTS_PER_BATCH;
+   STATIC_ASSERT(TC_MAX_SLOTS_PER_BATCH <= UINT16_MAX);
+   if (capacity != TC_SLOTS_PER_BATCH && capacity != 3072 &&
+       capacity != TC_MAX_SLOTS_PER_BATCH) {
+      mesa_loge("threaded_context: WARNING: invalid payload capacity owner=gallium/threaded-context component=batch-payload reason=unsupported-capacity action=context-creation-failed slots=%u", capacity);
       pipe->destroy(pipe);
       return NULL;
+   }
+
+   /* One allocation owns the context and all 64 stable, uint64-aligned
+    * payloads. Check both alignment rounding and the tail-size arithmetic.
+    */
+   const size_t alignment = alignof(uint64_t);
+   if (sizeof(*tc) > SIZE_MAX - (alignment - 1)) {
+      mesa_loge("threaded_context: WARNING: payload allocation overflow owner=gallium/threaded-context component=batch-payload reason=alignment-overflow action=context-creation-failed");
+      pipe->destroy(pipe);
+      return NULL;
+   }
+   const size_t payload_offset = ALIGN_POT(sizeof(*tc), alignment);
+   if (capacity > (SIZE_MAX - payload_offset) /
+                  TC_MAX_BATCHES / sizeof(uint64_t)) {
+      mesa_loge("threaded_context: WARNING: payload allocation overflow owner=gallium/threaded-context component=batch-payload reason=size-overflow action=context-creation-failed slots=%u", capacity);
+      pipe->destroy(pipe);
+      return NULL;
+   }
+   const size_t allocation_size = payload_offset +
+      (size_t)TC_MAX_BATCHES * capacity * sizeof(uint64_t);
+   tc = CALLOC(1, allocation_size);
+   if (!tc) {
+      mesa_loge("threaded_context: WARNING: payload allocation failed owner=gallium/threaded-context component=batch-payload reason=allocation-failed action=context-creation-failed slots=%u", capacity);
+      pipe->destroy(pipe);
+      return NULL;
+   }
+   tc->batch_capacity_slots = capacity;
+   uint64_t *payload = (uint64_t *)((char *)tc + payload_offset);
+   for (unsigned i = 0; i < TC_MAX_BATCHES; i++) {
+#if !defined(NDEBUG) && TC_DEBUG >= 1
+      tc->batch_slots[i].sentinel = TC_SENTINEL;
+#endif
+      tc->batch_slots[i].tc = tc;
+      tc->batch_slots[i].slots = payload + (size_t)i * capacity;
    }
 
    /* drivers must set this */
@@ -5658,6 +5701,14 @@ threaded_context_create(struct pipe_context *pipe,
    tc->base.destroy = tc_destroy;
    tc->base.callback = tc_callback;
 
+   tc->use_forced_staging_uploads = true;
+   tc->num_batch_slots = tc->options.batch_slots ?
+      CLAMP(tc->options.batch_slots, 3, TC_MAX_BATCHES) :
+      TC_DEFAULT_BATCHES;
+   tc->batch_size_slots = tc->options.batch_size_slots ?
+      CLAMP(tc->options.batch_size_slots, 64, tc->batch_capacity_slots) :
+      tc->batch_capacity_slots;
+
    tc->base.stream_uploader = u_upload_clone(&tc->base, pipe->stream_uploader);
    if (pipe->stream_uploader == pipe->const_uploader)
       tc->base.const_uploader = tc->base.stream_uploader;
@@ -5666,14 +5717,6 @@ threaded_context_create(struct pipe_context *pipe,
 
    if (!tc->base.stream_uploader || !tc->base.const_uploader)
       goto fail;
-
-   tc->use_forced_staging_uploads = true;
-   tc->num_batch_slots = tc->options.batch_slots ?
-      CLAMP(tc->options.batch_slots, 3, TC_MAX_BATCHES) :
-      TC_DEFAULT_BATCHES;
-   tc->batch_size_slots = tc->options.batch_size_slots ?
-      CLAMP(tc->options.batch_size_slots, 64, TC_SLOTS_PER_BATCH) :
-      TC_SLOTS_PER_BATCH;
 
    /* The queue size is the number of batches "waiting". Batches are removed
     * from the queue before being executed, so keep one tc_batch slot for that
@@ -5685,10 +5728,6 @@ threaded_context_create(struct pipe_context *pipe,
 
    tc->last_completed = -1;
    for (unsigned i = 0; i < TC_MAX_BATCHES; i++) {
-#if !defined(NDEBUG) && TC_DEBUG >= 1
-      tc->batch_slots[i].sentinel = TC_SENTINEL;
-#endif
-      tc->batch_slots[i].tc = tc;
       util_queue_fence_init(&tc->batch_slots[i].fence);
       tc->batch_slots[i].renderpass_info_idx = -1;
       if (tc->options.parse_renderpass_info) {
@@ -5866,7 +5905,17 @@ threaded_context_create(struct pipe_context *pipe,
    return &tc->base;
 
 fail:
-   tc_destroy(&tc->base);
+   /* Both callers precede successful queue/fence/slab initialization.
+    * Fresh uploader clones have no buffer or transfer and cannot record
+    * callbacks when destroyed here. util_queue_init unwinds its own failure.
+    */
+   if (tc->base.const_uploader &&
+       tc->base.const_uploader != tc->base.stream_uploader)
+      u_upload_destroy(tc->base.const_uploader);
+   if (tc->base.stream_uploader)
+      u_upload_destroy(tc->base.stream_uploader);
+   pipe->destroy(pipe);
+   FREE(tc);
    return NULL;
 }
 

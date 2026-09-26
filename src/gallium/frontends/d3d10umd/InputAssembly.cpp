@@ -351,7 +351,9 @@ CreateElementLayout(
          break;
       case D3D10_DDI_INPUT_PER_INSTANCE_DATA:
          if (!pVertexElement->InstanceDataStepRate) {
-            LOG_UNSUPPORTED(!pVertexElement->InstanceDataStepRate);
+            /* UINT_MAX is Yttrium's internal representation of the D3D
+             * zero-step divisor (the instance element never advances).
+             */
             ve->instance_divisor = ~0;
          } else {
             ve->instance_divisor = pVertexElement->InstanceDataStepRate;

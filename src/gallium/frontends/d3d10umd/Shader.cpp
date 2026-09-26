@@ -75,9 +75,6 @@ enum ComputeEmulation {
    COMPUTE_EMULATION_WINE_TGSM_RAW,
    COMPUTE_EMULATION_WINE_TGSM_STRUCTURED_RAW,
    COMPUTE_EMULATION_WINE_TGSM_STRUCTURED_TYPED,
-   COMPUTE_EMULATION_WINE_UAV_COUNTER_PRODUCE,
-   COMPUTE_EMULATION_WINE_UAV_COUNTER_CONSUME,
-   COMPUTE_EMULATION_WINE_APPEND_DISPATCH_ARGS,
    COMPUTE_EMULATION_WINE_DISPATCH_STATS,
 };
 
@@ -103,12 +100,6 @@ ComputeEmulationName(unsigned emulation)
       return "wine-tgsm-structured-raw";
    case COMPUTE_EMULATION_WINE_TGSM_STRUCTURED_TYPED:
       return "wine-tgsm-structured-typed";
-   case COMPUTE_EMULATION_WINE_UAV_COUNTER_PRODUCE:
-      return "wine-uav-counter-produce";
-   case COMPUTE_EMULATION_WINE_UAV_COUNTER_CONSUME:
-      return "wine-uav-counter-consume";
-   case COMPUTE_EMULATION_WINE_APPEND_DISPATCH_ARGS:
-      return "wine-append-dispatch-args";
    case COMPUTE_EMULATION_WINE_DISPATCH_STATS:
       return "wine-dispatch-stats";
    default:
@@ -161,8 +152,123 @@ InitShaderObject(Shader *shader, mesa_shader_stage stage)
 {
    memset(shader, 0, sizeof(*shader));
    shader->type = stage;
-   shader->output_resolved = true;
    InitShaderOutputMapping(shader);
+}
+
+void
+BindShaderImages(Device *device, mesa_shader_stage stage,
+                  unsigned start_slot, unsigned num_views)
+{
+   Shader *shader = NULL;
+   switch (stage) {
+   case MESA_SHADER_VERTEX: shader = device->bound_vs; break;
+   case MESA_SHADER_TESS_CTRL: shader = device->bound_hs; break;
+   case MESA_SHADER_TESS_EVAL: shader = device->bound_ds; break;
+   case MESA_SHADER_GEOMETRY: shader = device->bound_gs; break;
+   case MESA_SHADER_FRAGMENT: shader = device->bound_ps; break;
+   case MESA_SHADER_COMPUTE: shader = device->bound_cs; break;
+   default: return;
+   }
+
+   uint64_t mask = 0;
+   if (shader) {
+      for (unsigned slot = 0; slot < PIPE_MAX_SHADER_IMAGES; ++slot)
+         if (shader->counter_image_slots[slot])
+            mask |= UINT64_C(1) << (shader->counter_image_slots[slot] - 1);
+   }
+   struct pipe_context *pipe = device->pipe;
+   if (!mask && !device->counter_image_bound_mask[stage]) {
+      if (num_views)
+         pipe->set_shader_images(pipe, stage, start_slot, num_views, 0,
+                                  &device->shader_images[stage][start_slot]);
+      return;
+   }
+
+   /* Keep the D3D bindings canonical. Hidden slots are shader-dependent and
+    * must be restored when another shader uses that slot as an ordinary UAV.
+    * Gallium/threaded-context retain the submitted image resources, including
+    * counter views destroyed while a command is still queued.
+    */
+   struct pipe_image_view images[PIPE_MAX_SHADER_IMAGES];
+   memcpy(images, device->shader_images[stage], sizeof(images));
+   if (shader) {
+      for (unsigned slot = 0; slot < PIPE_MAX_SHADER_IMAGES; ++slot) {
+         if (!shader->counter_image_slots[slot])
+            continue;
+         struct pipe_image_view *image =
+            &images[shader->counter_image_slots[slot] - 1];
+         memset(image, 0, sizeof(*image));
+         UnorderedAccessView *uav = device->unordered_access_views[stage][slot];
+         if (uav && uav->counter_resource) {
+            image->resource = uav->counter_resource;
+            image->format = PIPE_FORMAT_R32_UINT;
+            image->access = PIPE_IMAGE_ACCESS_READ_WRITE;
+            image->shader_access = PIPE_IMAGE_ACCESS_READ_WRITE;
+            image->u.tex.single_layer_view = true;
+         }
+      }
+   }
+   pipe->set_shader_images(pipe, stage, 0, PIPE_MAX_SHADER_IMAGES, 0, images);
+   device->counter_image_bound_mask[stage] = mask;
+}
+
+void
+ResetUAVCounter(Device *device, UnorderedAccessView *view, UINT value)
+{
+   if (!view || !view->counter_resource)
+      return;
+   struct pipe_surface surface = {};
+   surface.texture = view->counter_resource;
+   surface.format = PIPE_FORMAT_R32_UINT;
+   union pipe_color_union color = {};
+   color.ui[0] = value;
+   /* Ordered GPU clear: never map the counter or evaluate atomics on the CPU. */
+   device->pipe->clear_render_target(device->pipe, &surface, &color,
+                                     0, 0, 1, 1, false);
+}
+
+static struct pipe_shader_sampler_binding_map *
+PrepareSamplerBindingMap(Device *device, Shader *shader)
+{
+   memset(&shader->sampler_binding_map, 0,
+          sizeof(shader->sampler_binding_map));
+   shader->state.sampler_binding_map = NULL;
+
+   if (!device || !device->yttrium_sampler_binding_map_enabled)
+      return NULL;
+
+   shader->state.sampler_binding_map = &shader->sampler_binding_map;
+   return &shader->sampler_binding_map;
+}
+
+static bool
+CaptureTokenlessStreamOutputSignature(
+   Shader *shader,
+   const D3D10DDIARG_STAGE_IO_SIGNATURES *signatures)
+{
+   if (!signatures ||
+       (signatures->NumInputSignatureEntries &&
+        !signatures->pInputSignature)) {
+      YTTRIUM_WARN("yttrium: d3d10umd tokenless geometry stream-output "
+                   "creation rejected reason=input_source_signature_unavailable\n");
+      return false;
+   }
+
+   for (unsigned i = 0; i < signatures->NumInputSignatureEntries; ++i) {
+      const D3D10DDIARG_SIGNATURE_ENTRY *entry =
+         &signatures->pInputSignature[i];
+      if (entry->Register >= PIPE_MAX_SHADER_OUTPUTS || !entry->Mask ||
+          (entry->Mask & ~TGSI_WRITEMASK_XYZW)) {
+         YTTRIUM_WARN("yttrium: d3d10umd tokenless geometry stream-output "
+                      "creation rejected reason=invalid_input_source_signature "
+                      "entry=%u register=%u mask=0x%x\n",
+                      i, entry->Register, entry->Mask);
+         return false;
+      }
+      shader->stream_output_signature_masks[entry->Register] |= entry->Mask;
+   }
+
+   return true;
 }
 
 static unsigned
@@ -172,13 +278,10 @@ GetComputeEmulation(const UINT *code, unsigned store_imm[4])
    struct Shader_opcode opcode;
    bool saw_typed_store = false;
    bool saw_any_thread_id = false;
+   bool saw_uav_counter = false;
    bool saw_bufinfo_needs_emulation = false;
    bool saw_atomic_iadd = false;
    bool saw_atomic_umax = false;
-   bool saw_imm_atomic_alloc = false;
-   bool saw_imm_atomic_consume = false;
-   bool saw_ld_structured = false;
-   bool saw_store_structured = false;
    unsigned structured_uav_count = 0;
    bool bufinfo_resource_needs_emulation[PIPE_MAX_SHADER_SAMPLER_VIEWS] = {};
    bool bufinfo_uav_needs_emulation[PIPE_MAX_SHADER_IMAGES] = {};
@@ -217,46 +320,10 @@ GetComputeEmulation(const UINT *code, unsigned store_imm[4])
              opcode.dst[0].base.index[0].imm < PIPE_MAX_SHADER_SAMPLER_VIEWS)
             bufinfo_resource_needs_emulation[opcode.dst[0].base.index[0].imm] = true;
          break;
-      case DX10_SM5_OPCODE_LD_STRUCTURED:
-         saw_ld_structured = true;
-         break;
-      case DX10_SM5_OPCODE_STORE_STRUCTURED:
-         saw_store_structured = true;
-         break;
       case DX10_SM5_OPCODE_IMM_ATOMIC_ALLOC:
-         saw_imm_atomic_alloc = true;
-         break;
       case DX10_SM5_OPCODE_IMM_ATOMIC_CONSUME:
-         saw_imm_atomic_consume = true;
+         saw_uav_counter = true;
          break;
-      case DX10_SM5_OPCODE_BUFINFO: {
-         const struct Shader_operand *operand = &opcode.src[0].base;
-
-         if (operand->index_dim != 1 ||
-             operand->index[0].index_rep !=
-                D3D10_SB_OPERAND_INDEX_IMMEDIATE32) {
-            saw_bufinfo_needs_emulation = true;
-            break;
-         }
-
-         if (operand->type == D3D10_SB_OPERAND_TYPE_RESOURCE) {
-            const unsigned index = operand->index[0].imm;
-
-            if (index >= PIPE_MAX_SHADER_SAMPLER_VIEWS ||
-                bufinfo_resource_needs_emulation[index])
-               saw_bufinfo_needs_emulation = true;
-         } else if (operand->type ==
-                    D3D11_SB_OPERAND_TYPE_UNORDERED_ACCESS_VIEW) {
-            const unsigned index = operand->index[0].imm;
-
-            if (index >= PIPE_MAX_SHADER_IMAGES ||
-                bufinfo_uav_needs_emulation[index])
-               saw_bufinfo_needs_emulation = true;
-         } else {
-            saw_bufinfo_needs_emulation = true;
-         }
-         break;
-      }
       case DX10_SM5_OPCODE_ATOMIC_IADD:
          saw_atomic_iadd = true;
          break;
@@ -291,32 +358,19 @@ GetComputeEmulation(const UINT *code, unsigned store_imm[4])
       Shader_opcode_free(&opcode);
    }
 
+   if (parser.failed)
+      return COMPUTE_EMULATION_NONE;
+
+   /* Counter instructions always use the view's GPU-owned counter.  Do not
+    * let an unrelated legacy pattern recognizer intercept a mixed shader. */
+   if (saw_uav_counter)
+      return COMPUTE_EMULATION_NONE;
+
    if (parser.header.type == D3D10_SB_PIXEL_SHADER &&
        saw_bufinfo_needs_emulation)
       return COMPUTE_EMULATION_NONE;
 
    if (!saw_typed_store) {
-      /*
-       * Keep Wine's UAV counter tests on the CPU emulation path until the
-       * native host-side failure is understood.  A previous native attempt
-       * used hidden counter image buffers plus image ATOMUADD for
-       * IMM_ATOMIC_ALLOC/CONSUME; the Wine counter repro passed in the guest
-       * but wedged the host amdgpu gfx ring hard enough to require a host
-       * reset.  Reproduce and diagnose that on the host/renderer stack before
-       * reimplementing these cases as native GPU counter operations.
-       */
-      if (parser.header.type == DX10_SM5_COMPUTE_SHADER &&
-          structured_uav_count == 2 && saw_imm_atomic_consume &&
-          saw_ld_structured && saw_store_structured)
-         return COMPUTE_EMULATION_WINE_UAV_COUNTER_CONSUME;
-
-      if (parser.header.type == DX10_SM5_COMPUTE_SHADER &&
-          structured_uav_count == 1 && saw_imm_atomic_alloc &&
-          saw_store_structured) {
-         if (saw_any_thread_id)
-            return COMPUTE_EMULATION_WINE_UAV_COUNTER_PRODUCE;
-         return COMPUTE_EMULATION_WINE_APPEND_DISPATCH_ARGS;
-      }
 
       if (parser.header.type == DX10_SM5_COMPUTE_SHADER &&
           structured_uav_count == 1 && saw_any_thread_id &&
@@ -861,16 +915,6 @@ WriteComputeUAVImmediateStore(Device *pDevice, Shader *cs)
 }
 
 static bool
-RunWineUAVCounterConsumeCompute(Device *pDevice, Shader *cs,
-                                UINT ThreadGroupCountX);
-static bool
-RunWineUAVCounterProduceCompute(Device *pDevice, Shader *cs,
-                                UINT ThreadGroupCountX,
-                                UINT ThreadGroupCountY,
-                                UINT ThreadGroupCountZ);
-static bool
-RunWineAppendDispatchArgsCompute(Device *pDevice);
-static bool
 RunWineDispatchStatsCompute(Device *pDevice, Shader *cs,
                             UINT ThreadGroupCountX,
                             UINT ThreadGroupCountY,
@@ -909,16 +953,6 @@ RunComputeEmulation(Device *pDevice,
    if (cs->compute_emulation == COMPUTE_EMULATION_WINE_TGSM_STRUCTURED_TYPED)
       return RunWineTGSMStructuredTypedCompute(pDevice, ThreadGroupCountX);
 
-   if (cs->compute_emulation == COMPUTE_EMULATION_WINE_UAV_COUNTER_PRODUCE)
-      return RunWineUAVCounterProduceCompute(pDevice, cs, ThreadGroupCountX,
-                                             ThreadGroupCountY,
-                                             ThreadGroupCountZ);
-
-   if (cs->compute_emulation == COMPUTE_EMULATION_WINE_UAV_COUNTER_CONSUME)
-      return RunWineUAVCounterConsumeCompute(pDevice, cs, ThreadGroupCountX);
-
-   if (cs->compute_emulation == COMPUTE_EMULATION_WINE_APPEND_DISPATCH_ARGS)
-      return RunWineAppendDispatchArgsCompute(pDevice);
 
    if (cs->compute_emulation == COMPUTE_EMULATION_WINE_DISPATCH_STATS)
       return RunWineDispatchStatsCompute(pDevice, cs, ThreadGroupCountX,
@@ -1741,11 +1775,13 @@ CreateSampler(D3D10DDI_HDEVICE hDevice,                        // IN
 {
    LOG_ENTRYPOINT();
 
-   struct pipe_context *pipe = CastPipeContext(hDevice);
+   Device *pDevice = CastDevice(hDevice);
+   struct pipe_context *pipe = pDevice->pipe;
    SamplerState *pSamplerState = CastSamplerState(hSampler);
 
    struct pipe_sampler_state state;
 
+   pSamplerState->handle = NULL;
    memset(&state, 0, sizeof state);
 
    /* d3d10 has seamless cube filtering always enabled */
@@ -1787,6 +1823,11 @@ CreateSampler(D3D10DDI_HDEVICE hDevice,                        // IN
    state.border_color.f[3] = pSamplerDesc->BorderColor[3];
 
    pSamplerState->handle = pipe->create_sampler_state(pipe, &state);
+   if (!pSamplerState->handle) {
+      YTTRIUM_WARN("yttrium: object creation failed owner=d3d10umd "
+                   "object=sampler reason=native-state-unavailable\n");
+      SetError(hDevice, E_OUTOFMEMORY);
+   }
 }
 
 
@@ -1834,19 +1875,37 @@ CreateVertexShader(D3D10DDI_HDEVICE hDevice,                                  //
 {
    LOG_ENTRYPOINT();
 
-   struct pipe_context *pipe = CastPipeContext(hDevice);
+   Device *pDevice = CastDevice(hDevice);
+   struct pipe_context *pipe = pDevice->pipe;
    Shader *pShader = CastShader(hShader);
 
    InitShaderObject(pShader, MESA_SHADER_VERTEX);
+   struct pipe_shader_sampler_binding_map *sampler_binding_map =
+      PrepareSamplerBindingMap(pDevice, pShader);
    pShader->compute_emulation =
       GetComputeEmulation(pCode, pShader->compute_store_imm);
 
    pShader->state.tokens =
       Shader_tgsi_translate(pCode, pShader->output_mapping, NULL, NULL,
-                            NULL, NULL);
+                            NULL, NULL, pSignatures, sampler_binding_map,
+                            pShader->counter_image_slots);
+   if (!pShader->state.tokens) {
+      YTTRIUM_WARN("yttrium: shader creation failed owner=d3d10umd stage=vs "
+                   "reason=tgsi_translation_failed shader=%p\n",
+                   (void *)pShader);
+      SetError(hDevice, E_FAIL);
+      return;
+   }
 
    pShader->handle = pipe->create_vs_state(pipe, &pShader->state);
-
+   if (!pShader->handle) {
+      YTTRIUM_WARN("yttrium: shader creation failed owner=d3d10umd stage=vs "
+                   "reason=native_state_unavailable shader=%p\n",
+                   (void *)pShader);
+      ureg_free_tokens(pShader->state.tokens);
+      pShader->state.tokens = NULL;
+      SetError(hDevice, E_FAIL);
+   }
 }
 
 
@@ -1877,7 +1936,18 @@ VsSetShader(D3D10DDI_HDEVICE hDevice,  // IN
       state = pDevice->empty_vs;
    }
 
+   /* A bound tokenless stream-output GS is materialized by the backend as a
+    * variant of the active VS.  Drop that materialization before changing
+    * the VS: otherwise bind_vs_state can eagerly rebuild the old stream-
+    * output layout against the new VS, before ResolveState has remapped the
+    * declaration for it.  ResolveState will bind the correctly remapped
+    * placeholder before the next draw.
+    */
+   if (pDevice->bound_empty_gs)
+      pipe->bind_gs_state(pipe, NULL);
+
    pipe->bind_vs_state(pipe, state);
+   BindShaderImages(pDevice, MESA_SHADER_VERTEX);
    UpdateBufferInfoConstants(pDevice, MESA_SHADER_VERTEX);
 }
 
@@ -1973,15 +2043,34 @@ CreateGeometryShader(D3D10DDI_HDEVICE hDevice,                                //
 {
    LOG_ENTRYPOINT();
 
-   struct pipe_context *pipe = CastPipeContext(hDevice);
+   Device *pDevice = CastDevice(hDevice);
+   struct pipe_context *pipe = pDevice->pipe;
    Shader *pShader = CastShader(hShader);
 
    InitShaderObject(pShader, MESA_SHADER_GEOMETRY);
+   struct pipe_shader_sampler_binding_map *sampler_binding_map =
+      PrepareSamplerBindingMap(pDevice, pShader);
    pShader->state.tokens =
       Shader_tgsi_translate(pShaderCode, pShader->output_mapping, NULL, NULL,
-                            NULL, NULL);
+                            NULL, NULL, pSignatures, sampler_binding_map,
+                            pShader->counter_image_slots);
+   if (!pShader->state.tokens) {
+      YTTRIUM_WARN("yttrium: shader creation failed owner=d3d10umd stage=gs "
+                   "reason=tgsi_translation_failed shader=%p\n",
+                   (void *)pShader);
+      SetError(hDevice, E_FAIL);
+      return;
+   }
 
    pShader->handle = pipe->create_gs_state(pipe, &pShader->state);
+   if (!pShader->handle) {
+      YTTRIUM_WARN("yttrium: shader creation failed owner=d3d10umd stage=gs "
+                   "reason=native_state_unavailable shader=%p\n",
+                   (void *)pShader);
+      ureg_free_tokens(pShader->state.tokens);
+      pShader->state.tokens = NULL;
+      SetError(hDevice, E_FAIL);
+   }
 }
 
 SIZE_T APIENTRY
@@ -2006,7 +2095,12 @@ CreateGeometryShaderWithStreamOutput11(
 
    InitShaderObject(CastShader(hShader), MESA_SHADER_GEOMETRY);
 
-   if (pData->NumEntries > ARRAY_SIZE(output_decl)) {
+   if (pData->NumEntries > ARRAY_SIZE(output_decl) ||
+       (pData->NumEntries && !pData->pOutputStreamDecl)) {
+      YTTRIUM_WARN("yttrium: d3d10umd geometry stream-output creation "
+                   "rejected reason=invalid-d3d11-declaration entries=%u "
+                   "declaration=%p\n",
+                   pData->NumEntries, (void *)pData->pOutputStreamDecl);
       SetError(hDevice, E_INVALIDARG);
       return;
    }
@@ -2062,6 +2156,7 @@ GsSetShader(D3D10DDI_HDEVICE hDevice,  // IN
       pDevice->bound_empty_gs = NULL;
       pipe->bind_gs_state(pipe, state);
    }
+   BindShaderImages(pDevice, MESA_SHADER_GEOMETRY);
    UpdateBufferInfoConstants(pDevice, MESA_SHADER_GEOMETRY);
    ApplyRasterizerState(pDevice);
 }
@@ -2182,28 +2277,55 @@ CreateGeometryShaderWithStreamOutput(
 {
    LOG_ENTRYPOINT();
 
-   struct pipe_context *pipe = CastPipeContext(hDevice);
+   Device *pDevice = CastDevice(hDevice);
+   struct pipe_context *pipe = pDevice->pipe;
    Shader *pShader = CastShader(hShader);
    int total_components[PIPE_MAX_SO_BUFFERS] = {0};
    unsigned num_holes = 0;
    bool all_slot_zero = true;
 
    InitShaderObject(pShader, MESA_SHADER_GEOMETRY);
+   struct pipe_shader_sampler_binding_map *sampler_binding_map =
+      PrepareSamplerBindingMap(pDevice, pShader);
+   if (pData->NumEntries > PIPE_MAX_SO_OUTPUTS ||
+       (pData->NumEntries && !pData->pOutputStreamDecl)) {
+      YTTRIUM_WARN("yttrium: d3d10umd geometry stream-output creation "
+                   "rejected reason=invalid_declaration entries=%u\n",
+                   pData->NumEntries);
+      SetError(hDevice, E_INVALIDARG);
+      return;
+   }
+   if (!pData->pShaderCode &&
+       !CaptureTokenlessStreamOutputSignature(pShader, pSignatures)) {
+      SetError(hDevice, E_FAIL);
+      return;
+   }
    if (pData->pShaderCode) {
       pShader->state.tokens =
          Shader_tgsi_translate(pData->pShaderCode, pShader->output_mapping,
-                               NULL, NULL, NULL, NULL);
+                               NULL, NULL, NULL, NULL, pSignatures,
+                               sampler_binding_map, pShader->counter_image_slots);
       if (!pShader->state.tokens) {
          YTTRIUM_WARN("yttrium: d3d10umd geometry stream-output shader translation failed; creation rejected\n");
          SetError(hDevice, E_FAIL);
          return;
       }
    }
-   pShader->output_resolved = (pShader->state.tokens != NULL);
-
    for (unsigned i = 0; i < pData->NumEntries; ++i) {
       CONST D3D10DDIARG_STREAM_OUTPUT_DECLARATION_ENTRY* pOutputStreamDecl =
             &pData->pOutputStreamDecl[i];
+      if (pOutputStreamDecl->OutputSlot >= PIPE_MAX_SO_BUFFERS) {
+         YTTRIUM_WARN("yttrium: d3d10umd geometry stream-output creation "
+                      "rejected entry=%u output_slot=%u "
+                      "reason=output_slot_out_of_range\n",
+                      i, pOutputStreamDecl->OutputSlot);
+         if (pShader->state.tokens) {
+            ureg_free_tokens(pShader->state.tokens);
+            pShader->state.tokens = NULL;
+         }
+         SetError(hDevice, E_INVALIDARG);
+         return;
+      }
       BYTE RegisterMask = pOutputStreamDecl->RegisterMask;
       unsigned start_component = 0;
       unsigned num_components = 0;
@@ -2221,24 +2343,80 @@ CreateGeometryShaderWithStreamOutput(
             ++num_components;
             RegisterMask >>= 1;
          }
-         assert(start_component < 4);
-         assert(1 <= num_components && num_components <= 4);
-         LOG_UNSUPPORTED(((1 << num_components) - 1) << start_component !=
-                         EffectiveRegisterMask);
+         if (start_component >= 4 || num_components > 4 ||
+             (((1u << num_components) - 1) << start_component) !=
+                EffectiveRegisterMask) {
+            YTTRIUM_WARN("yttrium: d3d10umd geometry stream-output "
+                         "creation rejected entry=%u register_mask=0x%x "
+                         "reason=noncontiguous-or-invalid-mask\n",
+                         i, EffectiveRegisterMask);
+            if (pShader->state.tokens) {
+               ureg_free_tokens(pShader->state.tokens);
+               pShader->state.tokens = NULL;
+            }
+            SetError(hDevice, E_INVALIDARG);
+            return;
+         }
       }
 
       if (pOutputStreamDecl->RegisterIndex == 0xffffffff) {
          ++num_holes;
       } else {
          unsigned idx = i - num_holes;
+         const unsigned d3d_register = pOutputStreamDecl->RegisterIndex;
+         if (d3d_register >= PIPE_MAX_SHADER_OUTPUTS) {
+            YTTRIUM_WARN("yttrium: d3d10umd geometry stream-output shader "
+                         "creation rejected output=%u d3d_register=%u "
+                         "reason=register_out_of_range\n",
+                         idx, d3d_register);
+            if (pShader->state.tokens) {
+               ureg_free_tokens(pShader->state.tokens);
+               pShader->state.tokens = NULL;
+            }
+            SetError(hDevice, E_FAIL);
+            return;
+         }
+         if (!pData->pShaderCode &&
+             (EffectiveRegisterMask &
+              ~pShader->stream_output_signature_masks[d3d_register])) {
+            YTTRIUM_WARN("yttrium: d3d10umd tokenless geometry "
+                         "stream-output creation rejected output=%u "
+                         "d3d_register=%u declaration_mask=0x%x "
+                         "signature_mask=0x%x "
+                         "reason=declaration_not_in_input_signature\n",
+                         idx, d3d_register, EffectiveRegisterMask,
+                         pShader->stream_output_signature_masks[d3d_register]);
+            SetError(hDevice, E_FAIL);
+            return;
+         }
          pShader->state.stream_output.output[idx].start_component =
             start_component;
          pShader->state.stream_output.output[idx].num_components =
             num_components;
          pShader->state.stream_output.output[idx].output_buffer =
             pOutputStreamDecl->OutputSlot;
-         pShader->state.stream_output.output[idx].register_index =
-            ShaderFindOutputMapping(pShader, pOutputStreamDecl->RegisterIndex);
+         pShader->stream_output_d3d_registers[idx] = d3d_register;
+         if (pShader->state.tokens) {
+            const unsigned mapping =
+               ShaderFindOutputMapping(pShader, d3d_register);
+            if (mapping == ~0u) {
+               YTTRIUM_WARN("yttrium: d3d10umd geometry stream-output shader "
+                            "creation rejected output=%u d3d_register=%u "
+                            "reason=output_not_declared\n",
+                            idx, d3d_register);
+               ureg_free_tokens(pShader->state.tokens);
+               pShader->state.tokens = NULL;
+               SetError(hDevice, E_FAIL);
+               return;
+            }
+            pShader->state.stream_output.output[idx].register_index = mapping;
+         } else {
+            /* A tokenless GS inherits the currently bound VS.  Keep the D3D
+             * register here until ResolveState can map it against that VS.
+             */
+            pShader->state.stream_output.output[idx].register_index =
+               d3d_register;
+         }
          pShader->state.stream_output.output[idx].dst_offset =
             total_components[pOutputStreamDecl->OutputSlot];
          if (pOutputStreamDecl->OutputSlot != 0)
@@ -2258,8 +2436,19 @@ CreateGeometryShaderWithStreamOutput(
          pShader->state.stream_output.stride[i] = total_components[i];
       }
    }
+   pShader->stream_output_template = pShader->state.stream_output;
 
    pShader->handle = pipe->create_gs_state(pipe, &pShader->state);
+   if (!pShader->handle) {
+      YTTRIUM_WARN("yttrium: shader creation failed owner=d3d10umd stage=gs_so "
+                   "reason=native_state_unavailable shader=%p\n",
+                   (void *)pShader);
+      if (pShader->state.tokens) {
+         ureg_free_tokens(pShader->state.tokens);
+         pShader->state.tokens = NULL;
+      }
+      SetError(hDevice, E_FAIL);
+   }
 }
 
 
@@ -2281,6 +2470,7 @@ SoSetTargets(D3D10DDI_HDEVICE hDevice,                                     // IN
              __in_ecount (SOTargets) const UINT *pOffsets)                 // IN
 {
    unsigned i;
+   struct pipe_stream_output_target *targets[PIPE_MAX_SO_BUFFERS] = {};
 
    LOG_ENTRYPOINT();
 
@@ -2288,6 +2478,17 @@ SoSetTargets(D3D10DDI_HDEVICE hDevice,                                     // IN
    struct pipe_context *pipe = pDevice->pipe;
 
    assert(SOTargets + ClearTargets <= PIPE_MAX_SO_BUFFERS);
+
+   if (!pipe->create_stream_output_target ||
+       !pipe->set_stream_output_targets) {
+      YTTRIUM_WARN("yttrium: stream-output bind failed owner=d3d10umd "
+                   "reason=required-gallium-callback-unavailable "
+                   "create_callback=%u bind_callback=%u\n",
+                   pipe->create_stream_output_target != NULL,
+                   pipe->set_stream_output_targets != NULL);
+      SetError(hDevice, E_FAIL);
+      return;
+   }
 
    for (i = 0; i < SOTargets; ++i) {
       Resource *resource = CastResource(phResource[i]);
@@ -2301,29 +2502,38 @@ SoSetTargets(D3D10DDI_HDEVICE hDevice,                                     // IN
          if (!so_target ||
              so_target->buffer != buffer ||
              so_target->buffer_size != buffer_size) {
-            if (so_target) {
-               pipe_so_target_reference(&resource->so_target, NULL);
+            struct pipe_stream_output_target *replacement =
+               pipe->create_stream_output_target(pipe, buffer,
+                                                  0, /* buffer offset */
+                                                  buffer_size);
+            if (!replacement) {
+               YTTRIUM_WARN("yttrium: stream-output bind failed "
+                            "owner=d3d10umd target=%u resource=%p "
+                            "reason=target-creation-failed\n",
+                            i, (void *)resource);
+               SetError(hDevice, E_FAIL);
+               goto fail;
             }
-            so_target = pipe->create_stream_output_target(pipe, buffer,
-                                                          0,/*buffer offset*/
-                                                          buffer_size);
-            resource->so_target = so_target;
+            pipe_so_target_reference(&resource->so_target, replacement);
+            pipe_so_target_reference(&replacement, NULL);
+            so_target = resource->so_target;
          }
       }
-      pipe_so_target_reference(&pDevice->so_targets[i], so_target);
+      pipe_so_target_reference(&targets[i], so_target);
    }
 
+   for (i = 0; i < SOTargets; ++i)
+      pipe_so_target_reference(&pDevice->so_targets[i], targets[i]);
    for (i = 0; i < ClearTargets; ++i) {
       pipe_so_target_reference(&pDevice->so_targets[SOTargets + i], NULL);
    }
 
-   if (!pipe->set_stream_output_targets) {
-      LOG_UNSUPPORTED(pipe->set_stream_output_targets);
-      return;
-   }
-
    pipe->set_stream_output_targets(pipe, SOTargets, pDevice->so_targets,
                                    pOffsets, MESA_PRIM_UNKNOWN);
+
+fail:
+   for (i = 0; i < SOTargets; ++i)
+      pipe_so_target_reference(&targets[i], NULL);
 }
 
 
@@ -2348,16 +2558,20 @@ CreatePixelShader(D3D10DDI_HDEVICE hDevice,                                // IN
 {
    LOG_ENTRYPOINT();
 
-   struct pipe_context *pipe = CastPipeContext(hDevice);
+   Device *pDevice = CastDevice(hDevice);
+   struct pipe_context *pipe = pDevice->pipe;
    Shader *pShader = CastShader(hShader);
 
    InitShaderObject(pShader, MESA_SHADER_FRAGMENT);
+   struct pipe_shader_sampler_binding_map *sampler_binding_map =
+      PrepareSamplerBindingMap(pDevice, pShader);
    pShader->compute_emulation =
       GetComputeEmulation(pShaderCode, pShader->compute_store_imm);
 
    pShader->state.tokens =
       Shader_tgsi_translate(pShaderCode, pShader->output_mapping, NULL, NULL,
-                            NULL, NULL);
+                            NULL, NULL, NULL, sampler_binding_map,
+                            pShader->counter_image_slots);
 
    /*
     * A NULL here is the translator telling us it could not handle this
@@ -2381,6 +2595,8 @@ CreatePixelShader(D3D10DDI_HDEVICE hDevice,                                // IN
    if (!pShader->handle) {
       YTTRIUM_WARN("yttrium: d3d10umd pixel shader state creation failed shader=%p\n",
                    (void *)pShader);
+      ureg_free_tokens(pShader->state.tokens);
+      pShader->state.tokens = NULL;
       SetError(hDevice, E_FAIL);
    }
 }
@@ -2414,6 +2630,7 @@ PsSetShader(D3D10DDI_HDEVICE hDevice,  // IN
    }
 
    pipe->bind_fs_state(pipe, state);
+   BindShaderImages(pDevice, MESA_SHADER_FRAGMENT);
    UpdateBufferInfoConstants(pDevice, MESA_SHADER_FRAGMENT);
 }
 
@@ -2500,124 +2717,6 @@ RunWineBufferInfo(Device *pDevice)
    return WriteSolidRGBA32UI(pDevice, pDevice->fb.cbufs[0].texture, value);
 }
 
-static bool
-RunWineUAVCounterConsumeCompute(Device *pDevice, Shader *cs,
-                                UINT ThreadGroupCountX)
-{
-   if (!pDevice || !cs || !pDevice->pipe)
-      return false;
-
-   UnorderedAccessView *src =
-      pDevice->unordered_access_views[MESA_SHADER_COMPUTE][0];
-   UnorderedAccessView *dst =
-      pDevice->unordered_access_views[MESA_SHADER_COMPUTE][1];
-   if (!src || !dst || !src->buffer_counter || !src->buffer_structured ||
-       !dst->buffer_structured || !src->pipe_resource || !dst->pipe_resource ||
-       src->pipe_resource->target != PIPE_BUFFER ||
-       dst->pipe_resource->target != PIPE_BUFFER || !src->buffer_stride ||
-       !dst->buffer_stride)
-      return false;
-
-   const unsigned invocations =
-      ThreadGroupCountX * MAX2(cs->thread_group_size[0], 1u);
-   uint8_t data[64];
-   if (src->buffer_stride > sizeof(data) || dst->buffer_stride > sizeof(data))
-      return false;
-
-   unsigned counter = src->counter_value;
-   for (unsigned i = 0; i < invocations && counter; ++i) {
-      counter--;
-      const unsigned src_offset =
-         src->image.u.buf.offset + counter * src->buffer_stride;
-      const unsigned dst_offset =
-         dst->image.u.buf.offset + counter * dst->buffer_stride;
-      if (!ReadBufferRange(pDevice->pipe, src->pipe_resource, src_offset,
-                           src->buffer_stride, data))
-         return false;
-      if (!WriteBufferRange(pDevice->pipe, dst->pipe_resource, dst_offset,
-                            dst->buffer_stride, data))
-         return false;
-   }
-
-   src->counter_value = counter;
-   return true;
-}
-
-static bool
-RunWineUAVCounterProduceCompute(Device *pDevice, Shader *cs,
-                                UINT ThreadGroupCountX,
-                                UINT ThreadGroupCountY,
-                                UINT ThreadGroupCountZ)
-{
-   if (!pDevice || !cs || !pDevice->pipe)
-      return false;
-
-   UnorderedAccessView *uav =
-      pDevice->unordered_access_views[MESA_SHADER_COMPUTE][0];
-   if (!uav || !uav->buffer_counter || !uav->buffer_structured ||
-       !uav->pipe_resource || uav->pipe_resource->target != PIPE_BUFFER ||
-       uav->buffer_stride != sizeof(UINT))
-      return false;
-
-   const unsigned block_x = MAX2(cs->thread_group_size[0], 1u);
-   const unsigned block_y = MAX2(cs->thread_group_size[1], 1u);
-   const unsigned block_z = MAX2(cs->thread_group_size[2], 1u);
-   const unsigned invocations =
-      ThreadGroupCountX * ThreadGroupCountY * ThreadGroupCountZ *
-      block_x * block_y * block_z;
-   unsigned counter = uav->counter_value;
-   if (counter > uav->buffer_num_elements ||
-       invocations > uav->buffer_num_elements - counter)
-      return false;
-
-   for (unsigned i = 0; i < invocations; ++i) {
-      const UINT value = i;
-      const unsigned offset =
-         uav->image.u.buf.offset + (counter + i) * uav->buffer_stride;
-      if (!WriteBufferRange(pDevice->pipe, uav->pipe_resource, offset,
-                            sizeof(value), &value))
-         return false;
-   }
-
-   uav->counter_value = counter + invocations;
-   return true;
-}
-
-static bool
-RunWineAppendDispatchArgsCompute(Device *pDevice)
-{
-   static const UINT dispatch_args[3][3] = {
-      {4, 2, 1},
-      {4, 1, 1},
-      {3, 1, 1},
-   };
-
-   if (!pDevice || !pDevice->pipe)
-      return false;
-
-   UnorderedAccessView *uav =
-      pDevice->unordered_access_views[MESA_SHADER_COMPUTE][0];
-   if (!uav || !uav->buffer_append || !uav->buffer_structured ||
-       !uav->pipe_resource || uav->pipe_resource->target != PIPE_BUFFER ||
-       uav->buffer_stride != sizeof(dispatch_args[0]))
-      return false;
-
-   unsigned counter = uav->counter_value;
-   if (counter > uav->buffer_num_elements ||
-       ARRAY_SIZE(dispatch_args) > uav->buffer_num_elements - counter)
-      return false;
-
-   for (unsigned i = 0; i < ARRAY_SIZE(dispatch_args); ++i) {
-      const unsigned offset =
-         uav->image.u.buf.offset + (counter + i) * uav->buffer_stride;
-      if (!WriteBufferRange(pDevice->pipe, uav->pipe_resource, offset,
-                            sizeof(dispatch_args[i]), dispatch_args[i]))
-         return false;
-   }
-
-   uav->counter_value = counter + ARRAY_SIZE(dispatch_args);
-   return true;
-}
 
 static bool
 RunWineDispatchStatsCompute(Device *pDevice, Shader *cs,
@@ -2958,8 +3057,8 @@ ShaderSupportsNativeTessellation(
       Shader_opcode_free(&opcode);
    }
 
-   if (!invalid_declaration &&
-       parser.curr >= parser.code + parser.header.size) {
+   if (!parser.failed && !invalid_declaration &&
+       parser.curr == parser.code + parser.header.size) {
       if (stage == MESA_SHADER_TESS_EVAL) {
          supported_shader =
             input_control_points >= 1 &&
@@ -2986,7 +3085,9 @@ ShaderSupportsNativeTessellation(
                    output_primitive, max_tess_factor,
                    control_point_phases, fork_phases, join_phases,
                    invalid_declaration,
-                   (unsigned)(parser.code + parser.header.size - parser.curr));
+                   parser.curr <= parser.code + parser.header.size ?
+                      (unsigned)(parser.code + parser.header.size - parser.curr) :
+                      0);
       return false;
    }
 
@@ -3007,7 +3108,8 @@ InitD3D11TessellationShader(
    mesa_shader_stage stage,
    const D3D11DDIARG_TESSELLATION_IO_SIGNATURES *pSignatures)
 {
-   struct pipe_context *pipe = CastPipeContext(hDevice);
+   Device *pDevice = CastDevice(hDevice);
+   struct pipe_context *pipe = pDevice->pipe;
    Shader *pShader = CastShader(hShader);
    InitD3D11Shader(hShader, stage);
 
@@ -3038,13 +3140,19 @@ InitD3D11TessellationShader(
    pShader->tessellation_properties_valid = true;
    const struct Shader_tessellation_io_signatures signatures =
       GetTessellationSignatures(pShader);
+   struct pipe_shader_sampler_binding_map *sampler_binding_map =
+      PrepareSamplerBindingMap(pDevice, pShader);
    pShader->state.tokens =
       Shader_tgsi_translate(pCode, pShader->output_mapping, NULL, NULL,
                             pShader->tessellation_has_signatures ?
                                &signatures : NULL,
-                            NULL);
+                            NULL, NULL, sampler_binding_map,
+                            pShader->counter_image_slots);
    if (!pShader->state.tokens) {
       YTTRIUM_WARN("yttrium: d3d10umd hull shader translation failed\n");
+      FREE(pShader->tessellation_code);
+      pShader->tessellation_code = NULL;
+      pShader->tessellation_code_size = 0;
       SetError(hDevice, E_INVALIDARG);
       return;
    }
@@ -3052,6 +3160,11 @@ InitD3D11TessellationShader(
    pShader->handle = pipe->create_tcs_state(pipe, &pShader->state);
    if (!pShader->handle) {
       YTTRIUM_WARN("yttrium: d3d10umd hull shader state creation failed\n");
+      ureg_free_tokens(pShader->state.tokens);
+      pShader->state.tokens = NULL;
+      FREE(pShader->tessellation_code);
+      pShader->tessellation_code = NULL;
+      pShader->tessellation_code_size = 0;
       SetError(hDevice, E_FAIL);
    }
 }
@@ -3079,6 +3192,8 @@ RecreateTessEvalState(
    pShader->state.tokens = NULL;
    pShader->tessellation_compiled_properties_valid = false;
    InitShaderOutputMapping(pShader);
+   struct pipe_shader_sampler_binding_map *sampler_binding_map =
+      PrepareSamplerBindingMap(pDevice, pShader);
 
    const struct Shader_tessellation_io_signatures signatures =
       GetTessellationSignatures(pShader);
@@ -3087,7 +3202,8 @@ RecreateTessEvalState(
                             pShader->output_mapping, NULL, NULL,
                             pShader->tessellation_has_signatures ?
                                &signatures : NULL,
-                            properties);
+                            properties, NULL, sampler_binding_map,
+                            pShader->counter_image_slots);
    if (!pShader->state.tokens) {
       YTTRIUM_WARN("yttrium: d3d10umd domain shader translation failed\n");
       return false;
@@ -3096,6 +3212,8 @@ RecreateTessEvalState(
    pShader->handle = pipe->create_tes_state(pipe, &pShader->state);
    if (!pShader->handle) {
       YTTRIUM_WARN("yttrium: d3d10umd domain shader state creation failed\n");
+      ureg_free_tokens(pShader->state.tokens);
+      pShader->state.tokens = NULL;
       return false;
    }
 
@@ -3105,17 +3223,27 @@ RecreateTessEvalState(
 }
 
 static void
-BindD3D11TessellationStates(Device *pDevice)
+BindD3D11TessellationStates(D3D10DDI_HDEVICE hDevice)
 {
+   Device *pDevice = CastDevice(hDevice);
    Shader *hs = pDevice->bound_hs;
    Shader *ds = pDevice->bound_ds;
    void *tcs_state = NULL;
    void *tes_state = NULL;
 
-   if (hs && ds && hs->handle && hs->tessellation_properties_valid &&
-       RecreateTessEvalState(pDevice, ds, &hs->tessellation_properties)) {
-      tcs_state = hs->handle;
-      tes_state = ds->handle;
+   if (hs && ds) {
+      if (hs->handle && hs->tessellation_properties_valid &&
+          RecreateTessEvalState(pDevice, ds,
+                                &hs->tessellation_properties)) {
+         tcs_state = hs->handle;
+         tes_state = ds->handle;
+      } else {
+         YTTRIUM_WARN("yttrium: tessellation shader bind failed "
+                      "owner=d3d10umd hs=%p ds=%p hs_state=%p "
+                      "ds_state=%p action=SetError\n",
+                      (void *)hs, (void *)ds, hs->handle, ds->handle);
+         SetError(hDevice, E_FAIL);
+      }
    }
 
    /* Gallium and Vulkan accept tessellation stages only as a complete pair. */
@@ -3139,25 +3267,20 @@ ShaderDecodeTessOutputPrimitive(const UINT *pCode)
       return 0;
 
    struct Shader_parser parser;
+   struct Shader_opcode opcode;
    Shader_parse_init(&parser, pCode);
-   const UINT *curr = parser.curr;
-   const UINT *end = parser.code + parser.header.size;
+   if (parser.failed)
+      return 0;
 
-   while (curr < end) {
-      const UINT token = *curr;
-      const D3D10_SB_OPCODE_TYPE opcode =
-         DECODE_D3D10_SB_OPCODE_TYPE(token);
-      const UINT length =
-         DECODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(token);
+   while (Shader_parse_opcode(&parser, &opcode)) {
+      const bool is_output_primitive =
+         opcode.type == D3D11_SB_OPCODE_DCL_TESS_OUTPUT_PRIMITIVE;
+      const unsigned output_primitive =
+         opcode.specific.dcl_tess_output_primitive;
+      Shader_opcode_free(&opcode);
 
-      if (opcode == D3D11_SB_OPCODE_DCL_TESS_OUTPUT_PRIMITIVE) {
-         return (token & D3D11_SB_TESS_OUTPUT_PRIMITIVE_MASK) >>
-            D3D11_SB_TESS_OUTPUT_PRIMITIVE_SHIFT;
-      }
-
-      if (!length || curr + length > end)
-         break;
-      curr += length;
+      if (is_output_primitive)
+         return output_primitive;
    }
 
    return 0;
@@ -3197,7 +3320,8 @@ HsSetShader(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader)
    LOG_ENTRYPOINT();
    Device *pDevice = CastDevice(hDevice);
    pDevice->bound_hs = CastShader(hShader);
-   BindD3D11TessellationStates(pDevice);
+   BindD3D11TessellationStates(hDevice);
+   BindShaderImages(pDevice, MESA_SHADER_TESS_CTRL);
 }
 
 void APIENTRY
@@ -3206,7 +3330,8 @@ DsSetShader(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader)
    LOG_ENTRYPOINT();
    Device *pDevice = CastDevice(hDevice);
    pDevice->bound_ds = CastShader(hShader);
-   BindD3D11TessellationStates(pDevice);
+   BindD3D11TessellationStates(hDevice);
+   BindShaderImages(pDevice, MESA_SHADER_TESS_EVAL);
 }
 
 void APIENTRY
@@ -3215,6 +3340,8 @@ HsSetShaderResources(
    __in_ecount (NumViews) const D3D10DDI_HSHADERRESOURCEVIEW *phShaderResourceViews)
 {
    LOG_ENTRYPOINT();
+   SetShaderResources(MESA_SHADER_TESS_CTRL, hDevice, Offset, NumViews,
+                      phShaderResourceViews);
 }
 
 void APIENTRY
@@ -3223,6 +3350,8 @@ DsSetShaderResources(
    __in_ecount (NumViews) const D3D10DDI_HSHADERRESOURCEVIEW *phShaderResourceViews)
 {
    LOG_ENTRYPOINT();
+   SetShaderResources(MESA_SHADER_TESS_EVAL, hDevice, Offset, NumViews,
+                      phShaderResourceViews);
 }
 
 void APIENTRY
@@ -3248,6 +3377,7 @@ HsSetSamplers(D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumSamplers,
               __in_ecount (NumSamplers) const D3D10DDI_HSAMPLER *phSamplers)
 {
    LOG_ENTRYPOINT();
+   SetSamplers(MESA_SHADER_TESS_CTRL, hDevice, Offset, NumSamplers, phSamplers);
 }
 
 void APIENTRY
@@ -3255,6 +3385,7 @@ DsSetSamplers(D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumSamplers,
               __in_ecount (NumSamplers) const D3D10DDI_HSAMPLER *phSamplers)
 {
    LOG_ENTRYPOINT();
+   SetSamplers(MESA_SHADER_TESS_EVAL, hDevice, Offset, NumSamplers, phSamplers);
 }
 
 void APIENTRY
@@ -3294,6 +3425,8 @@ CreateComputeShader(D3D10DDI_HDEVICE hDevice,
    Shader *pShader = CastShader(hShader);
 
    InitShaderObject(pShader, MESA_SHADER_COMPUTE);
+   struct pipe_shader_sampler_binding_map *sampler_binding_map =
+      PrepareSamplerBindingMap(CastDevice(hDevice), pShader);
    pShader->thread_group_size[0] = 1;
    pShader->thread_group_size[1] = 1;
    pShader->thread_group_size[2] = 1;
@@ -3303,14 +3436,32 @@ CreateComputeShader(D3D10DDI_HDEVICE hDevice,
    unsigned static_shared_mem = 0;
    pShader->state.tokens =
       Shader_tgsi_translate(pCode, NULL, pShader->thread_group_size,
-                            &static_shared_mem, NULL, NULL);
+                            &static_shared_mem, NULL, NULL, NULL,
+                            sampler_binding_map, pShader->counter_image_slots);
+   if (!pShader->state.tokens) {
+      YTTRIUM_WARN("yttrium: shader creation failed owner=d3d10umd stage=cs "
+                   "reason=tgsi_translation_failed shader=%p\n",
+                   (void *)pShader);
+      SetError(hDevice, E_FAIL);
+      return;
+   }
 
    pShader->compute_state.ir_type = PIPE_SHADER_IR_TGSI;
    pShader->compute_state.prog = pShader->state.tokens;
    pShader->compute_state.static_shared_mem = static_shared_mem;
+   pShader->compute_state.sampler_binding_map = sampler_binding_map;
 
    pShader->handle =
       pipe->create_compute_state(pipe, &pShader->compute_state);
+   if (!pShader->handle) {
+      YTTRIUM_WARN("yttrium: shader creation failed owner=d3d10umd stage=cs "
+                   "reason=native_state_unavailable shader=%p\n",
+                   (void *)pShader);
+      ureg_free_tokens(pShader->state.tokens);
+      pShader->state.tokens = NULL;
+      pShader->compute_state.prog = NULL;
+      SetError(hDevice, E_FAIL);
+   }
 }
 
 void APIENTRY
@@ -3325,6 +3476,7 @@ CsSetShader(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader)
 
    pDevice->bound_cs = pShader;
    pipe->bind_compute_state(pipe, state);
+   BindShaderImages(pDevice, MESA_SHADER_COMPUTE);
    UpdateBufferInfoConstants(pDevice, MESA_SHADER_COMPUTE);
 }
 
@@ -3426,12 +3578,23 @@ CopyStructureCount(D3D10DDI_HDEVICE hDevice,
    Device *pDevice = CastDevice(hDevice);
    Resource *dst = CastResource(hDstBuffer);
    UnorderedAccessView *src = CastUnorderedAccessView(hSrcView);
-   if (!pDevice || !pDevice->pipe || !dst || !dst->resource || !src ||
-       !src->pipe_resource || (!src->buffer_counter && !src->buffer_append))
+   if (!pDevice || !pDevice->pipe || !dst || !dst->resource || !src)
       return;
-
-   WriteBufferRange(pDevice->pipe, dst->resource, DstAlignedByteOffset,
-                    sizeof(src->counter_value), &src->counter_value);
+   if (!src->counter_resource || dst->resource->target != PIPE_BUFFER ||
+       (DstAlignedByteOffset & 3) ||
+       DstAlignedByteOffset > dst->resource->width0 ||
+       sizeof(UINT) > dst->resource->width0 - DstAlignedByteOffset) {
+      YTTRIUM_WARN("yttrium: CopyStructureCount rejected owner=d3d10umd "
+                   "reason=invalid_counter_or_destination offset=%u\n",
+                   DstAlignedByteOffset);
+      SetError(hDevice, E_INVALIDARG);
+      return;
+   }
+   struct pipe_box box = {};
+   box.width = box.height = box.depth = 1;
+   pDevice->pipe->resource_copy_region(pDevice->pipe, dst->resource, 0,
+                                       DstAlignedByteOffset, 0, 0,
+                                       src->counter_resource, 0, &box);
 }
 
 
@@ -3537,7 +3700,8 @@ CreateShaderResourceView(
    ShaderResourceView *pSRView = CastShaderResourceView(hShaderResourceView);
    struct pipe_resource *resource;
    enum pipe_format format;
-   
+
+   pSRView->handle = NULL;
    pSRView->resource = CastResource(pCreateSRView->hDrvResource);
    pSRView->buffer_raw = false;
    pSRView->buffer_structured = false;
@@ -3557,6 +3721,24 @@ CreateShaderResourceView(
    }
    if (buffer_structured)
       format = PIPE_FORMAT_R32_UINT;
+
+   if (!resource || format == PIPE_FORMAT_NONE) {
+      YTTRIUM_WARN("yttrium: object creation failed owner=d3d10umd "
+                   "object=shader-resource-view resource=%p format=%u "
+                   "dimension=%u reason=invalid-resource-or-format\n",
+                   (void *)resource, pCreateSRView->Format,
+                   pCreateSRView->ResourceDimension);
+      SetError(hDevice, E_INVALIDARG);
+      return;
+   }
+
+   if (!pipe->create_sampler_view) {
+      YTTRIUM_WARN("yttrium: object creation failed owner=d3d10umd "
+                   "object=shader-resource-view reason=create-sampler-view-"
+                   "callback-unavailable\n");
+      SetError(hDevice, DXGI_DDI_ERR_UNSUPPORTED);
+      return;
+   }
 
    u_sampler_view_default_template(&desc,
                                    resource,
@@ -3610,11 +3792,24 @@ CreateShaderResourceView(
       assert(pCreateSRView->TexCube.MipLevels != 0 && pCreateSRView->TexCube.MipLevels != (UINT)-1);
       break;
    default:
-      assert(0);
+      YTTRIUM_WARN("yttrium: object creation failed owner=d3d10umd "
+                   "object=shader-resource-view dimension=%u "
+                   "reason=unsupported-resource-dimension\n",
+                   pCreateSRView->ResourceDimension);
+      SetError(hDevice, E_INVALIDARG);
       return;
    }
 
    pSRView->handle = pipe->create_sampler_view(pipe, resource, &desc);
+   if (!pSRView->handle) {
+      YTTRIUM_WARN("yttrium: object creation failed owner=d3d10umd "
+                   "object=shader-resource-view resource=%p format=%u "
+                   "dimension=%u reason=native-view-unavailable\n",
+                   (void *)resource, pCreateSRView->Format,
+                   pCreateSRView->ResourceDimension);
+      SetError(hDevice, E_OUTOFMEMORY);
+      return;
+   }
    ResourceEvent(RESOURCE_EVENT_SRV_CREATE,
                  (uint64_t)hRTShaderResourceView.handle,
                  pSRView,
@@ -3651,6 +3846,7 @@ CreateShaderResourceView1(
    struct pipe_resource *resource;
    enum pipe_format format;
 
+   pSRView->handle = NULL;
    pSRView->resource = CastResource(pCreateSRView->hDrvResource);
    pSRView->buffer_raw = false;
    pSRView->buffer_structured = false;
@@ -3670,6 +3866,24 @@ CreateShaderResourceView1(
    }
    if (buffer_structured)
       format = PIPE_FORMAT_R32_UINT;
+
+   if (!resource || format == PIPE_FORMAT_NONE) {
+      YTTRIUM_WARN("yttrium: object creation failed owner=d3d10umd "
+                   "object=shader-resource-view1 resource=%p format=%u "
+                   "dimension=%u reason=invalid-resource-or-format\n",
+                   (void *)resource, pCreateSRView->Format,
+                   pCreateSRView->ResourceDimension);
+      SetError(hDevice, E_INVALIDARG);
+      return;
+   }
+
+   if (!pipe->create_sampler_view) {
+      YTTRIUM_WARN("yttrium: object creation failed owner=d3d10umd "
+                   "object=shader-resource-view1 reason=create-sampler-view-"
+                   "callback-unavailable\n");
+      SetError(hDevice, DXGI_DDI_ERR_UNSUPPORTED);
+      return;
+   }
 
    u_sampler_view_default_template(&desc,
                                    resource,
@@ -3725,11 +3939,24 @@ CreateShaderResourceView1(
       assert(pCreateSRView->TexCube.MipLevels != 0 && pCreateSRView->TexCube.MipLevels != (UINT)-1);
       break;
    default:
-      assert(0);
+      YTTRIUM_WARN("yttrium: object creation failed owner=d3d10umd "
+                   "object=shader-resource-view1 dimension=%u "
+                   "reason=unsupported-resource-dimension\n",
+                   pCreateSRView->ResourceDimension);
+      SetError(hDevice, E_INVALIDARG);
       return;
    }
 
    pSRView->handle = pipe->create_sampler_view(pipe, resource, &desc);
+   if (!pSRView->handle) {
+      YTTRIUM_WARN("yttrium: object creation failed owner=d3d10umd "
+                   "object=shader-resource-view1 resource=%p format=%u "
+                   "dimension=%u reason=native-view-unavailable\n",
+                   (void *)resource, pCreateSRView->Format,
+                   pCreateSRView->ResourceDimension);
+      SetError(hDevice, E_OUTOFMEMORY);
+      return;
+   }
    ResourceEvent(RESOURCE_EVENT_SRV_CREATE,
                  (uint64_t)hRTShaderResourceView.handle,
                  pSRView,
@@ -3785,9 +4012,9 @@ CreateShaderResourceView11(
                              hRTShaderResourceView);
 
    ShaderResourceView *pSRView = CastShaderResourceView(hShaderResourceView);
-   if ((pCreateSRView->ResourceDimension == D3D10DDIRESOURCE_BUFFER ||
-        pCreateSRView->ResourceDimension == D3D11DDIRESOURCE_BUFFEREX) &&
-       pSRView) {
+   if (pSRView && pSRView->handle &&
+       (pCreateSRView->ResourceDimension == D3D10DDIRESOURCE_BUFFER ||
+        pCreateSRView->ResourceDimension == D3D11DDIRESOURCE_BUFFEREX)) {
       pSRView->buffer_raw =
          pCreateSRView->BufferEx.Flags & D3D11_DDI_BUFFEREX_SRV_FLAG_RAW;
       if (pSRView->buffer_raw)
@@ -3879,15 +4106,22 @@ CreateUnorderedAccessView(
    pUAView->buffer_first_element = 0;
    pUAView->buffer_num_elements = 0;
    pUAView->buffer_stride = 0;
-   pUAView->counter_value = 0;
+   pUAView->counter_resource = NULL;
    pUAView->pipe_resource = NULL;
    pipe_resource_reference(&pUAView->pipe_resource,
                            CastPipeResource(pCreateUAView->hDrvResource));
    memset(&pUAView->image, 0, sizeof(pUAView->image));
    pUAView->image.resource = pUAView->pipe_resource;
+   const bool buffer_structured =
+      pCreateUAView->ResourceDimension == D3D10DDIRESOURCE_BUFFER &&
+      pUAView->resource &&
+      (pUAView->resource->MiscFlags & D3D11_DDI_RESOURCE_MISC_BUFFER_STRUCTURED);
+   /* Structured/raw shaders access individual DWORDs.  UNKNOWN describes the
+    * D3D view, not the byte-sized format used to allocate its backing buffer. */
    pUAView->image.format =
       (pCreateUAView->ResourceDimension == D3D10DDIRESOURCE_BUFFER &&
-       (pCreateUAView->Buffer.Flags & D3D11_DDI_BUFFER_UAV_FLAG_RAW)) ?
+       ((pCreateUAView->Buffer.Flags & D3D11_DDI_BUFFER_UAV_FLAG_RAW) ||
+        buffer_structured)) ?
          PIPE_FORMAT_R32_UINT :
          (pCreateUAView->Format == DXGI_FORMAT_UNKNOWN ?
             pUAView->pipe_resource->format :
@@ -3932,9 +4166,7 @@ CreateUnorderedAccessView(
          pCreateUAView->Buffer.Flags & D3D11_DDI_BUFFER_UAV_FLAG_COUNTER;
       pUAView->buffer_append =
          pCreateUAView->Buffer.Flags & D3D11_DDI_BUFFER_UAV_FLAG_APPEND;
-      pUAView->buffer_structured =
-         pUAView->resource &&
-         (pUAView->resource->MiscFlags & D3D11_DDI_RESOURCE_MISC_BUFFER_STRUCTURED);
+      pUAView->buffer_structured = buffer_structured;
       pUAView->buffer_first_element = pCreateUAView->Buffer.FirstElement;
       pUAView->buffer_num_elements = pCreateUAView->Buffer.NumElements;
       pUAView->buffer_stride = pUAView->buffer_structured ?
@@ -3948,6 +4180,29 @@ CreateUnorderedAccessView(
    default:
       LOG_UNSUPPORTED(true);
       break;
+   }
+
+   if (pUAView->buffer_counter || pUAView->buffer_append) {
+      Device *device = CastDevice(hDevice);
+      struct pipe_resource resource = {};
+      resource.target = PIPE_TEXTURE_2D;
+      resource.format = PIPE_FORMAT_R32_UINT;
+      resource.width0 = resource.height0 = resource.depth0 = 1;
+      resource.array_size = 1;
+      resource.usage = PIPE_USAGE_DEFAULT;
+      resource.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SHADER_IMAGE;
+      resource.flags = YTTRIUM_GDI_RESOURCE_FLAG_UAV_COUNTER;
+      pUAView->counter_resource =
+         device->screen->resource_create(device->screen, &resource);
+      if (!pUAView->counter_resource) {
+         YTTRIUM_WARN("yttrium: UAV creation failed owner=d3d10umd "
+                      "reason=gpu_counter_image_allocation\n");
+         pipe_resource_reference(&pUAView->pipe_resource, NULL);
+         pUAView->image.resource = NULL;
+         SetError(hDevice, E_OUTOFMEMORY);
+         return;
+      }
+      ResetUAVCounter(device, pUAView, 0);
    }
 }
 
@@ -3964,6 +4219,7 @@ DestroyUnorderedAccessView(
       return;
 
    pipe_resource_reference(&pUAView->pipe_resource, NULL);
+   pipe_resource_reference(&pUAView->counter_resource, NULL);
    pUAView->resource = NULL;
 }
 
@@ -4251,7 +4507,6 @@ CsSetUnorderedAccessViews(
    LOG_ENTRYPOINT();
 
    Device *pDevice = CastDevice(hDevice);
-   struct pipe_context *pipe = pDevice->pipe;
 
    if (!NumViews)
       return;
@@ -4264,7 +4519,7 @@ CsSetUnorderedAccessViews(
          if (pUAVInitialCounts &&
              pUAVInitialCounts[i] != ~0u &&
              (uav->buffer_counter || uav->buffer_append))
-            uav->counter_value = pUAVInitialCounts[i];
+            ResetUAVCounter(pDevice, uav, pUAVInitialCounts[i]);
          pDevice->unordered_access_views[MESA_SHADER_COMPUTE][StartSlot + i] =
             uav;
          pDevice->shader_images[MESA_SHADER_COMPUTE][StartSlot + i] =
@@ -4277,8 +4532,7 @@ CsSetUnorderedAccessViews(
       }
    }
 
-   pipe->set_shader_images(pipe, MESA_SHADER_COMPUTE, StartSlot, NumViews, 0,
-                           &pDevice->shader_images[MESA_SHADER_COMPUTE][StartSlot]);
+   BindShaderImages(pDevice, MESA_SHADER_COMPUTE, StartSlot, NumViews);
    UpdateBufferInfoUavConstants(pDevice, MESA_SHADER_COMPUTE,
                                 StartSlot, NumViews);
    UpdateBufferInfoConstants(pDevice, MESA_SHADER_COMPUTE);
@@ -4324,14 +4578,9 @@ GenMips(D3D10DDI_HDEVICE hDevice,                           // IN
 unsigned
 ShaderFindOutputMapping(Shader *shader, unsigned registerIndex)
 {
-   if (!shader || !shader->state.tokens)
-      return registerIndex;
+   if (!shader || !shader->state.tokens ||
+       registerIndex >= ARRAY_SIZE(shader->output_mapping))
+      return ~0u;
 
-   for (unsigned i = 0; i < PIPE_MAX_SHADER_OUTPUTS; ++i) {
-      if (shader->output_mapping[i] == ~0u)
-         break;
-      if (shader->output_mapping[i] == registerIndex)
-         return i;
-   }
-   return registerIndex;
+   return shader->output_mapping[registerIndex];
 }

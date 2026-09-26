@@ -35,9 +35,6 @@ struct hash_table_u64;
 #ifndef VIRTGPU_DRM_CAPSET_VENUS
 #define VIRTGPU_DRM_CAPSET_VENUS 4
 #endif
-#ifndef VIRGL_RENDERER_CONTEXT_FLAG_GLOBAL_RESOURCE_IDS
-#define VIRGL_RENDERER_CONTEXT_FLAG_GLOBAL_RESOURCE_IDS (1u << 8)
-#endif
 
 /*
  * A single command has to fit here whole.  128 KB was enough until a real
@@ -83,6 +80,8 @@ struct hash_table_u64;
 #define YTTRIUM_VENUS_ASYNC_BATCH_ENV "D3D10UMD_YTTRIUM_ASYNC_BATCH"
 #define YTTRIUM_VENUS_GROUP_QUEUE_SUBMITS_ENV \
    "D3D10UMD_YTTRIUM_GROUP_QUEUE_SUBMITS"
+#define YTTRIUM_VENUS_GROUP_QUEUE_SUBMIT_OP_THRESHOLD_ENV \
+   "D3D10UMD_YTTRIUM_GROUP_QUEUE_SUBMIT_OP_THRESHOLD"
 #define YTTRIUM_VENUS_BATCH_FENCE_FEEDBACK_ENV \
    "D3D10UMD_YTTRIUM_BATCH_FENCE_FEEDBACK"
 #define YTTRIUM_VENUS_NATIVE_DRAW_BATCH_ENV "D3D10UMD_YTTRIUM_DRAW_BATCH"
@@ -270,6 +269,7 @@ struct yttrium_venus_render_target_key {
    VkBool32 use_mrss;
    uint32_t color_feedback_loop_mask;
    VkBool32 depth_feedback_loop;
+   VkBool32 depth_read_only;
 };
 
 struct yttrium_venus_render_target {
@@ -378,8 +378,7 @@ struct yttrium_venus_retired_resource {
    VkBuffer buffer;
    VkDeviceMemory memory;
    VkImageView image_view;
-   struct yttrium_venus_sample_image_view
-      sample_image_view_cache[YTTRIUM_VENUS_SAMPLE_IMAGE_VIEW_CACHE_SIZE];
+   struct yttrium_venus_sample_image_view *sample_image_views;
    struct yttrium_venus_sample_buffer_view *sample_buffer_views;
    VkRenderPass render_pass;
    VkFramebuffer framebuffer;
@@ -398,6 +397,7 @@ struct yttrium_venus_retired_resource {
    VkImageView pipeline_image_views[PIPE_MAX_COLOR_BUFS];
    VkImageView pipeline_depth_image_view;
    VkSampler pipeline_samplers[YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES];
+   uint32_t custom_border_color_sampler_count;
    VkBuffer draw_vertex_buffer;
    VkDeviceMemory draw_vertex_memory;
    VkBuffer draw_index_buffer;
@@ -477,6 +477,7 @@ struct yttrium_venus_cmd_batch_footprint {
    struct yttrium_venus_cmd_batch_buffer_footprint index;
    uint64_t sampled_image_ids[YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES];
    uint64_t attachment_image_ids[PIPE_MAX_COLOR_BUFS + 1];
+   uint64_t read_only_depth_image_id;
    uint64_t pipeline_id;
    uint32_t resource_id;
    uint32_t sampled_image_count;
@@ -530,6 +531,7 @@ struct yttrium_venus_render_pass_group_key {
    uint32_t depth_layers;
    uint32_t color_feedback_loop_mask;
    VkBool32 depth_feedback_loop;
+   VkBool32 depth_read_only;
 };
 
 struct yttrium_venus_deferred_draw {
@@ -569,6 +571,7 @@ struct yttrium_venus_deferred_draw {
    uint32_t ubo_push_write_count;
    uint32_t sampled_push_write_count;
    uint32_t push_write_count;
+   uint32_t declared_push_descriptor_count;
    uint32_t vertex_count;
    uint32_t index_count;
    uint32_t instance_count;
@@ -610,6 +613,7 @@ struct yttrium_venus_compact_draw_packet {
    uint32_t viewport_count;
    uint32_t vertex_buffer_count;
    uint32_t push_write_count;
+   uint32_t declared_push_descriptor_count;
    struct yttrium_venus_object render_pass_obj;
    struct yttrium_venus_object framebuffer_obj;
    struct yttrium_venus_object pipeline_obj;
@@ -687,6 +691,9 @@ struct yttrium_venus {
    VkSampleCountFlags framebuffer_no_attachments_sample_counts;
    float max_sampler_anisotropy;
    float max_sampler_lod_bias;
+   uint32_t max_custom_border_color_samplers;
+   /* Includes samplers retained by in-flight retired pipelines. */
+   uint32_t custom_border_color_sampler_count;
    uint32_t mipmap_precision_bits;
    uint32_t instance_version;
    uint32_t queue_family_index;
@@ -699,6 +706,8 @@ struct yttrium_venus {
    uint32_t peak_live_batch_count;
    uint32_t pending_submit_count;
    uint32_t group_queue_submit_size;
+   uint64_t pending_submit_op_count;
+   uint64_t group_queue_submit_op_threshold;
    VkDeviceSize peak_ubo_arena_bytes;
    VkDeviceSize peak_draw_backing_pool_bytes;
    bool group_queue_submits;
@@ -713,13 +722,22 @@ struct yttrium_venus {
    bool sample_rate_shading;
    bool tessellation_shader;
    bool attachment_feedback_loop_layout;
+   bool load_store_op_none;
    bool fragment_shader_pixel_interlock;
    bool fragment_stores_and_atomics;
+   bool draw_indirect_first_instance;
+   bool vertex_divisor_nonzero_first_instance;
+   bool storage_image_read_without_format;
+   bool storage_image_write_without_format;
+   /* Immutable per-device format support: 0 unknown, 1 unsupported, 2 supported. */
+   uint8_t storage_image_formatless_formats[PIPE_FORMAT_COUNT];
    bool multisampled_render_to_single_sampled;
    bool transform_feedback;
    bool vertex_attribute_instance_rate_divisor;
    bool vertex_attribute_instance_rate_zero_divisor;
    bool push_descriptor;
+   bool custom_border_colors;
+   bool custom_border_color_without_format;
    bool multi_viewport;
    bool shader_output_viewport_index;
    uint32_t max_viewports;
@@ -741,6 +759,7 @@ struct yttrium_venus {
    uint64_t next_batch_submit_order;
    uint64_t last_completed_submit_order;
    uint32_t push_descriptor_layout_index;
+   uint32_t compute_push_descriptor_layout_index;
    /*
     * The frame the ordered worker owes the display, held one Present deep so
     * that the wait for its rendering runs while the next frame's work is
@@ -783,6 +802,9 @@ struct yttrium_venus {
    VkBufferMemoryBarrier *cmd_batch_upload_barriers;
    uint32_t cmd_batch_upload_barrier_count;
    uint32_t cmd_batch_upload_barrier_capacity;
+   /* Candidate index + 1, revalidated against the live count and merge key.
+    * Indices survive realloc; these entries own no barriers or resources. */
+   uint32_t cmd_batch_upload_barrier_candidates[64];
    VkPipelineStageFlags cmd_batch_upload_src_stages;
    VkPipelineStageFlags cmd_batch_upload_dst_stages;
    struct yttrium_venus_cmd_batch_upload *cmd_batch_uploads;
@@ -957,6 +979,9 @@ yttrium_venus2_transform_feedback_enabled(
    const struct yttrium_venus *venus);
 
 bool
+yttrium_venus2_supports_load_store_op_none(struct yttrium_venus *venus);
+
+bool
 yttrium_venus2_supports_multisampled_render_to_single_sampled(
    struct yttrium_venus *venus,
    uint32_t sample_count);
@@ -974,6 +999,15 @@ yttrium_venus2_sampled_texture_format_supported(
    struct yttrium_venus *venus,
    enum pipe_format pipe_format,
    enum pipe_texture_target target);
+
+bool
+yttrium_venus2_storage_image_without_format_supported(
+   struct yttrium_venus *venus, bool read, bool write);
+
+bool
+yttrium_venus2_storage_image_formatless_format_supported(
+   struct yttrium_venus *venus, enum pipe_format format,
+   bool read, bool write);
 
 bool
 yttrium_venus2_transform_feedback_draw_enabled(
@@ -1399,6 +1433,16 @@ void
 yttrium_venus_cmd_batch_destroy_footprint_index(
    struct yttrium_venus *venus);
 
+void
+yttrium_venus_cmd_batch_collect_image_roles(
+   const struct yttrium_venus_sampled_image *sampled_images,
+   uint32_t sampled_image_count,
+   struct yttrium_venus_resource **color_resources,
+   uint32_t color_resource_count,
+   struct yttrium_venus_resource *depth_resource,
+   bool depth_read_only,
+   struct yttrium_venus_cmd_batch_footprint *footprint);
+
 bool
 yttrium_venus_cmd_batch_deferred_image_role_conflict(
    struct yttrium_venus *venus,
@@ -1406,7 +1450,8 @@ yttrium_venus_cmd_batch_deferred_image_role_conflict(
    uint32_t sampled_image_count,
    struct yttrium_venus_resource **color_resources,
    uint32_t color_resource_count,
-   struct yttrium_venus_resource *depth_resource);
+   struct yttrium_venus_resource *depth_resource,
+   bool depth_read_only);
 
 bool
 yttrium_venus_cmd_batch_emit_deferred_draws(struct yttrium_venus *venus,

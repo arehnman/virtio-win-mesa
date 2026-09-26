@@ -17,6 +17,7 @@
 
 #include "yttrium_trace.h"
 #include "yttrium_venus2_private.h"
+#include "yttrium_venus2_ring.h"
 
 enum yttrium_venus_submit_path {
    YTTRIUM_VENUS_SUBMIT_PATH_UNKNOWN = 0,
@@ -70,6 +71,45 @@ yttrium_venus_resize_submit_buffers(struct yttrium_venus *venus,
    }
 
    return ctx->CommandBufferSize >= command_size;
+}
+
+bool
+yttrium_venus_submit_gpu(struct yttrium_venus *venus, const void *data, size_t size)
+{
+   const size_t overhead = sizeof(VIOGPU_COMMAND_HDR) + sizeof(VIOGPU_TIMELINE_SUBMIT);
+   struct gdikmt_context *ctx = venus->kmt_ctx;
+   if (size > UINT_MAX - overhead ||
+       !yttrium_venus_resize_submit_buffers(venus, overhead + size))
+      return false;
+   VIOGPU_COMMAND_HDR *header = ctx->pCommandBuffer;
+   VIOGPU_TIMELINE_SUBMIT *packet = (VIOGPU_TIMELINE_SUBMIT *)(header + 1);
+   header->type = VIOGPU_CMD_SUBMIT_TIMELINE;
+   header->size = (UINT)(sizeof(*packet) + size);
+   packet->RingIndex = 1;
+   packet->Reserved = 0;
+   memcpy(packet + 1, data, size);
+   struct gdikmt_render render = {0};
+   render.CommandLength = (UINT)(overhead + size);
+   /* Process-only diagnostic: delay worker submission to exercise the
+    * Present issuance checkpoint. Never read on the normal path. */
+   char delay_text[16] = {0};
+   GetEnvironmentVariableA("D3D10UMD_YTTRIUM_SCHEDULED_SUBMIT_DELAY_MS",
+                          delay_text, sizeof(delay_text));
+   unsigned delay = (unsigned)strtoul(delay_text, NULL, 10);
+   if (delay && delay <= 1000) {
+      YTTRIUM_LOG("yttrium: scheduled GPU submit delay begin ms=%u\n", delay);
+      Sleep(delay);
+      YTTRIUM_LOG("yttrium: scheduled GPU submit delay end ms=%u\n", delay);
+   }
+   NTSTATUS status = ctx->render(ctx, &render);
+   YTTRIUM_LOG("yttrium: scheduled GPU submit context=0x%x bytes=%llu timeline=1 hr=%lx\n",
+               ctx->kmt_handle(ctx), (unsigned long long)size, (unsigned long)status);
+   if (!NT_SUCCESS(status)) {
+      YTTRIUM_WARN("yttrium: ERROR scheduled GPU submit owner=venus2 hr=%lx\n", (unsigned long)status);
+      gdikmt_device_report_reset(venus->device, PIPE_UNKNOWN_CONTEXT_RESET);
+      return false;
+   }
+   return true;
 }
 
 /*

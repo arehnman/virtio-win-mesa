@@ -49,6 +49,7 @@ vn_queue_fini(struct vn_queue *queue)
       vn_DestroySemaphore(dev_handle, queue->sparse_semaphore, NULL);
    }
    vn_cached_storage_fini(&queue->storage);
+   simple_mtx_destroy(&queue->submission_mutex);
    vn_queue_base_fini(&queue->base);
 }
 
@@ -65,6 +66,7 @@ vn_queue_init(struct vn_device *dev,
       return result;
 
    vn_cached_storage_init(&queue->storage, &dev->base.vk.alloc);
+   simple_mtx_init(&queue->submission_mutex, mtx_plain);
 
    if (dev->physical_device->emulate_second_queue ==
           queue_info->queueFamilyIndex &&

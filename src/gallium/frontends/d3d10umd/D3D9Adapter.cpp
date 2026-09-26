@@ -5,6 +5,8 @@
  */
 #include "D3D9Private.h"
 
+#include <stddef.h>
+
 extern "C" {
 #include "gallium/winsys/yttrium/gdi/yttrium_venus.h"
 }
@@ -74,10 +76,11 @@ static const FORMATOP g_format_ops[] = {
    { D3D9_FMT_ATI1, 0x0082d007, 0, 0, 8 },
    { D3D9_FMT_P8, 0x00824007, 0, 0, 0 },
    { D3D9_FMT_A8P8, 0x00820007, 0, 0, 0 },
-   /* Fullscreen MSAA reset with auto depth validates D24S8, but D3D9
-    * StretchRect depth/stencil MSAA support remains hidden.
+   /* Auto depth-stencil creation can validate the blt MSAA mask even for a
+    * fullscreen swapchain.  Both masks describe renderable sample counts;
+    * neither advertises depth/stencil StretchRect support.
     */
-   { D3DDDIFMT_D24S8, 0x000000c0, d3d9_ms_types, 0, 0 },
+   { D3DDDIFMT_D24S8, 0x000000c0, d3d9_ms_types, d3d9_ms_types, 0 },
    { D3DDDIFMT_D24X8, 0x000000c0, 0, 0, 0 },
    { D3DDDIFMT_D16, 0x000000c0, 0, 0, 0 },
    { D3D9_FMT_D16_LOCKABLE, 0x000000c0, 0, 0, 0 },
@@ -223,6 +226,151 @@ D3D9FillCaps(const D3D9Adapter *adapter, D3DCAPS9 *caps)
 
 }
 
+/* D3DDDICAPS_GETD3D3CAPS uses the documented D3DHAL_GLOBALDRIVERDATA
+ * layout.  Keep a private ABI definition here because the legacy d3dhal.h
+ * header conflicts with the D3D9 headers in some supported toolchains.
+ */
+struct D3D9LegacyTransformCaps {
+   DWORD dwSize;
+   DWORD dwCaps;
+};
+
+struct D3D9LegacyLightingCaps {
+   DWORD dwSize;
+   DWORD dwCaps;
+   DWORD dwLightingModel;
+   DWORD dwNumLights;
+};
+
+struct D3D9LegacyPrimitiveCaps {
+   DWORD dwSize;
+   DWORD dwMiscCaps;
+   DWORD dwRasterCaps;
+   DWORD dwZCmpCaps;
+   DWORD dwSrcBlendCaps;
+   DWORD dwDestBlendCaps;
+   DWORD dwAlphaCmpCaps;
+   DWORD dwShadeCaps;
+   DWORD dwTextureCaps;
+   DWORD dwTextureFilterCaps;
+   DWORD dwTextureBlendCaps;
+   DWORD dwTextureAddressCaps;
+   DWORD dwStippleWidth;
+   DWORD dwStippleHeight;
+};
+
+struct D3D9LegacyDeviceDesc {
+   DWORD dwSize;
+   DWORD dwFlags;
+   DWORD dcmColorModel;
+   DWORD dwDevCaps;
+   D3D9LegacyTransformCaps dtcTransformCaps;
+   BOOL bClipping;
+   D3D9LegacyLightingCaps dlcLightingCaps;
+   D3D9LegacyPrimitiveCaps dpcLineCaps;
+   D3D9LegacyPrimitiveCaps dpcTriCaps;
+   DWORD dwDeviceRenderBitDepth;
+   DWORD dwDeviceZBufferBitDepth;
+   DWORD dwMaxBufferSize;
+   DWORD dwMaxVertexCount;
+};
+
+struct D3D9LegacyGlobalDriverData {
+   DWORD dwSize;
+   D3D9LegacyDeviceDesc hwCaps;
+   DWORD dwNumVertices;
+   DWORD dwNumClipVertices;
+   DWORD dwNumTextureFormats;
+   void *lpTextureFormats;
+};
+
+static_assert(sizeof(D3D9LegacyTransformCaps) == 8);
+static_assert(sizeof(D3D9LegacyLightingCaps) == 16);
+static_assert(sizeof(D3D9LegacyPrimitiveCaps) == 56);
+static_assert(sizeof(D3D9LegacyDeviceDesc) == 172);
+static_assert(offsetof(D3D9LegacyGlobalDriverData, dwNumTextureFormats) == 184);
+static_assert(sizeof(D3D9LegacyGlobalDriverData) ==
+              (sizeof(void *) == 8 ? 200 : 192));
+
+static constexpr DWORD d3d9_legacy_valid_color_model = 0x00000001u;
+static constexpr DWORD d3d9_legacy_valid_dev_caps = 0x00000002u;
+static constexpr DWORD d3d9_legacy_valid_render_bit_depth = 0x00000080u;
+static constexpr DWORD d3d9_legacy_valid_z_bit_depth = 0x00000100u;
+static constexpr DWORD d3d9_legacy_color_rgb = 2u;
+static constexpr DWORD d3d9_legacy_depth_16 = 0x00000400u;
+static constexpr DWORD d3d9_legacy_depth_24 = 0x00000200u;
+static constexpr DWORD d3d9_legacy_depth_32 = 0x00000100u;
+
+static constexpr DWORD d3d9_legacy_dev_float_tl_vertex = 0x00000001u;
+static constexpr DWORD d3d9_legacy_dev_execute_system_memory = 0x00000010u;
+static constexpr DWORD d3d9_legacy_dev_execute_video_memory = 0x00000020u;
+static constexpr DWORD d3d9_legacy_dev_tl_vertex_system_memory = 0x00000040u;
+static constexpr DWORD d3d9_legacy_dev_tl_vertex_video_memory = 0x00000080u;
+static constexpr DWORD d3d9_legacy_dev_texture_system_memory = 0x00000100u;
+static constexpr DWORD d3d9_legacy_dev_texture_video_memory = 0x00000200u;
+static constexpr DWORD d3d9_legacy_dev_draw_prim_tl_vertex = 0x00000400u;
+static constexpr DWORD d3d9_legacy_dev_render_after_flip = 0x00000800u;
+static constexpr DWORD d3d9_legacy_dev_texture_nonlocal = 0x00001000u;
+static constexpr DWORD d3d9_legacy_dev_draw_primitives2 = 0x00002000u;
+static constexpr DWORD d3d9_legacy_dev_draw_primitives2_ex = 0x00008000u;
+static constexpr DWORD d3d9_legacy_dev_hw_transform_light = 0x00010000u;
+static constexpr DWORD d3d9_legacy_dev_blit_sys_to_nonlocal = 0x00020000u;
+static constexpr DWORD d3d9_legacy_dev_hw_rasterization = 0x00080000u;
+
+static void
+D3D9FillLegacyCaps(const D3D9Adapter *adapter,
+                   D3D9LegacyGlobalDriverData *caps)
+{
+   D3DCAPS9 d3d9_caps;
+   D3D9FillCaps(adapter, &d3d9_caps);
+
+   memset(caps, 0, sizeof(*caps));
+   caps->dwSize = sizeof(*caps);
+
+   D3D9LegacyDeviceDesc *hw = &caps->hwCaps;
+   hw->dwSize = sizeof(*hw);
+   hw->dwFlags = d3d9_legacy_valid_color_model |
+                 d3d9_legacy_valid_dev_caps |
+                 d3d9_legacy_valid_render_bit_depth |
+                 d3d9_legacy_valid_z_bit_depth;
+   hw->dcmColorModel = d3d9_legacy_color_rgb;
+
+   const DWORD legacy_dev_caps =
+      d3d9_legacy_dev_float_tl_vertex |
+      d3d9_legacy_dev_execute_system_memory |
+      d3d9_legacy_dev_tl_vertex_system_memory |
+      d3d9_legacy_dev_texture_system_memory |
+      d3d9_legacy_dev_texture_video_memory |
+      d3d9_legacy_dev_draw_prim_tl_vertex |
+      d3d9_legacy_dev_render_after_flip |
+      d3d9_legacy_dev_texture_nonlocal |
+      d3d9_legacy_dev_draw_primitives2 |
+      d3d9_legacy_dev_draw_primitives2_ex |
+      d3d9_legacy_dev_hw_transform_light |
+      d3d9_legacy_dev_blit_sys_to_nonlocal |
+      d3d9_legacy_dev_hw_rasterization;
+   hw->dwDevCaps = d3d9_caps.DevCaps & legacy_dev_caps;
+
+   /* These obsolete flags have mandatory values for legacy runtimes. */
+   hw->dwDevCaps |= d3d9_legacy_dev_float_tl_vertex |
+                    d3d9_legacy_dev_execute_system_memory |
+                    d3d9_legacy_dev_tl_vertex_system_memory |
+                    d3d9_legacy_dev_draw_prim_tl_vertex |
+                    d3d9_legacy_dev_render_after_flip;
+   hw->dwDevCaps &= ~(d3d9_legacy_dev_execute_video_memory |
+                      d3d9_legacy_dev_tl_vertex_video_memory);
+
+   hw->dtcTransformCaps.dwSize = sizeof(hw->dtcTransformCaps);
+   hw->dlcLightingCaps.dwSize = sizeof(hw->dlcLightingCaps);
+   hw->dpcLineCaps.dwSize = sizeof(hw->dpcLineCaps);
+   hw->dpcTriCaps.dwSize = sizeof(hw->dpcTriCaps);
+   hw->dwDeviceRenderBitDepth = d3d9_legacy_depth_16 |
+                                d3d9_legacy_depth_32;
+   hw->dwDeviceZBufferBitDepth = d3d9_legacy_depth_16 |
+                                 d3d9_legacy_depth_24 |
+                                 d3d9_legacy_depth_32;
+}
+
 static HRESULT
 D3D9ValidateData(const D3DDDIARG_GETCAPS *data, UINT size)
 {
@@ -353,9 +501,17 @@ D3D9CreateDevice(HANDLE hAdapter, D3DDDIARG_CREATEDEVICE *data)
    device->gdi_device.use_legacy_signal_sync = true;
    gdikmt_d3dddi_fill_basefuncs(&device->gdi_device);
 
+   HRESULT residency_hr = gdikmt_d3dddi_init_residency(
+      &device->gdi_device, data->pCallbacks, data->Version);
+   if (FAILED(residency_hr)) {
+      free(device);
+      return residency_hr;
+   }
+
    device->screen = d3d10_create_screen(&device->gdi_device.base);
    if (!device->screen) {
       D3D9Tracef("CreateDevice failed to create Yttrium screen\n");
+      device->gdi_device.base.destroy(&device->gdi_device.base);
       free(device);
       return E_FAIL;
    }
@@ -364,6 +520,7 @@ D3D9CreateDevice(HANDLE hAdapter, D3DDDIARG_CREATEDEVICE *data)
    if (!device->pipe) {
       D3D9Tracef("CreateDevice failed to create Yttrium context\n");
       device->screen->destroy(device->screen);
+      device->gdi_device.base.destroy(&device->gdi_device.base);
       free(device);
       return E_FAIL;
    }
@@ -501,6 +658,22 @@ D3D9GetCaps(HANDLE hAdapter, const D3DDDIARG_GETCAPS *data)
       memcpy(data->pData, g_query_types, sizeof(g_query_types));
       D3D9Tracef("GetCaps QUERYDATA bytes=%u count=%u\n",
                  data->DataSize, (unsigned)ARRAYSIZE(g_query_types));
+      return S_OK;
+   case D3DDDICAPS_GETD3D3CAPS:
+      if (FAILED(D3D9ValidateData(data,
+                                 sizeof(D3D9LegacyGlobalDriverData))))
+         return E_INVALIDARG;
+      D3D9FillLegacyCaps(adapter,
+                         (D3D9LegacyGlobalDriverData *)data->pData);
+      D3D9Tracef("GetCaps D3D3 size=%lu dev=0x%08lx render=0x%08lx "
+                 "z=0x%08lx\n",
+                 ((D3D9LegacyGlobalDriverData *)data->pData)->dwSize,
+                 ((D3D9LegacyGlobalDriverData *)data->pData)
+                    ->hwCaps.dwDevCaps,
+                 ((D3D9LegacyGlobalDriverData *)data->pData)
+                    ->hwCaps.dwDeviceRenderBitDepth,
+                 ((D3D9LegacyGlobalDriverData *)data->pData)
+                    ->hwCaps.dwDeviceZBufferBitDepth);
       return S_OK;
    case D3DDDICAPS_GETD3D9CAPS:
       if (FAILED(D3D9ValidateData(data, sizeof(D3DCAPS9))))

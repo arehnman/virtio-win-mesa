@@ -55,7 +55,8 @@ typedef struct _VIOGPU_ADAPTERINFO {
         UINT has_host_visible : 1;
         UINT has_resource_assign_uuid : 1;
         UINT has_context_init : 1;
-        UINT Reserved : 26;
+        UINT requires_explicit_residency : 1;
+        UINT Reserved : 25;
     } Flags;
     ULONGLONG SupportedCapsetIDs;
 } VIOGPU_ADAPTERINFO;
@@ -75,6 +76,8 @@ typedef struct _VIOGPU_ADAPTERINFO {
 
 #define VIOGPU_CTX_INIT                                   0x200
 #define VIOGPU_SUBMIT_CMD                                 0x300
+#define VIOGPU_QUERY_TIMELINE_SUBMIT                      0x301
+#define VIOGPU_TIMELINE_SUBMIT_VERSION                    1u
 
 
 #pragma pack(1)
@@ -231,6 +234,12 @@ typedef struct _VIOGPU_CREATE_ALLOCATION_EXCHANGE {
 // ================= COMMAND BUFFER
 #define VIOGPU_CMD_NOP                          0x0
 #define VIOGPU_CMD_SUBMIT                       0x1 // Submit Command to virgl
+#define VIOGPU_CMD_SUBMIT_TIMELINE              0x5
+
+typedef struct _VIOGPU_TIMELINE_SUBMIT {
+    UINT RingIndex;
+    UINT Reserved;
+} VIOGPU_TIMELINE_SUBMIT;
 #define VIOGPU_CMD_TRANSFER_TO_HOST             0x2 // Transfer resource to host
 #define VIOGPU_CMD_TRANSFER_FROM_HOST           0x3 // Transfer resource to host
 #define VIOGPU_CMD_PRESENT_FLIP                 0x4 // Flip scanout to a resource

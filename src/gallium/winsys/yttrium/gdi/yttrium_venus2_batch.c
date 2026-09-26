@@ -37,6 +37,37 @@
 #include "venus-protocol/vn_protocol_driver_sampler.h"
 #include "venus-protocol/vn_protocol_driver_semaphore.h"
 #include "venus-protocol/vn_protocol_driver_shader_module.h"
+#include "venus-protocol/vn_protocol_driver_transport.h"
+
+static bool
+yttrium_venus_queue_submit(struct yttrium_venus *venus,
+                          const VkSubmitInfo *info, VkFence fence)
+{
+   if (!venus->kmt_ctx->scheduled_present_mode) {
+      vn_async_vkQueueSubmit(&venus->vn_ring, venus->queue, 1, info, fence);
+      return !venus->failed;
+   }
+
+   /* Recording stays on the shared ring. Windows owns execution of QueueSubmit.
+    * The host context dispatch waits for recording before touching the handles. */
+   yttrium_venus2_ring_lock();
+   uint32_t seqno;
+   bool ok = yttrium_venus_ring_publish_for_submit(venus, &seqno);
+   size_t size = vn_sizeof_vkWaitRingSeqnoMESA(venus->ring.id, 0) +
+                 vn_sizeof_vkQueueSubmit(venus->queue, 1, info, fence);
+   void *data = ok ? MALLOC(size) : NULL;
+   if (!data) {
+      yttrium_venus2_ring_unlock();
+      return false;
+   }
+   struct vn_cs_encoder enc = VN_CS_ENCODER_INITIALIZER_LOCAL(data, size);
+   vn_encode_vkWaitRingSeqnoMESA(&enc, 0, venus->ring.id, seqno);
+   vn_encode_vkQueueSubmit(&enc, 0, venus->queue, 1, info, fence);
+   ok = !enc.fatal_error && yttrium_venus_submit_gpu(venus, data, vn_cs_encoder_get_len(&enc));
+   FREE(data);
+   yttrium_venus2_ring_unlock();
+   return ok;
+}
 
 bool
 yttrium_venus_begin_command_buffer(
@@ -62,6 +93,7 @@ yttrium_venus_batch_release_ubo_arena(
 static bool
 yttrium_venus_submit_batch_async(struct yttrium_venus *venus,
                                  struct yttrium_venus_batch *batch,
+                                 uint32_t op_count,
                                  const char *label);
 
 static bool
@@ -242,13 +274,6 @@ yttrium_venus_retired_resource_rebuild_handles(
       retired->device_local_draw_memory =
          YTTRIUM_VENUS_HANDLE(
             VkDeviceMemory, &retired->device_local_draw_memory_obj);
-
-   for (unsigned i = 0; i < YTTRIUM_VENUS_SAMPLE_IMAGE_VIEW_CACHE_SIZE; i++) {
-      if (retired->sample_image_view_cache[i].view)
-         retired->sample_image_view_cache[i].view =
-            YTTRIUM_VENUS_HANDLE(
-               VkImageView, &retired->sample_image_view_cache[i].obj);
-   }
 }
 
 struct yttrium_venus_retired_resource *
@@ -285,9 +310,8 @@ yttrium_venus_retired_resource_create(
    retired->buffer = resource->buffer;
    retired->memory = resource->memory;
    retired->image_view = resource->image_view;
-   memcpy(retired->sample_image_view_cache,
-          resource->sample_image_view_cache,
-          sizeof(retired->sample_image_view_cache));
+   retired->sample_image_views = resource->sample_image_views;
+   resource->sample_image_views = NULL;
    retired->sample_buffer_views = resource->sample_buffer_views;
    resource->sample_buffer_views = NULL;
    retired->render_pass = resource->render_pass;
@@ -506,6 +530,8 @@ yttrium_venus_retired_pipeline_create(struct yttrium_pipeline *pipeline)
    retired->push_pipeline = pipeline->push_pipeline;
    memcpy(retired->pipeline_samplers, pipeline->samplers,
           sizeof(retired->pipeline_samplers));
+   retired->custom_border_color_sampler_count =
+      pipeline->custom_border_color_sampler_count;
 
    yttrium_venus_retired_resource_rebuild_handles(retired);
    return retired;
@@ -682,13 +708,22 @@ yttrium_venus_destroy_retired_resource(
          vn_async_vkDestroySampler(&venus->vn_ring, venus->device_handle,
                                    retired->pipeline_samplers[i], NULL);
    }
+   assert(venus->custom_border_color_sampler_count >=
+          retired->custom_border_color_sampler_count);
+   venus->custom_border_color_sampler_count -=
+      retired->custom_border_color_sampler_count;
 
-   for (unsigned i = 0; i < YTTRIUM_VENUS_SAMPLE_IMAGE_VIEW_CACHE_SIZE; i++) {
-      if (retired->sample_image_view_cache[i].view)
-         vn_async_vkDestroyImageView(
-            &venus->vn_ring, venus->device_handle,
-            retired->sample_image_view_cache[i].view, NULL);
+   struct yttrium_venus_sample_image_view *image_view =
+      retired->sample_image_views;
+   while (image_view) {
+      struct yttrium_venus_sample_image_view *next = image_view->next;
+      if (image_view->view)
+         vn_async_vkDestroyImageView(&venus->vn_ring, venus->device_handle,
+                                     image_view->view, NULL);
+      FREE(image_view);
+      image_view = next;
    }
+   retired->sample_image_views = NULL;
 
    struct yttrium_venus_sample_buffer_view *buffer_view =
       retired->sample_buffer_views;
@@ -1348,58 +1383,65 @@ yttrium_venus_cmd_batch_id_in_list(uint64_t id, const uint64_t *ids,
    return false;
 }
 
-static void
+void
 yttrium_venus_cmd_batch_collect_image_roles(
    const struct yttrium_venus_sampled_image *sampled_images,
    uint32_t sampled_image_count,
    struct yttrium_venus_resource **color_resources,
    uint32_t color_resource_count,
    struct yttrium_venus_resource *depth_resource,
-   uint64_t *sampled_ids,
-   uint32_t *sampled_id_count,
-   uint64_t *attachment_ids,
-   uint32_t *attachment_id_count)
+   bool depth_read_only,
+   struct yttrium_venus_cmd_batch_footprint *footprint)
 {
    uint32_t sampled_count = 0;
    uint32_t attachment_count = 0;
+   uint64_t *sampled_ids = footprint->sampled_image_ids;
+   uint64_t *attachment_ids = footprint->attachment_image_ids;
 
-   if (sampled_ids && sampled_id_count) {
-      for (uint32_t i = 0;
-           sampled_images && i < sampled_image_count &&
-           sampled_count < YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES;
-           i++) {
-         if (sampled_images[i].buffer || !sampled_images[i].resource)
-            continue;
+   /* Preserve the descriptor and buffer footprint populated by the caller. */
+   footprint->read_only_depth_image_id = 0;
+   for (uint32_t i = 0;
+        sampled_images && i < sampled_image_count &&
+        sampled_count < ARRAY_SIZE(footprint->sampled_image_ids);
+        i++) {
+      if (sampled_images[i].buffer || !sampled_images[i].resource)
+         continue;
 
-         const uint64_t id = sampled_images[i].resource->image_obj.id;
-         if (!yttrium_venus_cmd_batch_id_in_list(id, sampled_ids,
-                                                 sampled_count))
-            sampled_ids[sampled_count++] = id;
-      }
-      *sampled_id_count = sampled_count;
+      const uint64_t id = sampled_images[i].resource->image_obj.id;
+      if (!yttrium_venus_cmd_batch_id_in_list(id, sampled_ids,
+                                              sampled_count))
+         sampled_ids[sampled_count++] = id;
    }
+   footprint->sampled_image_count = sampled_count;
 
-   if (attachment_ids && attachment_id_count) {
-      for (uint32_t i = 0;
-           color_resources && i < color_resource_count &&
-           attachment_count < PIPE_MAX_COLOR_BUFS + 1;
-           i++) {
-         if (!color_resources[i])
-            continue;
+   for (uint32_t i = 0;
+        color_resources && i < color_resource_count &&
+        attachment_count < ARRAY_SIZE(footprint->attachment_image_ids);
+        i++) {
+      if (!color_resources[i])
+         continue;
 
-         const uint64_t id = color_resources[i]->image_obj.id;
-         if (!yttrium_venus_cmd_batch_id_in_list(id, attachment_ids,
-                                                 attachment_count))
-            attachment_ids[attachment_count++] = id;
-      }
-      if (depth_resource && attachment_count < PIPE_MAX_COLOR_BUFS + 1) {
+      const uint64_t id = color_resources[i]->image_obj.id;
+      if (!yttrium_venus_cmd_batch_id_in_list(id, attachment_ids,
+                                              attachment_count))
+         attachment_ids[attachment_count++] = id;
+   }
+   if (depth_resource) {
+      if (depth_read_only) {
+         /* This bit also certifies the caller's read-only layout path.  Keep
+          * the depth read even if it is not listed among sampled resources,
+          * so a later attachment write cannot pass the read-role index.
+          */
+         footprint->read_only_depth_image_id = depth_resource->image_obj.id;
+      } else if (attachment_count <
+                 ARRAY_SIZE(footprint->attachment_image_ids)) {
          const uint64_t id = depth_resource->image_obj.id;
          if (!yttrium_venus_cmd_batch_id_in_list(id, attachment_ids,
                                                  attachment_count))
             attachment_ids[attachment_count++] = id;
       }
-      *attachment_id_count = attachment_count;
    }
+   footprint->attachment_image_count = attachment_count;
 }
 
 static bool
@@ -1441,6 +1483,10 @@ yttrium_venus_cmd_batch_indexed_image_role_conflict(
              footprint->sampled_image_ids[i], seen))
          return true;
    }
+   if (yttrium_venus_cmd_batch_index_lookup(
+          venus, venus->cmd_batch_attachment_image_roles,
+          footprint->read_only_depth_image_id, seen))
+      return true;
    for (uint32_t i = 0; i < footprint->attachment_image_count; i++) {
       if (yttrium_venus_cmd_batch_index_lookup(
              venus, venus->cmd_batch_sampled_image_roles,
@@ -1463,6 +1509,17 @@ yttrium_venus_cmd_batch_index_footprint(
       const uint64_t id = footprint->sampled_image_ids[i];
       if (!id)
          continue;
+      _mesa_hash_table_u64_insert(venus->cmd_batch_sampled_image_roles,
+                                  id, value);
+      if (!_mesa_hash_table_u64_search(
+             venus->cmd_batch_sampled_image_roles, id))
+         return false;
+   }
+   /* The sampled-image table is the read-role index.  Read-only depth joins
+    * it without consuming a sampled binding or an attachment-write role.
+    */
+   if (footprint->read_only_depth_image_id) {
+      const uint64_t id = footprint->read_only_depth_image_id;
       _mesa_hash_table_u64_insert(venus->cmd_batch_sampled_image_roles,
                                   id, value);
       if (!_mesa_hash_table_u64_search(
@@ -1580,7 +1637,8 @@ yttrium_venus_cmd_batch_deferred_image_role_conflict(
    uint32_t sampled_image_count,
    struct yttrium_venus_resource **color_resources,
    uint32_t color_resource_count,
-   struct yttrium_venus_resource *depth_resource)
+   struct yttrium_venus_resource *depth_resource,
+   bool depth_read_only)
 {
    struct yttrium_venus_cmd_batch_footprint new_footprint;
 
@@ -1591,11 +1649,7 @@ yttrium_venus_cmd_batch_deferred_image_role_conflict(
    memset(&new_footprint, 0, sizeof(new_footprint));
    yttrium_venus_cmd_batch_collect_image_roles(
       sampled_images, sampled_image_count, color_resources,
-      color_resource_count, depth_resource,
-      new_footprint.sampled_image_ids,
-      &new_footprint.sampled_image_count,
-      new_footprint.attachment_image_ids,
-      &new_footprint.attachment_image_count);
+      color_resource_count, depth_resource, depth_read_only, &new_footprint);
 
    if (!yttrium_venus_cmd_batch_ensure_footprint_index(venus))
       return true;
@@ -1872,6 +1926,12 @@ yttrium_venus_flush_command_batch(struct yttrium_venus *venus,
    bool ok = yttrium_venus_cmd_batch_emit_deferred_draws(venus, label);
    if (ok)
       ok = yttrium_venus_end_command_buffer(venus, label);
+   /* A failed emission may leave the buffer recording.  Reset it before
+    * discarding the batch; unlike completed recordings, it cannot rely on
+    * the implicit reset when a free slot is begun again.
+    */
+   if (!ok)
+      vn_async_vkResetCommandBuffer(&venus->vn_ring, venus->command_buffer, 0);
    if (ok) {
       const uint32_t submitted_live_batch_count =
          venus->live_batch_count +
@@ -1944,7 +2004,8 @@ yttrium_venus_flush_command_batch(struct yttrium_venus *venus,
             batch->ubo_arena->batch_refcount++;
          ok = yttrium_venus_move_draw_mirror_updates_to_batch(venus, batch);
          if (ok)
-            ok = yttrium_venus_submit_batch_async(venus, batch, label);
+            ok = yttrium_venus_submit_batch_async(venus, batch, op_count,
+                                                   label);
          /* A failed ring notify can be reported after the command buffer was
           * submitted and ownership moved to the busy batch.  Keep all batch
           * references alive until that batch is retired or destroyed. */
@@ -3205,7 +3266,8 @@ yttrium_venus_ensure_batches(struct yttrium_venus *venus)
       struct yttrium_venus_batch *batch = venus->batches[i];
       if (!batch)
          return false;
-      if (!yttrium_venus_initialize_batch(venus, batch, i))
+      if (!batch->initialized &&
+          !yttrium_venus_initialize_batch(venus, batch, i))
          return false;
    }
 
@@ -3421,8 +3483,8 @@ yttrium_venus_flush_pending_submits(struct yttrium_venus *venus,
       .pCommandBuffers = command_buffers,
    };
    start_us = yttrium_trace_is_enabled() ? yttrium_trace_now_us() : 0;
-   vn_async_vkQueueSubmit(&venus->vn_ring, venus->queue, 1,
-                          &submit_info, tail->fence);
+   if (!yttrium_venus_queue_submit(venus, &submit_info, tail->fence))
+      return false;
    yttrium_venus_trace_timing(YTTRIUM_TRACE_TIMING_VENUS_QUEUE_SUBMIT,
                               0, start_us, label, 0, count, 2, 0);
 
@@ -3445,6 +3507,7 @@ yttrium_venus_flush_pending_submits(struct yttrium_venus *venus,
       venus->pending_submit_batches[i] = NULL;
    }
    venus->pending_submit_count = 0;
+   venus->pending_submit_op_count = 0;
 
    if (!yttrium_venus_ring_flush_notify(venus, label, false)) {
       YTTRIUM_WARN("yttrium: ERROR: Venus2 grouped queue submit ring notify failed owner=venus2 count=%u label=%s\n",
@@ -3458,6 +3521,7 @@ yttrium_venus_flush_pending_submits(struct yttrium_venus *venus,
 static bool
 yttrium_venus_submit_batch_async(struct yttrium_venus *venus,
                                  struct yttrium_venus_batch *batch,
+                                 uint32_t op_count,
                                  const char *label)
 {
    if (!venus || !batch || !batch->initialized || batch->busy)
@@ -3486,9 +3550,12 @@ yttrium_venus_submit_batch_async(struct yttrium_venus *venus,
       batch->completion_fence = VK_NULL_HANDLE;
       batch->completion_feedback_index = UINT32_MAX;
       venus->pending_submit_batches[venus->pending_submit_count++] = batch;
+      venus->pending_submit_op_count += op_count;
 
-      if (venus->pending_submit_count >=
-          venus->group_queue_submit_size)
+      if (venus->pending_submit_count >= venus->group_queue_submit_size ||
+          (venus->group_queue_submit_op_threshold &&
+           venus->pending_submit_op_count >=
+              venus->group_queue_submit_op_threshold))
          return yttrium_venus_flush_pending_submits(venus, label);
       return true;
    }
@@ -3526,8 +3593,8 @@ yttrium_venus_submit_batch_async(struct yttrium_venus *venus,
       .pCommandBuffers = command_buffers,
    };
    start_us = yttrium_trace_is_enabled() ? yttrium_trace_now_us() : 0;
-   vn_async_vkQueueSubmit(&venus->vn_ring, venus->queue, 1,
-                          &submit_info, batch->fence);
+   if (!yttrium_venus_queue_submit(venus, &submit_info, batch->fence))
+      return false;
    yttrium_venus_trace_timing(YTTRIUM_TRACE_TIMING_VENUS_QUEUE_SUBMIT,
                               0, start_us, label, 0, 1, 2, 0);
 
@@ -3861,8 +3928,11 @@ yttrium_venus_begin_command_batch(struct yttrium_venus *venus,
 
    venus->cmd_batch = batch;
    venus->command_buffer = batch->command_buffer;
-   vn_async_vkResetCommandBuffer(&venus->vn_ring, batch->command_buffer, 0);
 
+   /* The pool allows individual resets, and acquisition only returns slots
+    * that are no longer pending.  Begin implicitly resets the old recording;
+    * an explicit reset here would duplicate the host driver's reset work.
+    */
    const VkCommandBufferBeginInfo begin_info = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,

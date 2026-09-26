@@ -988,9 +988,18 @@ vn_queue_submission_prepare_submit(struct vn_queue_submission *submit)
 }
 
 static VkResult
+vn_queue_submit_finish(struct vn_queue *queue, VkResult result)
+{
+   simple_mtx_unlock(&queue->submission_mutex);
+   return result;
+}
+
+static VkResult
 vn_queue_submit(struct vn_queue_submission *submit)
 {
    struct vn_queue *queue = vn_queue_from_handle(submit->queue_handle);
+   simple_mtx_lock(&queue->submission_mutex);
+
    struct vn_device *dev = vn_device_from_vk(queue->base.vk.base.device);
    struct vn_instance *instance = dev->instance;
    VkResult result;
@@ -1006,11 +1015,11 @@ vn_queue_submit(struct vn_queue_submission *submit)
     */
    result = vn_queue_submission_prepare_submit(submit);
    if (result != VK_SUCCESS)
-      return vn_error(instance, result);
+      return vn_queue_submit_finish(queue, vn_error(instance, result));
 
    /* skip no-op submit */
    if (!submit->batch_count && submit->fence_handle == VK_NULL_HANDLE)
-      return VK_SUCCESS;
+      return vn_queue_submit_finish(queue, VK_SUCCESS);
 
    if (VN_PERF(NO_ASYNC_QUEUE_SUBMIT)) {
       if (submit->batch_type == VK_STRUCTURE_TYPE_SUBMIT_INFO_2) {
@@ -1025,7 +1034,7 @@ vn_queue_submit(struct vn_queue_submission *submit)
 
       if (result != VK_SUCCESS) {
          vn_queue_submission_cleanup(submit);
-         return vn_error(instance, result);
+         return vn_queue_submit_finish(queue, vn_error(instance, result));
       }
    } else {
       struct vn_ring_submit_command ring_submit;
@@ -1040,7 +1049,8 @@ vn_queue_submit(struct vn_queue_submission *submit)
       }
       if (!ring_submit.ring_seqno_valid) {
          vn_queue_submission_cleanup(submit);
-         return vn_error(instance, VK_ERROR_DEVICE_LOST);
+         return vn_queue_submit_finish(
+            queue, vn_error(instance, VK_ERROR_DEVICE_LOST));
       }
       submit->external_payload.ring_seqno_valid = true;
       submit->external_payload.ring_seqno = ring_submit.ring_seqno;
@@ -1072,7 +1082,7 @@ vn_queue_submit(struct vn_queue_submission *submit)
 
    vn_queue_submission_cleanup(submit);
 
-   return VK_SUCCESS;
+   return vn_queue_submit_finish(queue, VK_SUCCESS);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL

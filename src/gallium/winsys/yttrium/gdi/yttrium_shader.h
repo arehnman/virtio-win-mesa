@@ -30,7 +30,8 @@ struct yttrium_screen;
 #define YTTRIUM_SHADER_SAMPLED_IMAGE_BINDING_BASE \
    (PIPE_MAX_CONSTANT_BUFFERS * 6)
 #define YTTRIUM_SHADER_STORAGE_IMAGE_BINDING_BASE \
-   (YTTRIUM_SHADER_SAMPLED_IMAGE_BINDING_BASE + PIPE_MAX_SAMPLERS)
+   (YTTRIUM_SHADER_SAMPLED_IMAGE_BINDING_BASE + \
+    YTTRIUM_VENUS_SAMPLED_STAGE_COUNT * PIPE_MAX_SAMPLERS)
 #define YTTRIUM_SHADER_MAX_UBO_BYTES (64 * 1024)
 #define YTTRIUM_SHADER_MAX_UBO_DWORDS (YTTRIUM_SHADER_MAX_UBO_BYTES / 4)
 #define YTTRIUM_SHADER_MAX_PUSH_CONSTANT_WORDS \
@@ -77,9 +78,23 @@ struct yttrium_shader_state {
    uint16_t push_constant_source_words[YTTRIUM_SHADER_MAX_PUSH_CONSTANT_WORDS];
    uint32_t sampler_used_mask;
    uint64_t image_used_mask;
+   uint32_t sampler_binding_valid_mask;
+   uint32_t sampler_mixed_return_mask;
    uint16_t sampler_view_index[PIPE_MAX_SAMPLERS];
+   uint8_t sampler_state_index[PIPE_MAX_SAMPLERS];
    struct pipe_stream_output_info stream_output;
    struct tgsi_shader_info info;
+   /* Typed texture UAVs take their channel layout from the bound view. */
+   /* Storage-image slots the shader declares as arrayed.  The Vulkan view
+    * type has to agree with the SPIR-V OpTypeImage Arrayed flag, and D3D
+    * gives a one-element array the same resource shape as a non-array, so
+    * the resource alone cannot tell them apart. */
+   uint64_t image_array_mask;
+   uint64_t formatless_image_mask;
+   uint64_t formatless_image_read_mask;
+   uint64_t formatless_image_write_mask;
+   uint64_t formatless_image_uint_mask;
+   uint64_t formatless_image_sint_mask;
 };
 
 const char *
@@ -198,6 +213,16 @@ yttrium_shader_state_sampler_view_index(
    const struct yttrium_shader_state *shader,
    unsigned sampler_slot);
 
+unsigned
+yttrium_shader_state_sampler_state_index(
+   const struct yttrium_shader_state *shader,
+   unsigned sampler_slot);
+
+bool
+yttrium_shader_state_has_explicit_sampler_binding(
+   const struct yttrium_shader_state *shader,
+   unsigned sampler_slot);
+
 uint32_t
 yttrium_shader_ubo_default_binding(mesa_shader_stage stage);
 
@@ -208,7 +233,12 @@ uint32_t
 yttrium_shader_ubo_binding(mesa_shader_stage stage, unsigned raw_index);
 
 uint32_t
-yttrium_shader_sampler_binding(unsigned raw_index);
+yttrium_shader_sampler_binding(mesa_shader_stage stage, unsigned raw_index);
+
+bool
+yttrium_shader_sampler_binding_decode(uint32_t binding,
+                                      mesa_shader_stage *stage,
+                                      unsigned *raw_index);
 
 uint32_t
 yttrium_shader_storage_image_binding(unsigned raw_index);

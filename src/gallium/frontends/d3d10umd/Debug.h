@@ -36,6 +36,12 @@ void st_debug_parse(void);
 void
 DebugPrintf(const char *format, ...);
 
+void
+LogUnsupported(const char *file,
+               unsigned line,
+               const char *function,
+               const char *expression);
+
 /*
  * Resource lifetime and binding trace.  These fire on bind paths, several
  * times per draw, so they are emitted as a structured ETW event with generic
@@ -126,10 +132,14 @@ AssertFail(const char *expr, const char *file, unsigned line, const char *functi
 #define LOG_ENTRYPOINT() (void)0
 #endif
 
-#define LOG_UNSUPPORTED_ENTRYPOINT() DebugPrintf("%s XXX\n", __func__)
+#define LOG_UNSUPPORTED_ENTRYPOINT() \
+   LogUnsupported(__FILE__, __LINE__, __func__, "entrypoint")
 
 #define LOG_UNSUPPORTED(expr) \
-   do { if (expr) DebugPrintf("%s:%d XXX %s\n", __func__, __LINE__, #expr); } while(0)
+   do { \
+      if (expr) \
+         LogUnsupported(__FILE__, __LINE__, __func__, #expr); \
+   } while (0)
 
 
 #ifdef __cplusplus

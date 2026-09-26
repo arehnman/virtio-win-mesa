@@ -38,19 +38,49 @@
 #include "util/u_memory.h"
 
 
+static bool
+dword_count_fits_size_t(unsigned count)
+{
+   const size_t byte_count = (size_t)count * sizeof(unsigned);
+
+   return !count || byte_count / sizeof(unsigned) == count;
+}
+
+
 void
 Shader_parse_init(struct Shader_parser *parser,
                        const unsigned *code)
 {
+   if (!parser)
+      return;
+
+   memset(parser, 0, sizeof(*parser));
    parser->curr = parser->code = code;
+   parser->failed = true;
 
-   parser->header.type = DECODE_D3D10_SB_TOKENIZED_PROGRAM_TYPE(*parser->curr);
-   parser->header.major_version = DECODE_D3D10_SB_TOKENIZED_PROGRAM_MAJOR_VERSION(*parser->curr);
-   parser->header.minor_version = DECODE_D3D10_SB_TOKENIZED_PROGRAM_MINOR_VERSION(*parser->curr);
-   parser->curr++;
+   if (!code) {
+      yttrium_gdi_trace_warnf(
+         "yttrium: shader parse received NULL bytecode\n");
+      return;
+   }
 
-   parser->header.size = DECODE_D3D10_SB_TOKENIZED_PROGRAM_LENGTH(*parser->curr);
-   parser->curr++;
+   parser->header.type = DECODE_D3D10_SB_TOKENIZED_PROGRAM_TYPE(code[0]);
+   parser->header.major_version =
+      DECODE_D3D10_SB_TOKENIZED_PROGRAM_MAJOR_VERSION(code[0]);
+   parser->header.minor_version =
+      DECODE_D3D10_SB_TOKENIZED_PROGRAM_MINOR_VERSION(code[0]);
+   parser->header.size = DECODE_D3D10_SB_TOKENIZED_PROGRAM_LENGTH(code[1]);
+
+   if (parser->header.size < 2 ||
+       !dword_count_fits_size_t(parser->header.size)) {
+      yttrium_gdi_trace_warnf(
+         "yttrium: shader parse invalid header size=%u\n",
+         parser->header.size);
+      return;
+   }
+
+   parser->curr = code + 2;
+   parser->failed = false;
 }
 
 #define OP_NOT_DONE (1 << 0) /* not implemented yet */
@@ -232,6 +262,8 @@ opcode_info[D3D10_SB_NUM_OPCODES] = {
       _(D3D11_SB_OPCODE_GATHER4_PO),                    1, 4, 0},
    [D3D11_SB_OPCODE_GATHER4_PO_C] = {
       _(D3D11_SB_OPCODE_GATHER4_PO_C),                  1, 5, 0},
+   [D3D11_SB_OPCODE_EVAL_SAMPLE_INDEX] = {
+      _(D3D11_SB_OPCODE_EVAL_SAMPLE_INDEX),            1, 2, 0},
    [DX10_SM5_OPCODE_DCL_THREAD_GROUP] = {
       _(DX10_SM5_OPCODE_DCL_THREAD_GROUP),              0, 0, OP_DCL},
    [DX10_SM5_OPCODE_DCL_UAV_RAW] = {
@@ -338,14 +370,30 @@ opcode_info[D3D10_SB_NUM_OPCODES] = {
 
 #undef _
 
-static void
+static bool
+read_token(const unsigned **curr, const unsigned *end, unsigned *value)
+{
+   if (!curr || !*curr || !value || *curr >= end)
+      return false;
+
+   *value = *(*curr)++;
+   return true;
+}
+
+static bool
 parse_operand(const unsigned **curr,
+              const unsigned *end,
               struct Shader_operand *operand)
 {
-   operand->type = DECODE_D3D10_SB_OPERAND_TYPE(**curr);
+   unsigned token;
+
+   if (!operand || !read_token(curr, end, &token))
+      return false;
+
+   operand->type = DECODE_D3D10_SB_OPERAND_TYPE(token);
 
    /* Index dimension. */
-   switch (DECODE_D3D10_SB_OPERAND_INDEX_DIMENSION(**curr)) {
+   switch (DECODE_D3D10_SB_OPERAND_INDEX_DIMENSION(token)) {
    case D3D10_SB_OPERAND_INDEX_0D:
       operand->index_dim = 0;
       break;
@@ -356,273 +404,409 @@ parse_operand(const unsigned **curr,
       operand->index_dim = 2;
       break;
    default:
-      assert(0);
+      return false;
    }
 
    if (operand->index_dim >= 1) {
-      operand->index[0].index_rep = DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(0, **curr);
+      operand->index[0].index_rep =
+         DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(0, token);
       if (operand->index_dim >= 2) {
-         operand->index[1].index_rep = DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(1, **curr);
+         operand->index[1].index_rep =
+            DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(1, token);
       }
    }
 
-   (*curr)++;
+   return true;
 }
 
-static void
+static bool
 parse_relative_operand(const unsigned **curr,
+                       const unsigned *end,
                        struct Shader_relative_operand *operand)
 {
-   assert(!DECODE_IS_D3D10_SB_OPERAND_EXTENDED(**curr));
-   assert(DECODE_D3D10_SB_OPERAND_NUM_COMPONENTS(**curr) == D3D10_SB_OPERAND_4_COMPONENT);
-   assert(DECODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(**curr) == D3D10_SB_OPERAND_4_COMPONENT_SELECT_1_MODE);
+   D3D10_SB_OPERAND_INDEX_DIMENSION index_dim;
+   unsigned token;
 
-   operand->comp = DECODE_D3D10_SB_OPERAND_4_COMPONENT_SELECT_1(**curr);
+   if (!operand || !read_token(curr, end, &token))
+      return false;
 
-   operand->type = DECODE_D3D10_SB_OPERAND_TYPE(**curr);
-   assert(operand->type != D3D10_SB_OPERAND_TYPE_IMMEDIATE32);
+   if (DECODE_IS_D3D10_SB_OPERAND_EXTENDED(token) ||
+       DECODE_D3D10_SB_OPERAND_NUM_COMPONENTS(token) !=
+          D3D10_SB_OPERAND_4_COMPONENT ||
+       DECODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(token) !=
+          D3D10_SB_OPERAND_4_COMPONENT_SELECT_1_MODE)
+      return false;
 
-   /* Index dimension. */
-   assert(DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(0, **curr) == D3D10_SB_OPERAND_INDEX_IMMEDIATE32);
+   operand->comp = DECODE_D3D10_SB_OPERAND_4_COMPONENT_SELECT_1(token);
+   operand->type = DECODE_D3D10_SB_OPERAND_TYPE(token);
+   if (operand->type == D3D10_SB_OPERAND_TYPE_IMMEDIATE32)
+      return false;
 
-   if (DECODE_D3D10_SB_OPERAND_INDEX_DIMENSION(**curr) == D3D10_SB_OPERAND_INDEX_1D) {
-      (*curr)++;
-      operand->index[0].imm = **curr;
-   } else {
-      assert(DECODE_D3D10_SB_OPERAND_INDEX_DIMENSION(**curr) == D3D10_SB_OPERAND_INDEX_2D);
-      (*curr)++;
-      operand->index[0].imm = **curr;
-      (*curr)++;
-      operand->index[1].imm = **curr;
+   index_dim = DECODE_D3D10_SB_OPERAND_INDEX_DIMENSION(token);
+   if (index_dim != D3D10_SB_OPERAND_INDEX_1D &&
+       index_dim != D3D10_SB_OPERAND_INDEX_2D)
+      return false;
 
-   }
-   (*curr)++;
+   if (DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(0, token) !=
+       D3D10_SB_OPERAND_INDEX_IMMEDIATE32)
+      return false;
+   if (index_dim == D3D10_SB_OPERAND_INDEX_2D &&
+       DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(1, token) !=
+          D3D10_SB_OPERAND_INDEX_IMMEDIATE32)
+      return false;
+
+   if (!read_token(curr, end, &operand->index[0].imm))
+      return false;
+   if (index_dim == D3D10_SB_OPERAND_INDEX_2D &&
+       !read_token(curr, end, &operand->index[1].imm))
+      return false;
+
+   return true;
 }
 
-static void
+static bool
 parse_index(const unsigned **curr,
+            const unsigned *end,
             struct Shader_index *index)
 {
+   if (!index)
+      return false;
+
    switch (index->index_rep) {
    case D3D10_SB_OPERAND_INDEX_IMMEDIATE32:
-      index->imm = *(*curr)++;
-      break;
+      return read_token(curr, end, &index->imm);
    case D3D10_SB_OPERAND_INDEX_RELATIVE:
       index->imm = 0;
-      parse_relative_operand(curr, &index->rel);
-      break;
+      return parse_relative_operand(curr, end, &index->rel);
    case D3D10_SB_OPERAND_INDEX_IMMEDIATE32_PLUS_RELATIVE:
-      index->imm = *(*curr)++;
-      parse_relative_operand(curr, &index->rel);
-      break;
+      return read_token(curr, end, &index->imm) &&
+             parse_relative_operand(curr, end, &index->rel);
    default:
-      /* XXX: Support other index representations.
-       */
-      assert(0);
+      /* Other index representations are not implemented. */
+      return false;
    }
 }
 
-static void
+static bool
 parse_operand_index(const unsigned **curr,
+                    const unsigned *end,
                     struct Shader_operand *operand)
 {
-   if (operand->index_dim >= 1) {
-      parse_index(curr, &operand->index[0]);
-      if (operand->index_dim >= 2) {
-         parse_index(curr, &operand->index[1]);
-      }
-   }
+   if (!operand || operand->index_dim > 2)
+      return false;
+
+   if (operand->index_dim >= 1 &&
+       !parse_index(curr, end, &operand->index[0]))
+      return false;
+   if (operand->index_dim >= 2 &&
+       !parse_index(curr, end, &operand->index[1]))
+      return false;
+
+   return true;
 }
 
-static void
+static bool
 parse_stream_operand(const unsigned **curr,
+                     const unsigned *end,
                      struct Shader_opcode *opcode)
 {
    struct Shader_operand stream;
 
-   parse_operand(curr, &stream);
-   assert(stream.index_dim == 1);
-   parse_operand_index(curr, &stream);
+   if (!opcode)
+      return false;
+
+   memset(&stream, 0, sizeof(stream));
+   if (!parse_operand(curr, end, &stream) || stream.index_dim != 1 ||
+       stream.index[0].index_rep != D3D10_SB_OPERAND_INDEX_IMMEDIATE32 ||
+       !parse_operand_index(curr, end, &stream))
+      return false;
 
    opcode->specific.stream = stream.index[0].imm;
+   return true;
 }
 
 bool
 Shader_parse_opcode(struct Shader_parser *parser,
                          struct Shader_opcode *opcode)
 {
-   const unsigned *curr = parser->curr;
    const struct dx10_opcode_info *info;
+   const unsigned *instruction_start;
+   const unsigned *instruction_end;
+   const unsigned *shader_end;
+   const unsigned *curr;
+   unsigned token0;
    unsigned length;
-   bool opcode_is_extended;
    unsigned i;
 
-   if (curr >= parser->code + parser->header.size) {
+   if (!parser || !opcode) {
+      if (parser)
+         parser->failed = true;
+      yttrium_gdi_trace_warnf(
+         "yttrium: shader parse received invalid parser or opcode output\n");
       return false;
    }
 
-   memset(opcode, 0, sizeof *opcode);
+   if (parser->failed)
+      return false;
 
-   /* Opcode type. */
-   opcode->type = DECODE_D3D10_SB_OPCODE_TYPE(*curr);
+   if (!parser->code || !parser->curr || parser->header.size < 2 ||
+       !dword_count_fits_size_t(parser->header.size)) {
+      yttrium_gdi_trace_warnf(
+         "yttrium: shader parse has invalid parser state shader_size=%u\n",
+         parser->header.size);
+      parser->failed = true;
+      return false;
+   }
+
+   shader_end = parser->code + parser->header.size;
+   instruction_start = curr = parser->curr;
+   if (curr == shader_end)
+      return false;
+   if (curr < parser->code + 2 || curr > shader_end) {
+      yttrium_gdi_trace_warnf(
+         "yttrium: shader parse cursor out of bounds shader_size=%u\n",
+         parser->header.size);
+      parser->failed = true;
+      return false;
+   }
+
+   memset(opcode, 0, sizeof(*opcode));
+   token0 = *curr;
+   opcode->type = DECODE_D3D10_SB_OPCODE_TYPE(token0);
+   if (opcode->type >= D3D10_SB_NUM_OPCODES) {
+      yttrium_gdi_trace_warnf(
+         "yttrium: shader parse invalid opcode type=%u offset=%u shader_size=%u\n",
+         opcode->type, (unsigned)(instruction_start - parser->code),
+         parser->header.size);
+      parser->failed = true;
+      return false;
+   }
+
+   info = &opcode_info[opcode->type];
+   if (!info->name || info->type != opcode->type ||
+       info->num_dst > SHADER_MAX_DST_OPERANDS ||
+       info->num_src > SHADER_MAX_SRC_OPERANDS) {
+      yttrium_gdi_trace_warnf(
+         "yttrium: shader parse missing or mismatched opcode metadata "
+         "type=%u metadata_type=%u offset=%u\n",
+         opcode->type, info->type,
+         (unsigned)(instruction_start - parser->code));
+      parser->failed = true;
+      return false;
+   }
 
    if (opcode->type == D3D10_SB_OPCODE_CUSTOMDATA) {
-      opcode->customdata._class = DECODE_D3D10_SB_CUSTOMDATA_CLASS(*curr);
-      curr++;
+      unsigned custom_length;
+      size_t allocation_size;
 
-      assert(opcode->customdata._class == D3D10_SB_CUSTOMDATA_DCL_IMMEDIATE_CONSTANT_BUFFER);
+      opcode->customdata._class = DECODE_D3D10_SB_CUSTOMDATA_CLASS(token0);
+      if (opcode->customdata._class !=
+          D3D10_SB_CUSTOMDATA_DCL_IMMEDIATE_CONSTANT_BUFFER ||
+          shader_end - instruction_start < 2) {
+         yttrium_gdi_trace_warnf(
+            "yttrium: shader parse unsupported or truncated custom data "
+            "class=%u offset=%u shader_size=%u\n",
+            opcode->customdata._class,
+            (unsigned)(instruction_start - parser->code),
+            parser->header.size);
+         parser->failed = true;
+         return false;
+      }
 
-      opcode->customdata.u.constbuf.count = *curr - 2;
-      curr++;
+      custom_length = instruction_start[1];
+      if (custom_length < 2 ||
+          custom_length > (unsigned)(shader_end - instruction_start)) {
+         yttrium_gdi_trace_warnf(
+            "yttrium: shader parse custom data length out of bounds "
+            "offset=%u length=%u shader_size=%u\n",
+            (unsigned)(instruction_start - parser->code), custom_length,
+            parser->header.size);
+         parser->failed = true;
+         return false;
+      }
 
-      opcode->customdata.u.constbuf.data = MALLOC(opcode->customdata.u.constbuf.count * sizeof(unsigned));
-      assert(opcode->customdata.u.constbuf.data);
+      if ((custom_length - 2) % 4) {
+         yttrium_gdi_trace_warnf(
+            "yttrium: shader parse immediate constant buffer length "
+            "is not vec4-aligned offset=%u length=%u payload=%u\n",
+            (unsigned)(instruction_start - parser->code), custom_length,
+            custom_length - 2);
+         parser->failed = true;
+         return false;
+      }
 
-      memcpy(opcode->customdata.u.constbuf.data,
-             curr,
-             opcode->customdata.u.constbuf.count * sizeof(unsigned));
-      curr += opcode->customdata.u.constbuf.count;
+      instruction_end = instruction_start + custom_length;
+      opcode->customdata.u.constbuf.count = custom_length - 2;
+      if (!dword_count_fits_size_t(
+             opcode->customdata.u.constbuf.count)) {
+         yttrium_gdi_trace_warnf(
+            "yttrium: shader parse custom data allocation overflow "
+            "offset=%u count=%u\n",
+            (unsigned)(instruction_start - parser->code),
+            opcode->customdata.u.constbuf.count);
+         parser->failed = true;
+         return false;
+      }
 
-      parser->curr = curr;
+      allocation_size = (size_t)opcode->customdata.u.constbuf.count *
+                        sizeof(*opcode->customdata.u.constbuf.data);
+      if (allocation_size) {
+         opcode->customdata.u.constbuf.data = MALLOC(allocation_size);
+         if (!opcode->customdata.u.constbuf.data) {
+            yttrium_gdi_trace_warnf(
+               "yttrium: shader parse custom data allocation failed "
+               "offset=%u count=%u\n",
+               (unsigned)(instruction_start - parser->code),
+               opcode->customdata.u.constbuf.count);
+            parser->failed = true;
+            return false;
+         }
+         memcpy(opcode->customdata.u.constbuf.data,
+                instruction_start + 2, allocation_size);
+      }
+
+      parser->curr = instruction_end;
       return true;
+   }
+
+   /* Decode and validate token0 before touching any instruction payload. */
+   length = DECODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(token0);
+   if (!length ||
+       length > (unsigned)(shader_end - instruction_start)) {
+      yttrium_gdi_trace_warnf(
+         "yttrium: shader parse instruction length out of bounds "
+         "opcode=%s type=%u offset=%u length=%u shader_size=%u\n",
+         info->name, opcode->type,
+         (unsigned)(instruction_start - parser->code), length,
+         parser->header.size);
+      parser->failed = true;
+      return false;
+   }
+   instruction_end = instruction_start + length;
+
+   if (info->flags & OP_NOT_DONE) {
+      yttrium_gdi_trace_warnf(
+         "yttrium: shader parse unsupported opcode opcode=%s type=%u "
+         "offset=%u length=%u\n",
+         info->name, opcode->type,
+         (unsigned)(instruction_start - parser->code), length);
+      parser->failed = true;
+      return false;
    }
 
    opcode->dcl_siv_name = D3D10_SB_NAME_UNDEFINED;
 
-   /* Lookup extra information based on opcode type. */
-   assert(opcode->type < D3D10_SB_NUM_OPCODES);
-   info = &opcode_info[opcode->type];
-
-   /* Opcode specific. */
+   /* Opcode-specific fields carried by token0. */
    switch (opcode->type) {
    case D3D10_SB_OPCODE_DCL_RESOURCE:
    case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_TYPED:
-      opcode->specific.dcl_resource_dimension = DECODE_D3D10_SB_RESOURCE_DIMENSION(*curr);
+      opcode->specific.dcl_resource_dimension =
+         DECODE_D3D10_SB_RESOURCE_DIMENSION(token0);
       break;
    case D3D10_SB_OPCODE_DCL_SAMPLER:
-      opcode->specific.dcl_sampler_mode = DECODE_D3D10_SB_SAMPLER_MODE(*curr);
+      opcode->specific.dcl_sampler_mode =
+         DECODE_D3D10_SB_SAMPLER_MODE(token0);
       break;
    case D3D10_SB_OPCODE_DCL_GS_OUTPUT_PRIMITIVE_TOPOLOGY:
-      opcode->specific.dcl_gs_output_primitive_topology = DECODE_D3D10_SB_GS_OUTPUT_PRIMITIVE_TOPOLOGY(*curr);
+      opcode->specific.dcl_gs_output_primitive_topology =
+         DECODE_D3D10_SB_GS_OUTPUT_PRIMITIVE_TOPOLOGY(token0);
       break;
    case D3D10_SB_OPCODE_DCL_GS_INPUT_PRIMITIVE:
-      opcode->specific.dcl_gs_input_primitive = DECODE_D3D10_SB_GS_INPUT_PRIMITIVE(*curr);
+      opcode->specific.dcl_gs_input_primitive =
+         DECODE_D3D10_SB_GS_INPUT_PRIMITIVE(token0);
       break;
    case D3D10_SB_OPCODE_DCL_INPUT_PS:
    case D3D10_SB_OPCODE_DCL_INPUT_PS_SIV:
-      opcode->specific.dcl_in_ps_interp = DECODE_D3D10_SB_INPUT_INTERPOLATION_MODE(*curr);
+      opcode->specific.dcl_in_ps_interp =
+         DECODE_D3D10_SB_INPUT_INTERPOLATION_MODE(token0);
+      break;
+   case D3D10_SB_OPCODE_DCL_CONSTANT_BUFFER:
+      opcode->specific.dcl_cb_access_pattern =
+         DECODE_D3D10_SB_CONSTANT_BUFFER_ACCESS_PATTERN(token0);
       break;
    case D3D10_SB_OPCODE_DCL_GLOBAL_FLAGS:
       opcode->specific.global_flags.refactoring_allowed =
-         (DECODE_D3D10_SB_GLOBAL_FLAGS(*curr) &
+         (DECODE_D3D10_SB_GLOBAL_FLAGS(token0) &
           D3D10_SB_GLOBAL_FLAG_REFACTORING_ALLOWED) ? 1 : 0;
       opcode->specific.global_flags.force_early_depth_stencil =
-         (DECODE_D3D10_SB_GLOBAL_FLAGS(*curr) &
+         (DECODE_D3D10_SB_GLOBAL_FLAGS(token0) &
           D3D11_SB_GLOBAL_FLAG_FORCE_EARLY_DEPTH_STENCIL) ? 1 : 0;
       break;
-   case DX10_SM5_OPCODE_DCL_THREAD_GROUP:
-      opcode->specific.dcl_thread_group.x = curr[1];
-      opcode->specific.dcl_thread_group.y = curr[2];
-      opcode->specific.dcl_thread_group.z = curr[3];
-      break;
    case DX11_SM5_OPCODE_DCL_INPUT_CONTROL_POINT_COUNT:
-      opcode->specific.dcl_input_control_point_count = (*curr >> 11) & 0x3f;
+      opcode->specific.dcl_input_control_point_count = (token0 >> 11) & 0x3f;
       break;
    case DX11_SM5_OPCODE_DCL_OUTPUT_CONTROL_POINT_COUNT:
-      opcode->specific.dcl_output_control_point_count = (*curr >> 11) & 0x3f;
+      opcode->specific.dcl_output_control_point_count = (token0 >> 11) & 0x3f;
       break;
    case DX11_SM5_OPCODE_DCL_TESS_DOMAIN:
-      opcode->specific.dcl_tess_domain = (*curr >> 11) & 0x3;
+      opcode->specific.dcl_tess_domain = (token0 >> 11) & 0x3;
       break;
    case DX11_SM5_OPCODE_DCL_TESS_PARTITIONING:
-      opcode->specific.dcl_tess_partitioning = (*curr >> 11) & 0x7;
+      opcode->specific.dcl_tess_partitioning = (token0 >> 11) & 0x7;
       break;
    case DX11_SM5_OPCODE_DCL_TESS_OUTPUT_PRIMITIVE:
-      opcode->specific.dcl_tess_output_primitive = (*curr >> 11) & 0x7;
+      opcode->specific.dcl_tess_output_primitive = (token0 >> 11) & 0x7;
       break;
    default:
-      /* Parse opcode-specific control bits */
       if (info->flags & OP_DCL) {
-         /* no-op */
+         /* No generic control field. */
       } else if (info->flags & OP_SATURATE) {
          opcode->saturate =
-            !!DECODE_IS_D3D10_SB_INSTRUCTION_SATURATE_ENABLED(*curr);
+            !!DECODE_IS_D3D10_SB_INSTRUCTION_SATURATE_ENABLED(token0);
       } else if (info->flags & OP_TEST_BOOLEAN) {
          opcode->specific.test_boolean =
-            DECODE_D3D10_SB_INSTRUCTION_TEST_BOOLEAN(*curr);
+            DECODE_D3D10_SB_INSTRUCTION_TEST_BOOLEAN(token0);
       } else if (info->flags & OP_RESINFO_RET_TYPE) {
          opcode->specific.resinfo_ret_type =
-            DECODE_D3D10_SB_RESINFO_INSTRUCTION_RETURN_TYPE(*curr);
-      } else if (info->flags & OP_IGNORE_CONTROL) {
-         /* no-op */
-      } else {
-         /* Warn if there are bits set in the opcode-specific controls (bits 23:11 inclusive)*/
-         if (*curr & ((1 << 24) - (1 << 11))) {
-            debug_printf("warning: unexpected opcode-specific control in opcode %s\n",
-                         info->name);
-         }
+            DECODE_D3D10_SB_RESINFO_INSTRUCTION_RETURN_TYPE(token0);
+      } else if (!(info->flags & OP_IGNORE_CONTROL) &&
+                 (token0 & ((1 << 24) - (1 << 11)))) {
+         debug_printf(
+            "warning: unexpected opcode-specific control in opcode %s\n",
+            info->name);
       }
       break;
    }
-
-   /* Opcode length in DWORDs. */
-   length = DECODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(*curr);
-   if (curr + length > parser->code + parser->header.size) {
-      yttrium_gdi_trace_warnf("yttrium: shader parse instruction length out of bounds opcode=%s type=%u offset=%u length=%u shader_size=%u\n",
-                              info->name, opcode->type,
-                              (unsigned)(curr - parser->code), length,
-                              parser->header.size);
-      assert(0);
-      return false;
-   }
-
-   /* Opcode specific fields in token0. */
-   switch (opcode->type) {
-   case D3D10_SB_OPCODE_DCL_CONSTANT_BUFFER:
-      opcode->specific.dcl_cb_access_pattern =
-         DECODE_D3D10_SB_CONSTANT_BUFFER_ACCESS_PATTERN(*curr);
-      break;
-   default:
-      break;
-   }
-
-   opcode_is_extended = DECODE_IS_D3D10_SB_OPCODE_EXTENDED(*curr);
 
    curr++;
+   {
+      bool opcode_is_extended =
+         DECODE_IS_D3D10_SB_OPCODE_EXTENDED(token0);
 
-   while (opcode_is_extended) {
-      /* NOTE: DECODE_IS_D3D10_SB_OPCODE_DOUBLE_EXTENDED is broken.
-       */
-      opcode_is_extended =
-         (*curr & D3D10_SB_OPERAND_DOUBLE_EXTENDED_MASK) >>
-         D3D10_SB_OPERAND_DOUBLE_EXTENDED_SHIFT;
+      while (opcode_is_extended) {
+         unsigned extended_token;
 
-      switch (DECODE_D3D10_SB_EXTENDED_OPCODE_TYPE(*curr)) {
-      case D3D10_SB_EXTENDED_OPCODE_EMPTY:
-         break;
-      case D3D10_SB_EXTENDED_OPCODE_SAMPLE_CONTROLS:
-         opcode->imm_texel_offset.u = DECODE_IMMEDIATE_D3D10_SB_ADDRESS_OFFSET(D3D10_SB_IMMEDIATE_ADDRESS_OFFSET_U, *curr);
-         opcode->imm_texel_offset.v = DECODE_IMMEDIATE_D3D10_SB_ADDRESS_OFFSET(D3D10_SB_IMMEDIATE_ADDRESS_OFFSET_V, *curr);
-         opcode->imm_texel_offset.w = DECODE_IMMEDIATE_D3D10_SB_ADDRESS_OFFSET(D3D10_SB_IMMEDIATE_ADDRESS_OFFSET_W, *curr);
-         break;
-      case D3D11_SB_EXTENDED_OPCODE_RESOURCE_DIM:
-      case D3D11_SB_EXTENDED_OPCODE_RESOURCE_RETURN_TYPE:
-         break;
-      default:
-         assert(0);
+         if (!read_token(&curr, instruction_end, &extended_token))
+            goto malformed;
+
+         /* The SDK's opcode-double-extended decoder is broken; this is the
+          * equivalent continuation bit used by the existing parser.
+          */
+         opcode_is_extended =
+            !!((extended_token & D3D10_SB_OPERAND_DOUBLE_EXTENDED_MASK) >>
+               D3D10_SB_OPERAND_DOUBLE_EXTENDED_SHIFT);
+
+         switch (DECODE_D3D10_SB_EXTENDED_OPCODE_TYPE(extended_token)) {
+         case D3D10_SB_EXTENDED_OPCODE_EMPTY:
+            break;
+         case D3D10_SB_EXTENDED_OPCODE_SAMPLE_CONTROLS:
+            opcode->imm_texel_offset.u =
+               DECODE_IMMEDIATE_D3D10_SB_ADDRESS_OFFSET(
+                  D3D10_SB_IMMEDIATE_ADDRESS_OFFSET_U, extended_token);
+            opcode->imm_texel_offset.v =
+               DECODE_IMMEDIATE_D3D10_SB_ADDRESS_OFFSET(
+                  D3D10_SB_IMMEDIATE_ADDRESS_OFFSET_V, extended_token);
+            opcode->imm_texel_offset.w =
+               DECODE_IMMEDIATE_D3D10_SB_ADDRESS_OFFSET(
+                  D3D10_SB_IMMEDIATE_ADDRESS_OFFSET_W, extended_token);
+            break;
+         case D3D11_SB_EXTENDED_OPCODE_RESOURCE_DIM:
+         case D3D11_SB_EXTENDED_OPCODE_RESOURCE_RETURN_TYPE:
+            break;
+         default:
+            goto malformed;
+         }
       }
-
-      curr++;
-   }
-
-   if (info->flags & OP_NOT_DONE) {
-      yttrium_gdi_trace_warnf("yttrium: shader parse unsupported opcode opcode=%s type=%u offset=%u length=%u\n",
-                              info->name ? info->name : "(null)",
-                              opcode->type,
-                              (unsigned)(parser->curr - parser->code),
-                              length);
-      assert(0);
-      return false;
    }
 
    opcode->num_dst = info->num_dst;
@@ -630,255 +814,326 @@ Shader_parse_opcode(struct Shader_parser *parser,
 
    /* Destination operands. */
    for (i = 0; i < info->num_dst; i++) {
-      bool extended;
       D3D10_SB_OPERAND_NUM_COMPONENTS num_components;
+      unsigned operand_token;
+      bool extended;
 
-      extended = DECODE_IS_D3D10_SB_OPERAND_EXTENDED(*curr);
+      if (curr >= instruction_end)
+         goto malformed;
+      operand_token = *curr;
+      extended = DECODE_IS_D3D10_SB_OPERAND_EXTENDED(operand_token);
+      num_components = DECODE_D3D10_SB_OPERAND_NUM_COMPONENTS(operand_token);
 
-      num_components = DECODE_D3D10_SB_OPERAND_NUM_COMPONENTS(*curr);
       if (num_components == D3D10_SB_OPERAND_4_COMPONENT) {
-         D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE selection_mode;
-
-         selection_mode = DECODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(*curr);
-         assert(selection_mode == D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE);
-
-         opcode->dst[i].mask = DECODE_D3D10_SB_OPERAND_4_COMPONENT_MASK(*curr);
-      } else {
-         assert(num_components == D3D10_SB_OPERAND_0_COMPONENT ||
-                num_components == D3D10_SB_OPERAND_1_COMPONENT);
-
+         if (DECODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(
+                operand_token) != D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE)
+            goto malformed;
+         opcode->dst[i].mask =
+            DECODE_D3D10_SB_OPERAND_4_COMPONENT_MASK(operand_token);
+      } else if (num_components == D3D10_SB_OPERAND_0_COMPONENT ||
+                 num_components == D3D10_SB_OPERAND_1_COMPONENT) {
          opcode->dst[i].mask = D3D10_SB_OPERAND_4_COMPONENT_MASK_X;
+      } else {
+         goto malformed;
       }
 
-      parse_operand(&curr, &opcode->dst[i].base);
+      if (!parse_operand(&curr, instruction_end, &opcode->dst[i].base))
+         goto malformed;
 
       if (extended) {
-         /* NOTE: DECODE_IS_D3D10_SB_OPERAND_DOUBLE_EXTENDED is broken.
-          */
-         assert(!((*curr & D3D10_SB_OPERAND_DOUBLE_EXTENDED_MASK) >> D3D10_SB_OPERAND_DOUBLE_EXTENDED_SHIFT));
+         unsigned extended_token;
 
-         switch (DECODE_D3D10_SB_EXTENDED_OPERAND_TYPE(*curr)) {
+         if (!read_token(&curr, instruction_end, &extended_token) ||
+             ((extended_token & D3D10_SB_OPERAND_DOUBLE_EXTENDED_MASK) >>
+              D3D10_SB_OPERAND_DOUBLE_EXTENDED_SHIFT))
+            goto malformed;
+
+         switch (DECODE_D3D10_SB_EXTENDED_OPERAND_TYPE(extended_token)) {
          case D3D10_SB_EXTENDED_OPERAND_EMPTY:
          case D3D10_SB_EXTENDED_OPERAND_MODIFIER:
             break;
-
          default:
-            assert(0);
+            goto malformed;
          }
-
-         curr++;
       }
 
-      parse_operand_index(&curr, &opcode->dst[i].base);
+      if (!parse_operand_index(&curr, instruction_end,
+                               &opcode->dst[i].base))
+         goto malformed;
    }
 
    /* Source operands. */
    for (i = 0; i < info->num_src; i++) {
-      bool extended;
       D3D10_SB_OPERAND_NUM_COMPONENTS num_components;
+      unsigned operand_token;
+      bool extended;
 
-      extended = DECODE_IS_D3D10_SB_OPERAND_EXTENDED(*curr);
+      if (curr >= instruction_end)
+         goto malformed;
+      operand_token = *curr;
+      extended = DECODE_IS_D3D10_SB_OPERAND_EXTENDED(operand_token);
+      num_components = DECODE_D3D10_SB_OPERAND_NUM_COMPONENTS(operand_token);
 
-      num_components = DECODE_D3D10_SB_OPERAND_NUM_COMPONENTS(*curr);
       if (num_components == D3D10_SB_OPERAND_4_COMPONENT) {
-         D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE selection_mode;
-
-         selection_mode = DECODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(*curr);
+         D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE selection_mode =
+            DECODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(operand_token);
 
          if (selection_mode == D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_MODE) {
-            opcode->src[i].swizzle[0] = DECODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_SOURCE(*curr, 0);
-            opcode->src[i].swizzle[1] = DECODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_SOURCE(*curr, 1);
-            opcode->src[i].swizzle[2] = DECODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_SOURCE(*curr, 2);
-            opcode->src[i].swizzle[3] = DECODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_SOURCE(*curr, 3);
-         } else if (selection_mode == D3D10_SB_OPERAND_4_COMPONENT_SELECT_1_MODE) {
+            opcode->src[i].swizzle[0] =
+               DECODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_SOURCE(
+                  operand_token, 0);
+            opcode->src[i].swizzle[1] =
+               DECODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_SOURCE(
+                  operand_token, 1);
+            opcode->src[i].swizzle[2] =
+               DECODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_SOURCE(
+                  operand_token, 2);
+            opcode->src[i].swizzle[3] =
+               DECODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_SOURCE(
+                  operand_token, 3);
+         } else if (selection_mode ==
+                    D3D10_SB_OPERAND_4_COMPONENT_SELECT_1_MODE) {
             opcode->src[i].swizzle[0] =
                opcode->src[i].swizzle[1] =
                opcode->src[i].swizzle[2] =
-               opcode->src[i].swizzle[3] = DECODE_D3D10_SB_OPERAND_4_COMPONENT_SELECT_1(*curr);
-         } else {
-            /* This case apparently happens only for 4-component 32-bit
-             * immediate operands.
-             */
-            assert(selection_mode == D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE);
-            assert(DECODE_D3D10_SB_OPERAND_4_COMPONENT_MASK(*curr) == 0);
-            assert(DECODE_D3D10_SB_OPERAND_TYPE(*curr) == D3D10_SB_OPERAND_TYPE_IMMEDIATE32);
-
-
+               opcode->src[i].swizzle[3] =
+                  DECODE_D3D10_SB_OPERAND_4_COMPONENT_SELECT_1(operand_token);
+         } else if (selection_mode ==
+                       D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE &&
+                    DECODE_D3D10_SB_OPERAND_4_COMPONENT_MASK(operand_token) ==
+                       0 &&
+                    DECODE_D3D10_SB_OPERAND_TYPE(operand_token) ==
+                       D3D10_SB_OPERAND_TYPE_IMMEDIATE32) {
             opcode->src[i].swizzle[0] = D3D10_SB_4_COMPONENT_X;
             opcode->src[i].swizzle[1] = D3D10_SB_4_COMPONENT_Y;
             opcode->src[i].swizzle[2] = D3D10_SB_4_COMPONENT_Z;
             opcode->src[i].swizzle[3] = D3D10_SB_4_COMPONENT_W;
+         } else {
+            goto malformed;
          }
       } else if (num_components == D3D10_SB_OPERAND_1_COMPONENT) {
          opcode->src[i].swizzle[0] =
             opcode->src[i].swizzle[1] =
             opcode->src[i].swizzle[2] =
             opcode->src[i].swizzle[3] = D3D10_SB_4_COMPONENT_X;
-      } else {
-         /* Samplers only?
-          */
-         assert(num_components == D3D10_SB_OPERAND_0_COMPONENT);
-         assert(DECODE_D3D10_SB_OPERAND_TYPE(*curr) == D3D10_SB_OPERAND_TYPE_SAMPLER ||
-                DECODE_D3D10_SB_OPERAND_TYPE(*curr) == D3D10_SB_OPERAND_TYPE_LABEL);
-
+      } else if (num_components == D3D10_SB_OPERAND_0_COMPONENT &&
+                 (DECODE_D3D10_SB_OPERAND_TYPE(operand_token) ==
+                     D3D10_SB_OPERAND_TYPE_SAMPLER ||
+                  DECODE_D3D10_SB_OPERAND_TYPE(operand_token) ==
+                     D3D10_SB_OPERAND_TYPE_LABEL)) {
          opcode->src[i].swizzle[0] = D3D10_SB_4_COMPONENT_X;
          opcode->src[i].swizzle[1] = D3D10_SB_4_COMPONENT_Y;
          opcode->src[i].swizzle[2] = D3D10_SB_4_COMPONENT_Z;
          opcode->src[i].swizzle[3] = D3D10_SB_4_COMPONENT_W;
+      } else {
+         goto malformed;
       }
 
-      parse_operand(&curr, &opcode->src[i].base);
+      if (!parse_operand(&curr, instruction_end, &opcode->src[i].base))
+         goto malformed;
 
       opcode->src[i].modifier = D3D10_SB_OPERAND_MODIFIER_NONE;
       if (extended) {
-         /* NOTE: DECODE_IS_D3D10_SB_OPERAND_DOUBLE_EXTENDED is broken.
-          */
-         assert(!((*curr & D3D10_SB_OPERAND_DOUBLE_EXTENDED_MASK) >> D3D10_SB_OPERAND_DOUBLE_EXTENDED_SHIFT));
+         unsigned extended_token;
 
-         switch (DECODE_D3D10_SB_EXTENDED_OPERAND_TYPE(*curr)) {
+         if (!read_token(&curr, instruction_end, &extended_token) ||
+             ((extended_token & D3D10_SB_OPERAND_DOUBLE_EXTENDED_MASK) >>
+              D3D10_SB_OPERAND_DOUBLE_EXTENDED_SHIFT))
+            goto malformed;
+
+         switch (DECODE_D3D10_SB_EXTENDED_OPERAND_TYPE(extended_token)) {
          case D3D10_SB_EXTENDED_OPERAND_EMPTY:
             break;
-
          case D3D10_SB_EXTENDED_OPERAND_MODIFIER:
-            opcode->src[i].modifier = DECODE_D3D10_SB_OPERAND_MODIFIER(*curr);
+            opcode->src[i].modifier =
+               DECODE_D3D10_SB_OPERAND_MODIFIER(extended_token);
             break;
-
          default:
-            assert(0);
+            goto malformed;
          }
-
-         curr++;
       }
 
-      parse_operand_index(&curr, &opcode->src[i].base);
+      if (!parse_operand_index(&curr, instruction_end,
+                               &opcode->src[i].base))
+         goto malformed;
 
       if (opcode->src[i].base.type == D3D10_SB_OPERAND_TYPE_IMMEDIATE32) {
+         unsigned immediate;
+
          if (opcode->type == D3D10_1_SB_OPCODE_SAMPLE_POS && i == 1) {
+            if (!read_token(&curr, instruction_end, &immediate))
+               goto malformed;
             opcode->src[i].imm[0].u32 =
                opcode->src[i].imm[1].u32 =
                opcode->src[i].imm[2].u32 =
-               opcode->src[i].imm[3].u32 = *curr++;
+               opcode->src[i].imm[3].u32 = immediate;
             continue;
          }
 
          switch (num_components) {
          case D3D10_SB_OPERAND_1_COMPONENT:
+            if (!read_token(&curr, instruction_end, &immediate))
+               goto malformed;
             opcode->src[i].imm[0].u32 =
                opcode->src[i].imm[1].u32 =
                opcode->src[i].imm[2].u32 =
-               opcode->src[i].imm[3].u32 = *curr++;
+               opcode->src[i].imm[3].u32 = immediate;
             break;
-
          case D3D10_SB_OPERAND_4_COMPONENT:
-            opcode->src[i].imm[0].u32 = *curr++;
-            opcode->src[i].imm[1].u32 = *curr++;
-            opcode->src[i].imm[2].u32 = *curr++;
-            opcode->src[i].imm[3].u32 = *curr++;
+            if (!read_token(&curr, instruction_end,
+                            &opcode->src[i].imm[0].u32) ||
+                !read_token(&curr, instruction_end,
+                            &opcode->src[i].imm[1].u32) ||
+                !read_token(&curr, instruction_end,
+                            &opcode->src[i].imm[2].u32) ||
+                !read_token(&curr, instruction_end,
+                            &opcode->src[i].imm[3].u32))
+               goto malformed;
             break;
-
          default:
-            /* XXX: Support other component sizes.
-             */
-            assert(0);
+            goto malformed;
          }
       }
    }
 
-   /* Opcode specific trailing operands. */
+   /* Opcode-specific trailing payload. */
    switch (opcode->type) {
    case D3D10_SB_OPCODE_DCL_RESOURCE:
-   case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_TYPED:
-      opcode->dcl_resource_ret_type[0] = DECODE_D3D10_SB_RESOURCE_RETURN_TYPE(*curr, 0);
-      opcode->dcl_resource_ret_type[1] = DECODE_D3D10_SB_RESOURCE_RETURN_TYPE(*curr, 1);
-      opcode->dcl_resource_ret_type[2] = DECODE_D3D10_SB_RESOURCE_RETURN_TYPE(*curr, 2);
-      opcode->dcl_resource_ret_type[3] = DECODE_D3D10_SB_RESOURCE_RETURN_TYPE(*curr, 3);
-      curr++;
+   case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_TYPED: {
+      unsigned return_types;
+      if (!read_token(&curr, instruction_end, &return_types))
+         goto malformed;
+      opcode->dcl_resource_ret_type[0] =
+         DECODE_D3D10_SB_RESOURCE_RETURN_TYPE(return_types, 0);
+      opcode->dcl_resource_ret_type[1] =
+         DECODE_D3D10_SB_RESOURCE_RETURN_TYPE(return_types, 1);
+      opcode->dcl_resource_ret_type[2] =
+         DECODE_D3D10_SB_RESOURCE_RETURN_TYPE(return_types, 2);
+      opcode->dcl_resource_ret_type[3] =
+         DECODE_D3D10_SB_RESOURCE_RETURN_TYPE(return_types, 3);
       break;
+   }
    case D3D10_SB_OPCODE_DCL_MAX_OUTPUT_VERTEX_COUNT:
-      opcode->specific.dcl_max_output_vertex_count = *curr;
-      curr++;
+      if (!read_token(&curr, instruction_end,
+                      &opcode->specific.dcl_max_output_vertex_count))
+         goto malformed;
       break;
    case D3D11_SB_OPCODE_DCL_GS_INSTANCE_COUNT:
-      opcode->specific.dcl_gs_instance_count = *curr;
-      curr++;
+      if (!read_token(&curr, instruction_end,
+                      &opcode->specific.dcl_gs_instance_count))
+         goto malformed;
       break;
    case D3D10_SB_OPCODE_DCL_INPUT_SGV:
    case D3D10_SB_OPCODE_DCL_INPUT_SIV:
    case D3D10_SB_OPCODE_DCL_INPUT_PS_SGV:
    case D3D10_SB_OPCODE_DCL_INPUT_PS_SIV:
    case D3D10_SB_OPCODE_DCL_OUTPUT_SIV:
-   case D3D10_SB_OPCODE_DCL_OUTPUT_SGV:
-      opcode->dcl_siv_name = DECODE_D3D10_SB_NAME(*curr);
-      curr++;
+   case D3D10_SB_OPCODE_DCL_OUTPUT_SGV: {
+      unsigned name;
+      if (!read_token(&curr, instruction_end, &name))
+         goto malformed;
+      opcode->dcl_siv_name = DECODE_D3D10_SB_NAME(name);
       break;
+   }
    case D3D10_SB_OPCODE_DCL_TEMPS:
-      opcode->specific.dcl_num_temps = *curr;
-      curr++;
+      if (!read_token(&curr, instruction_end,
+                      &opcode->specific.dcl_num_temps))
+         goto malformed;
       break;
    case DX10_SM5_OPCODE_DCL_UAV_STRUCTURED:
    case DX10_SM5_OPCODE_DCL_RESOURCE_STRUCTURED:
-      opcode->specific.dcl_structured_stride = *curr++;
+      if (!read_token(&curr, instruction_end,
+                      &opcode->specific.dcl_structured_stride))
+         goto malformed;
       break;
    case DX10_SM5_OPCODE_DCL_TGSM_RAW:
-      opcode->specific.dcl_tgsm.byte_count = *curr++;
+      if (!read_token(&curr, instruction_end,
+                      &opcode->specific.dcl_tgsm.byte_count))
+         goto malformed;
       break;
    case DX10_SM5_OPCODE_DCL_TGSM_STRUCTURED:
-      opcode->specific.dcl_tgsm.structured_stride = *curr++;
-      opcode->specific.dcl_tgsm.structured_count = *curr++;
+      if (!read_token(&curr, instruction_end,
+                      &opcode->specific.dcl_tgsm.structured_stride) ||
+          !read_token(&curr, instruction_end,
+                      &opcode->specific.dcl_tgsm.structured_count) ||
+          (opcode->specific.dcl_tgsm.structured_stride &&
+           opcode->specific.dcl_tgsm.structured_count >
+              ~0u / opcode->specific.dcl_tgsm.structured_stride))
+         goto malformed;
       opcode->specific.dcl_tgsm.byte_count =
          opcode->specific.dcl_tgsm.structured_stride *
          opcode->specific.dcl_tgsm.structured_count;
       break;
    case DX10_SM5_OPCODE_DCL_THREAD_GROUP:
-      curr += 3;
+      if (!read_token(&curr, instruction_end,
+                      &opcode->specific.dcl_thread_group.x) ||
+          !read_token(&curr, instruction_end,
+                      &opcode->specific.dcl_thread_group.y) ||
+          !read_token(&curr, instruction_end,
+                      &opcode->specific.dcl_thread_group.z))
+         goto malformed;
       break;
    case DX11_SM5_OPCODE_DCL_HS_MAX_TESSFACTOR:
-      opcode->specific.dcl_hs_max_tessfactor_bits = *curr++;
+      if (!read_token(&curr, instruction_end,
+                      &opcode->specific.dcl_hs_max_tessfactor_bits))
+         goto malformed;
       break;
    case DX11_SM5_OPCODE_DCL_HS_FORK_PHASE_INSTANCE_COUNT:
    case DX11_SM5_OPCODE_DCL_HS_JOIN_PHASE_INSTANCE_COUNT:
-      opcode->specific.dcl_hs_phase_instance_count = *curr++;
+      if (!read_token(&curr, instruction_end,
+                      &opcode->specific.dcl_hs_phase_instance_count))
+         goto malformed;
       break;
    case D3D10_SB_OPCODE_DCL_INDEXABLE_TEMP:
-      opcode->specific.dcl_indexable_temp.index = *curr++;
-      opcode->specific.dcl_indexable_temp.count = *curr++;
-      opcode->specific.dcl_indexable_temp.components = *curr++;
+      if (!read_token(&curr, instruction_end,
+                      &opcode->specific.dcl_indexable_temp.index) ||
+          !read_token(&curr, instruction_end,
+                      &opcode->specific.dcl_indexable_temp.count) ||
+          !read_token(&curr, instruction_end,
+                      &opcode->specific.dcl_indexable_temp.components))
+         goto malformed;
       break;
    case D3D10_SB_OPCODE_DCL_INDEX_RANGE:
-      opcode->specific.index_range_count = *curr++;
+      if (!read_token(&curr, instruction_end,
+                      &opcode->specific.index_range_count))
+         goto malformed;
       break;
    case D3D11_SB_OPCODE_DCL_STREAM:
    case D3D11_SB_OPCODE_EMIT_STREAM:
    case D3D11_SB_OPCODE_CUT_STREAM:
    case D3D11_SB_OPCODE_EMITTHENCUT_STREAM:
-      parse_stream_operand(&curr, opcode);
+      if (!parse_stream_operand(&curr, instruction_end, opcode))
+         goto malformed;
       break;
    default:
       break;
    }
 
+   /* Some shader compilers append one compatibility DWORD to SAMPLE_POS.
+    * Keep that accepted form explicit while rejecting all other slack.
+    */
    if (opcode->type == D3D10_1_SB_OPCODE_SAMPLE_POS &&
-       curr < parser->curr + length) {
-      assert(parser->curr + length - curr == 1);
-      curr++;
+       instruction_end - curr == 1) {
+      if (!read_token(&curr, instruction_end,
+                      &opcode->specific.sample_pos_compatibility))
+         goto malformed;
    }
 
-   if (curr != parser->curr + length) {
-      yttrium_gdi_trace_warnf("yttrium: shader parse instruction length mismatch opcode=%s type=%u offset=%u consumed=%u length=%u\n",
-                              info->name, opcode->type,
-                              (unsigned)(parser->curr - parser->code),
-                              (unsigned)(curr - parser->curr), length);
-      if (curr > parser->curr + length) {
-         parser->curr += length;
-         assert(0);
-         return false;
-      }
-   }
+   if (curr != instruction_end)
+      goto malformed;
 
-   /* Advance to the next opcode. */
-   parser->curr += length;
-
+   parser->curr = instruction_end;
    return true;
+
+malformed:
+   yttrium_gdi_trace_warnf(
+      "yttrium: shader parse malformed instruction opcode=%s type=%u "
+      "offset=%u consumed=%u length=%u\n",
+      info->name, opcode->type,
+      (unsigned)(instruction_start - parser->code),
+      (unsigned)(curr - instruction_start), length);
+   parser->failed = true;
+   return false;
 }
 
 void
@@ -924,6 +1179,9 @@ Shader_parse_tessellation_properties(
       }
       Shader_opcode_free(&opcode);
    }
+
+   if (parser.failed)
+      return false;
 
    return properties->domain && properties->partitioning &&
           properties->output_primitive;

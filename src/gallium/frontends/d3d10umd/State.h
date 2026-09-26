@@ -40,6 +40,8 @@
 #include "cso_cache/cso_context.h"
 #include "util/u_thread.h"
 
+#include "gallium/winsys/yttrium/gdi/yttrium_gdi_public.h"
+
 #include <d3dukmdt.h>
 #include "gdikmt_d3dddi.h"
 
@@ -74,6 +76,9 @@ struct Shader
    uint type;
    struct pipe_shader_state state;
    struct pipe_compute_state compute_state;
+   struct pipe_shader_sampler_binding_map sampler_binding_map;
+   /* D3D UAV index -> hidden counter image index + 1 (zero means unused). */
+   uint8_t counter_image_slots[PIPE_MAX_SHADER_IMAGES];
    unsigned thread_group_size[3];
    unsigned compute_emulation;
    unsigned compute_store_imm[4];
@@ -91,8 +96,11 @@ struct Shader
    bool tessellation_has_signatures;
    bool tessellation_properties_valid;
    bool tessellation_compiled_properties_valid;
+   /* Original D3D output register -> translated TGSI output register. */
    unsigned output_mapping[PIPE_MAX_SHADER_OUTPUTS];
-   bool output_resolved;
+   struct pipe_stream_output_info stream_output_template;
+   uint8_t stream_output_d3d_registers[PIPE_MAX_SO_OUTPUTS];
+   uint8_t stream_output_signature_masks[PIPE_MAX_SHADER_OUTPUTS];
    bool no_rasterized_stream;
 };
 
@@ -132,11 +140,13 @@ struct Device
    unsigned constant_buffer_sizes[MESA_SHADER_STAGES][PIPE_MAX_CONSTANT_BUFFERS];
    bool constant_buffer_published[MESA_SHADER_STAGES][PIPE_MAX_CONSTANT_BUFFERS];
    bool constant_publication_enabled;
+   bool yttrium_sampler_binding_map_enabled;
    uint32_t bufinfo_constants[MESA_SHADER_STAGES][D3D10UMD_BUFINFO_CB_DWORDS];
    bool bufinfo_constants_dirty[MESA_SHADER_STAGES];
    bool bufinfo_constants_bound[MESA_SHADER_STAGES];
    bool shader_resource_views_dirty;
    struct pipe_image_view shader_images[MESA_SHADER_STAGES][PIPE_MAX_SHADER_IMAGES];
+   uint64_t counter_image_bound_mask[MESA_SHADER_STAGES];
 
    void *empty_fs;
    void *empty_vs;
@@ -207,13 +217,22 @@ CastPipeDevice(DXGI_DDI_HDEVICE hDevice)
 
 
 static inline void
-SetError(D3D10DDI_HDEVICE hDevice, HRESULT hr)
+SetErrorAt(D3D10DDI_HDEVICE hDevice, HRESULT hr,
+           const char *function, unsigned line)
 {
    if (FAILED(hr)) {
       Device *pDevice = CastDevice(hDevice);
+      if (hr != DXGI_DDI_ERR_WASSTILLDRAWING) {
+         yttrium_gdi_trace_errorf(
+            "d3d10umd: pfnSetErrorCb hr=0x%08x caller=%s:%u device=%p",
+            (unsigned)hr, function, line, pDevice);
+      }
       pDevice->UMCallbacks.pfnSetErrorCb(pDevice->hRTCoreLayer, hr);
    }
 }
+
+#define SetError(hDevice, hr) \
+   SetErrorAt((hDevice), (hr), __func__, __LINE__)
 
 
 struct Resource
@@ -481,6 +500,8 @@ CastPipeShaderResourceView(D3D10DDI_HSHADERRESOURCEVIEW hShaderResourceView)
 struct UnorderedAccessView
 {
    struct pipe_resource *pipe_resource;
+   /* The counter belongs to the view, not to the underlying structured buffer. */
+   struct pipe_resource *counter_resource;
    struct pipe_image_view image;
    enum pipe_format clear_format;
    Resource *resource;
@@ -491,7 +512,6 @@ struct UnorderedAccessView
    UINT buffer_first_element;
    UINT buffer_num_elements;
    UINT buffer_stride;
-   UINT counter_value;
 };
 
 

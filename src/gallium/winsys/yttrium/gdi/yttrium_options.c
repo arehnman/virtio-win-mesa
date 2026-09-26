@@ -234,14 +234,39 @@ yttrium_present_timeline_sync_enabled(void)
    LONG enabled = cached;
 
    if (enabled < 0) {
-      /* Enabled by default.  Zero restores the legacy fullscreen path through
-       * pfnPresentCb; windowed/DWM presents always use that path regardless. */
+      /* Used when scheduled Present is disabled. Zero restores the legacy
+       * fullscreen path through pfnPresentCb; windowed/DWM uses that path. */
       const LONG resolved = yttrium_gdi_debug_get_bool_option(
          "D3D10UMD_YTTRIUM_PRESENT_TIMELINE_SYNC", true) ? 1 : 0;
 
       enabled = InterlockedCompareExchange(&cached, resolved, -1);
       if (enabled < 0)
          enabled = resolved;
+   }
+
+   return enabled != 0;
+}
+
+bool
+yttrium_present_issuance_wait_enabled(void)
+{
+   static volatile LONG cached = -1;
+   LONG enabled = cached;
+
+   if (enabled < 0) {
+      const LONG resolved = yttrium_gdi_debug_get_bool_option(
+         "D3D10UMD_YTTRIUM_PRESENT_ISSUANCE_WAIT", true) ? 1 : 0;
+
+      const LONG previous =
+         InterlockedCompareExchange(&cached, resolved, -1);
+      if (previous < 0) {
+         enabled = resolved;
+         if (!enabled) {
+            YTTRIUM_WARN("yttrium: WARNING: runtime Present issuance ordering disabled owner=yttrium_present component=present-publication reason=process-option action=publish-without-worker-issuance-wait variable=D3D10UMD_YTTRIUM_PRESENT_ISSUANCE_WAIT risk=out-of-order-frames-and-cursor\n");
+         }
+      } else {
+         enabled = previous;
+      }
    }
 
    return enabled != 0;

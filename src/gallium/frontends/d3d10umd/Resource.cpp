@@ -629,7 +629,8 @@ sanitize_d3d11_resource_misc_flags(UINT flags)
    const UINT supported =
       D3D10_DDI_RESOURCE_MISC_SHARED |
       D3D10_DDI_RESOURCE_MISC_DISCARD_ON_PRESENT |
-      D3D10_DDI_RESOURCE_MISC_REMOTE;
+      D3D10_DDI_RESOURCE_MISC_REMOTE |
+      D3D11_DDI_RESOURCE_MISC_DRAWINDIRECT_ARGS;
 
    UINT sanitized = flags & supported;
    if (flags & (d3d11_shared_keyedmutex | d3d11_shared_nthandle))
@@ -962,11 +963,16 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
    templat.nr_storage_samples = pCreateResource->SampleDesc.Count;
    templat.bind       = translate_resource_flags(pCreateResource->BindFlags);
 #if SUPPORT_D3D11
+   if (pCreateResource->MiscFlags & D3D11_DDI_RESOURCE_MISC_DRAWINDIRECT_ARGS)
+      templat.bind |= PIPE_BIND_COMMAND_ARGS_BUFFER;
    if (pCreateResource->BindFlags & D3D11_DDI_BIND_UNORDERED_ACCESS) {
+      /* UAV accesses lower to TGSI images, including buffer UAVs.  Native
+       * argument/VB/IB allocations must therefore support texel-buffer views
+       * from creation, not only the shader-buffer binding below.
+       */
+      templat.bind |= PIPE_BIND_SHADER_IMAGE;
       if (pCreateResource->ResourceDimension == D3D10DDIRESOURCE_BUFFER)
          templat.bind |= PIPE_BIND_SHADER_BUFFER;
-      else
-         templat.bind |= PIPE_BIND_SHADER_IMAGE;
    }
 #endif
    templat.usage      = translate_resource_usage(pCreateResource->Usage);
@@ -1510,8 +1516,10 @@ static bool
 areYttriumDepthReadbackFormatsCompatible(const struct pipe_resource *src_resource,
                                          const struct pipe_resource *dst_resource)
 {
-   return src_resource->format == PIPE_FORMAT_Z16_UNORM &&
-          dst_resource->format == PIPE_FORMAT_R16_UNORM;
+   return (src_resource->format == PIPE_FORMAT_Z16_UNORM &&
+           dst_resource->format == PIPE_FORMAT_R16_UNORM) ||
+          (src_resource->format == PIPE_FORMAT_Z32_FLOAT &&
+           dst_resource->format == PIPE_FORMAT_R32_FLOAT);
 }
 
 /*

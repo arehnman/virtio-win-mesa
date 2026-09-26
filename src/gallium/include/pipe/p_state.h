@@ -303,6 +303,25 @@ struct pipe_stream_output_info
  * the nir_shader.  If gallium frontends need to hang on to the IR (for
  * example, variant management), it should use nir_shader_clone().
  */
+/*
+ * Optional mapping for state trackers which compact independent texture and
+ * sampler registers into a combined sampled-image namespace.  Each valid
+ * compact shader slot names the original pipe sampler-view and sampler-state
+ * slots which must be used to populate its descriptor.  A sampler-state
+ * index equal to PIPE_MAX_SAMPLERS means that the operation does not use a
+ * sampler state (for example, a texel fetch).
+ */
+struct pipe_shader_sampler_binding_map
+{
+   uint32_t valid_mask;
+   /* Compact slots whose typed BUFFER declaration used MIXED for all four
+    * return components and was lowered to TGSI float.
+    */
+   uint32_t mixed_return_mask;
+   uint8_t sampler_view_index[PIPE_MAX_SAMPLERS];
+   uint8_t sampler_state_index[PIPE_MAX_SAMPLERS];
+};
+
 struct pipe_shader_state
 {
    enum pipe_shader_ir type;
@@ -320,6 +339,9 @@ struct pipe_shader_state
     */
    bool report_compile_error;
    char *error_message;
+
+   /* Borrowed for the duration of create_*_state. */
+   const struct pipe_shader_sampler_binding_map *sampler_binding_map;
 };
 
 static inline void
@@ -329,6 +351,7 @@ pipe_shader_state_from_tgsi(struct pipe_shader_state *state,
    state->type = PIPE_SHADER_IR_TGSI;
    state->tokens = tokens;
    memset(&state->stream_output, 0, sizeof(state->stream_output));
+   state->sampler_binding_map = NULL;
 }
 
 struct pipe_stencil_state
@@ -1345,6 +1368,9 @@ struct pipe_compute_state
    enum pipe_shader_ir ir_type; /**< IR type contained in prog. */
    const void *prog; /**< Compute program to be executed. */
    unsigned static_shared_mem; /**< equal to info.shared_size, used for shaders passed as TGSI */
+
+   /* Optional combined sampled-image mapping, borrowed during create_compute_state. */
+   const struct pipe_shader_sampler_binding_map *sampler_binding_map;
 };
 
 struct pipe_compute_state_object_info

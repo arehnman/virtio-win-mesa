@@ -90,7 +90,6 @@ TranslateQueryType(D3D10DDI_QUERY query)
    case D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM3:
       return PIPE_QUERY_SO_OVERFLOW_PREDICATE;
    default:
-      LOG_UNSUPPORTED(true);
       return PIPE_QUERY_TYPES;
    }
 }
@@ -158,9 +157,33 @@ CreateQuery(D3D10DDI_HDEVICE hDevice,                          // IN
    pQuery->Emulated = ShouldEmulateQuery(pCreateQuery->Query);
 
    pQuery->pipe_type = TranslateQueryType(pCreateQuery->Query);
-   if (!pQuery->Emulated && pQuery->pipe_type < PIPE_QUERY_TYPES) {
-      pQuery->handle = pipe->create_query(pipe, pQuery->pipe_type,
-                                          TranslateQueryIndex(pCreateQuery->Query));
+   if (pQuery->pipe_type >= PIPE_QUERY_TYPES) {
+      yttrium_gdi_trace_warnf("yttrium: query creation failed owner=d3d10umd "
+                   "query_type=%u reason=unsupported-query-type\n",
+                   pCreateQuery->Query);
+      SetError(hDevice, DXGI_DDI_ERR_UNSUPPORTED);
+      return;
+   }
+
+   if (!pQuery->Emulated) {
+      if (!pipe->create_query) {
+         yttrium_gdi_trace_warnf("yttrium: query creation failed owner=d3d10umd "
+                      "query_type=%u pipe_type=%u "
+                      "reason=create-query-callback-unavailable\n",
+                      pCreateQuery->Query, pQuery->pipe_type);
+         SetError(hDevice, DXGI_DDI_ERR_UNSUPPORTED);
+         return;
+      }
+      pQuery->handle =
+         pipe->create_query(pipe, pQuery->pipe_type,
+                            TranslateQueryIndex(pCreateQuery->Query));
+      if (!pQuery->handle) {
+         yttrium_gdi_trace_warnf("yttrium: query creation failed owner=d3d10umd "
+                      "query_type=%u pipe_type=%u "
+                      "reason=native-query-unavailable\n",
+                      pCreateQuery->Query, pQuery->pipe_type);
+         SetError(hDevice, E_OUTOFMEMORY);
+      }
    }
 }
 
@@ -333,8 +356,12 @@ QueryGetData(D3D10DDI_HDEVICE hDevice,                      // IN
    } else if (state) {
       ret = pipe->get_query_result(pipe, state, false, &result);
    } else {
-      LOG_UNSUPPORTED(true);
-      ret = true;
+      yttrium_gdi_trace_warnf("yttrium: query GetData failed owner=d3d10umd "
+                   "query_type=%u pipe_type=%u reason=query-handle-missing\n",
+                   pQuery->Type, pQuery->pipe_type);
+      SetError(hDevice, pQuery->pipe_type >= PIPE_QUERY_TYPES ?
+                           DXGI_DDI_ERR_UNSUPPORTED : E_FAIL);
+      return;
    }
 
    if (!ret) {

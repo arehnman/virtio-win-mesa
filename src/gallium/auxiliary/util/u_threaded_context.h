@@ -260,6 +260,8 @@ struct tc_unflushed_batch_token;
  * the queuing and mutex overhead is negligible.
  */
 #define TC_SLOTS_PER_BATCH    1536
+/* Maximum explicitly requested immutable storage capacity. */
+#define TC_MAX_SLOTS_PER_BATCH 4096
 
 /* The buffer list queue is much deeper than the batch queue because buffer
  * lists need to stay around until the driver internally flushes its command
@@ -536,7 +538,8 @@ struct tc_batch {
    bool increment_rp_info_on_fb;
    int8_t batch_idx;
    struct tc_unflushed_batch_token *token;
-   uint64_t slots[TC_SLOTS_PER_BATCH];
+   /* Stable storage in the owning threaded_context allocation. */
+   uint64_t *slots;
    struct util_dynarray renderpass_infos;
 #if !defined(NDEBUG)
    bool tc_set_vertex_elements_for_call_pending;
@@ -577,8 +580,8 @@ struct threaded_context_options {
 
    /*
     * Target number of call slots per queued batch.  Zero selects the full
-    * TC_SLOTS_PER_BATCH capacity.  A single call larger than the target is
-    * still admitted up to the fixed capacity.
+    * selected physical capacity (TC_SLOTS_PER_BATCH by default). A single
+    * call larger than the target is still admitted up to that capacity.
     */
    unsigned batch_size_slots;
 
@@ -601,6 +604,11 @@ struct threaded_context_options {
     */
    void (*dsa_parse)(void *state, struct tc_renderpass_info *info);
    void (*fs_parse)(void *state, struct tc_renderpass_info *info);
+
+   /* Immutable physical slots per batch, including the end marker. Zero
+    * selects TC_SLOTS_PER_BATCH; explicit capacities are 1536, 3072 or 4096.
+    */
+   unsigned batch_capacity_slots;
 };
 
 struct tc_vertex_buffers {
@@ -692,6 +700,8 @@ struct threaded_context {
    unsigned last, next, next_buf_list;
    unsigned num_batch_slots;
    unsigned batch_size_slots;
+   /* Set once before any uploader can record into the stable payload. */
+   unsigned batch_capacity_slots;
 
    /* The list fences that the driver should signal after the next flush.
     * If this is empty, all driver command buffers have been flushed.

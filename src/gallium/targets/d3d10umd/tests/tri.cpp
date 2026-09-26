@@ -70,7 +70,7 @@ static void
 usage(const char *argv0)
 {
    fprintf(stderr,
-             "Usage: %s [--hardware] [--api d3d11|d3d9|d3d9ex] [--bgra] [--fullscreen] [--width W] [--height H] [--frames N] [--flip-sequential] [--flip-discard] [--discard] [--clear-black] [--viewport-inset N] [--scissor-inset N] [--indexed] [--triangle-list] [--strip-quad] [--line-box] [--texture-probe] [--vertex-id-texture-probe] [--ubo-probe] [--cpu-vertex-probe] [--depth-state-probe] [--stencil-mask-probe] [--alpha-blend] [--dst-only-blend] [--write-mask-red] [--sample-mask-zero] [--cull-front] [--cull-back] [--front-cw] [--list-adapters] [--adapter N] [--adapter-name SUBSTR] [--output N] [--benchmark] [--present-only] [--animate] [--warmup N] [--sync-interval N] [--draw-batch-perf] [--draw-count N] [--retire-resource-probe] [--retire-count N] [--upload-perf] [--upload-bytes N] [--upload-iters N]\n",
+             "Usage: %s [--hardware] [--api d3d11|d3d9|d3d9ex] [--bgra] [--srgb] [--fullscreen] [--width W] [--height H] [--frames N] [--flip-sequential] [--flip-discard] [--discard] [--clear-black] [--viewport-inset N] [--scissor-inset N] [--indexed] [--triangle-list] [--strip-quad] [--line-box] [--texture-probe] [--vertex-id-texture-probe] [--ubo-probe] [--cpu-vertex-probe] [--depth-state-probe] [--stencil-mask-probe] [--alpha-blend] [--dst-only-blend] [--write-mask-red] [--sample-mask-zero] [--cull-front] [--cull-back] [--front-cw] [--list-adapters] [--adapter N] [--adapter-name SUBSTR] [--output N] [--benchmark] [--present-only] [--animate] [--warmup N] [--sync-interval N] [--draw-batch-perf] [--draw-count N] [--retire-resource-probe] [--retire-count N] [--upload-perf] [--upload-bytes N] [--upload-iters N]\n",
             argv0);
 }
 
@@ -739,6 +739,7 @@ main(int argc, char *argv[])
     Api api = Api::D3D11;
     bool fullscreen = false;
     bool bgra = false;
+    bool srgb = false;
     unsigned windowWidth = 250;
     unsigned windowHeight = 250;
     unsigned frames = 1;
@@ -816,6 +817,8 @@ main(int argc, char *argv[])
             }
         } else if (strcmp(argv[i], "--bgra") == 0) {
             bgra = true;
+        } else if (strcmp(argv[i], "--srgb") == 0) {
+            srgb = true;
         } else if (strcmp(argv[i], "--fullscreen") == 0) {
             fullscreen = true;
         } else if (strcmp(argv[i], "--width") == 0) {
@@ -1055,6 +1058,10 @@ main(int argc, char *argv[])
         fprintf(stderr, "--bgra is only supported with --api d3d11\n");
         return EXIT_FAILURE;
     }
+    if (srgb && api != Api::D3D11) {
+        fprintf(stderr, "--srgb is only supported with --api d3d11\n");
+        return EXIT_FAILURE;
+    }
     if (uploadPerf && api != Api::D3D11) {
         fprintf(stderr, "--upload-perf is only supported with --api d3d11\n");
         return EXIT_FAILURE;
@@ -1246,8 +1253,11 @@ main(int argc, char *argv[])
     ZeroMemory(&SwapChainDesc, sizeof SwapChainDesc);
     SwapChainDesc.BufferDesc.Width = windowWidth;
     SwapChainDesc.BufferDesc.Height = windowHeight;
-    SwapChainDesc.BufferDesc.Format = bgra ? DXGI_FORMAT_B8G8R8A8_UNORM :
-                                            DXGI_FORMAT_R8G8B8A8_UNORM;
+    SwapChainDesc.BufferDesc.Format =
+        bgra ? (srgb ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB :
+                       DXGI_FORMAT_B8G8R8A8_UNORM) :
+               (srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB :
+                       DXGI_FORMAT_R8G8B8A8_UNORM);
     SwapChainDesc.BufferDesc.RefreshRate.Numerator = 60;
     SwapChainDesc.BufferDesc.RefreshRate.Denominator = 1;
     SwapChainDesc.SampleDesc.Quality = 0;
@@ -1766,7 +1776,8 @@ main(int argc, char *argv[])
         swapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD ? "flip-discard" :
                                                          "other";
     const char *swapFormatName =
-        bgra ? "B8G8R8A8_UNORM" : "R8G8B8A8_UNORM";
+        bgra ? (srgb ? "B8G8R8A8_UNORM_SRGB" : "B8G8R8A8_UNORM") :
+               (srgb ? "R8G8B8A8_UNORM_SRGB" : "R8G8B8A8_UNORM");
     printf("swapchain format=%s\n", swapFormatName);
 
     /* Benchmark mode times only the Present() call (the KMD present/blt path),

@@ -97,6 +97,12 @@ struct gdikmt_context {
    D3DKMT_HANDLE (*kmt_handle)(struct gdikmt_context* device);
    void (*destroy)(struct gdikmt_context* device);
    NTSTATUS (*render)(struct gdikmt_context* device, struct gdikmt_render *options);
+   /* D3DDDI defaults to 1: wait for worker submit/signal issuance. */
+   unsigned scheduled_present_mode;
+   HRESULT (*reserve_present)(struct gdikmt_context *ctx,
+                              struct gdikmt_context **consumer, uint64_t *value);
+   HRESULT (*signal_present)(struct gdikmt_context *ctx, uint64_t value);
+   HRESULT (*wait_present)(struct gdikmt_context *ctx, uint64_t value);
 };
 
 struct gdikmt_device {

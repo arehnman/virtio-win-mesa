@@ -582,8 +582,34 @@ yttrium_trace_venus_upload(uint32_t kind,
                            uint32_t row_stride,
                            uint32_t layer_stride);
 
+/* Per-emission diagnostic totals; no descriptor payloads or per-draw events. */
+struct yttrium_trace_deferred_draw_stats {
+   uint32_t draws;
+   uint32_t render_passes;
+   uint32_t pipeline_binds;
+   uint32_t pipeline_binds_skipped;
+   uint32_t descriptor_binds;
+   uint32_t descriptor_binds_skipped;
+   uint32_t push_calls;
+   uint32_t push_writes;
+   uint32_t repeated_push_layouts;
+   uint32_t requested_push_calls;
+   uint32_t requested_push_writes;
+   uint32_t push_comparisons;
+   uint32_t push_calls_skipped;
+   uint32_t push_writes_skipped;
+};
+
+void
+yttrium_trace_deferred_draw_state(
+   const struct yttrium_trace_deferred_draw_stats *stats);
+
 #define YTTRIUM_LOG(...)                                                \
-   yttrium_trace_logf(YTTRIUM_TRACE_DEBUG, __VA_ARGS__)
+   do {                                                                \
+      if (yttrium_trace_verbose_etw_text_enabled() &&                    \
+          yttrium_trace_is_enabled())                                  \
+         yttrium_trace_logf(YTTRIUM_TRACE_DEBUG, __VA_ARGS__);            \
+   } while (0)
 
 #define YTTRIUM_WARN(...)                                               \
    yttrium_trace_logf(YTTRIUM_TRACE_WARNING, __VA_ARGS__)

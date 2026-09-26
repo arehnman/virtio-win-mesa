@@ -1413,6 +1413,7 @@ D3D9DestroyDevice(HANDLE hDevice)
       device->pipe->destroy(device->pipe);
    if (device->screen)
       device->screen->destroy(device->screen);
+   device->gdi_device.base.destroy(&device->gdi_device.base);
    free(device);
    return S_OK;
 }

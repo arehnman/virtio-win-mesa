@@ -402,12 +402,16 @@ _Present(DXGI_DDI_ARG_PRESENT *pPresentData)
          present_info.dxgi_context = pPresentData->pDXGIContext;
          present_info.hDstAllocation = dst_alloc;
          present_info.status = S_OK;
-         /* A runtime primary is not sufficient: DWM owns one too.  The direct
-          * application scanout targets a real window, while DWM's compositor
-          * scanout has no hWindow and must retain the pfnPresentCb path. */
+         /* A runtime primary and a real window are not sufficient: windowed
+          * flip-model swapchains use redirected primaries too.  Only a real
+          * non-redirected flip may bypass Windows presentation and publish
+          * through the fullscreen scanout escape. */
          present_info.application_scanout =
             pSrcResource && pSrcResource->yttrium_primary &&
-            dxgi_present_context && dxgi_present_context->hWindow != NULL;
+            dxgi_present_context && dxgi_present_context->hWindow != NULL &&
+            dxgi_present_context->Flags.Flip &&
+            !dxgi_present_context->Flags.RedirectedFlip &&
+            !dxgi_present_context->Flags.RedirectedBlt;
          present_context = &present_info;
          yttrium_gdi_trace_dxgi_present(
             YTTRIUM_GDI_TRACE_DXGI_PRESENT_FLUSH_FRONTBUFFER,
@@ -520,6 +524,14 @@ _SetDisplayMode( DXGI_DDI_ARG_SETDISPLAYMODE *SetDisplayMode )
    Resource *res = CastResource(SetDisplayMode->hResource);
    const bool trace = dxgi_trace_enabled(device);
 
+   if (!res || !res->resource) {
+      yttrium_gdi_trace_warnf("yttrium: dxgi SetDisplayMode failed owner=d3d10umd "
+                   "resource=%p subresource=%u reason=invalid-resource\n",
+                   (void *)SetDisplayMode->hResource,
+                   SetDisplayMode->SubResourceIndex);
+      return E_INVALIDARG;
+   }
+
    if (trace) {
       dxgi_trace_printf(device,
                         "d3d10umd: dxgi SetDisplayMode resource=%p sub=%u screen=%s\n",
@@ -535,7 +547,7 @@ _SetDisplayMode( DXGI_DDI_ARG_SETDISPLAYMODE *SetDisplayMode )
          dxgi_trace_printf(device,
                            "d3d10umd: dxgi SetDisplayMode skipped: resource_get_handle missing\n");
       }
-      return S_OK;
+      return DXGI_DDI_ERR_UNSUPPORTED;
    }
 
    struct winsys_handle handle;
@@ -548,7 +560,7 @@ _SetDisplayMode( DXGI_DDI_ARG_SETDISPLAYMODE *SetDisplayMode )
                            "d3d10umd: dxgi SetDisplayMode skipped: resource_get_handle failed resource=%p\n",
                            (void *)SetDisplayMode->hResource);
       }
-      return S_OK;
+      return E_FAIL;
    };
 
    const auto kmt_handle =
@@ -564,7 +576,7 @@ _SetDisplayMode( DXGI_DDI_ARG_SETDISPLAYMODE *SetDisplayMode )
                         (unsigned long long)handle.size);
    }
 
-   return S_OK;
+   return (HRESULT)status;
 }
 
 

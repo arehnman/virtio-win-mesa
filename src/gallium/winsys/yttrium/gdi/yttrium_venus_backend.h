@@ -48,14 +48,13 @@ struct yttrium_venus_backend {
                          uint32_t attrib_count,
                          const struct yttrium_venus_ubo_binding_layout *ubo_bindings,
                          uint32_t ubo_binding_count,
-                         uint32_t sampled_image_mask,
-                         uint32_t sampled_buffer_mask,
-                         VkShaderStageFlags sampled_stage_flags,
+                         const struct yttrium_venus_sampled_binding_layout *sampled_bindings,
+                         uint32_t sampled_binding_count,
                          uint64_t storage_image_mask,
                          uint64_t storage_buffer_mask,
                          VkShaderStageFlags storage_stage_flags,
-                         const struct yttrium_venus_sampler_state *samplers,
                          const struct yttrium_venus_draw_state *draw_state);
+   bool (*supports_load_store_op_none)(void *ctx);
    bool (*supports_multisampled_render_to_single_sampled)(void *ctx,
                                                           uint32_t sample_count);
    bool (*supports_forced_sample_interlock)(void *ctx,
@@ -64,12 +63,19 @@ struct yttrium_venus_backend {
    bool (*sampled_texture_format_supported)(void *ctx,
                                              enum pipe_format format,
                                              enum pipe_texture_target target);
+   bool (*storage_image_without_format_supported)(void *ctx,
+                                                  bool read, bool write);
+   bool (*storage_image_formatless_format_supported)(void *ctx,
+                                                      enum pipe_format format,
+                                                      bool read, bool write);
    bool (*compute_pipeline_init)(
       void *ctx,
       struct yttrium_pipeline *pipeline,
       VkShaderModule compute_shader,
       const struct yttrium_venus_ubo_binding_layout *ubo_bindings,
       uint32_t ubo_binding_count,
+      const struct yttrium_venus_sampled_binding_layout *sampled_bindings,
+      uint32_t sampled_binding_count,
       uint64_t storage_image_mask,
       uint64_t storage_buffer_mask);
    void (*pipeline_fini)(void *ctx, struct yttrium_pipeline *pipeline);
@@ -109,6 +115,8 @@ struct yttrium_venus_backend {
                          const struct yttrium_venus_draw_state *draw_state);
    bool (*dispatch_compute)(void *ctx,
                             struct yttrium_pipeline *pipeline,
+                            const struct yttrium_venus_sampled_image *sampled_images,
+                            uint32_t sampled_image_count,
                             const struct yttrium_venus_storage_image *storage_images,
                             uint32_t storage_image_count,
                             const struct yttrium_venus_ubo_upload *ubo_uploads,

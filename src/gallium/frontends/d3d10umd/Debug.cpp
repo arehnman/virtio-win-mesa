@@ -38,6 +38,24 @@ DebugPrintf(const char *format, ...)
     OutputDebugStringA(buf);
 }
 
+
+void
+LogUnsupported(const char *file,
+               unsigned line,
+               const char *function,
+               const char *expression)
+{
+    const char *safe_file = file ? file : "<unknown>";
+    const char *safe_function = function ? function : "<unknown>";
+    const char *safe_expression = expression ? expression : "<unknown>";
+
+    DebugPrintf("%s:%u XXX %s\n", safe_function, line, safe_expression);
+    yttrium_gdi_trace_warnf(
+        "yttrium: WARNING: unsupported behavior owner=d3d10umd "
+        "function=%s file=%s line=%u expression=%s\n",
+        safe_function, safe_file, line, safe_expression);
+}
+
 static const char *
 ResourceEventKindName(enum ResourceEventKind kind)
 {

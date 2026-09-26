@@ -37,6 +37,11 @@
 
 struct Device;
 struct Shader;
+struct UnorderedAccessView;
+
+void BindShaderImages(Device *device, mesa_shader_stage stage,
+                      unsigned start_slot = 0, unsigned num_views = 0);
+void ResetUAVCounter(Device *device, UnorderedAccessView *view, UINT value);
 
 void *
 CreateEmptyShader(Device *pDevice,

@@ -399,6 +399,16 @@ yttrium_venus_ring_publish_tail(struct yttrium_venus *venus,
    return yttrium_venus_ring_flush_notify_if_idle(venus, label, blocking);
 }
 
+bool
+yttrium_venus_ring_publish_for_submit(struct yttrium_venus *venus, uint32_t *seqno)
+{
+   /* The caller serializes recording and captures only a published cursor. */
+   if (!yttrium_venus_ring_publish_tail(venus, "scheduled GPU submit", false))
+      return false;
+   *seqno = venus->ring.published_cur;
+   return true;
+}
+
 static bool
 yttrium_venus_ring_wait_space(struct yttrium_venus_ring *ring,
                               uint32_t size,
@@ -953,10 +963,11 @@ out:
    return ok;
 }
 
-bool
-yttrium_venus2_vn_ring_submit_command_locked(
+static bool
+yttrium_venus2_vn_ring_submit_commands_locked(
    struct vn_ring *vn_ring,
-   struct vn_ring_submit_command *submit)
+   struct vn_ring_submit_command *submit,
+   uint32_t command_count)
 {
    const uint64_t start_us =
       yttrium_trace_is_enabled() ? yttrium_trace_now_us() : 0;
@@ -993,7 +1004,9 @@ yttrium_venus2_vn_ring_submit_command_locked(
    const uint32_t command_size =
       (uint32_t)vn_cs_encoder_get_len(&submit->command);
    const uint32_t command_type =
-      yttrium_venus_ring_command_type_from_submit(submit, command_size);
+      command_count == 1 ?
+         yttrium_venus_ring_command_type_from_submit(submit, command_size) :
+         UINT32_MAX;
    const char *wait_label = submit->reply_size ?
       yttrium_venus_command_type_name(command_type) :
       "Venus ring producer";
@@ -1073,7 +1086,8 @@ yttrium_venus2_vn_ring_submit_command_locked(
       return false;
    }
 
-   venus->ring.protocol_command_count += 1 + (reply_command_size ? 1 : 0);
+   venus->ring.protocol_command_count +=
+      command_count + (reply_command_size ? 1 : 0);
    venus->ring.protocol_command_bytes += command_size + reply_command_size;
    if (command_type == VK_COMMAND_TYPE_vkQueueSubmit_EXT)
       venus->ring.protocol_queue_submit_count++;
@@ -1143,9 +1157,96 @@ yttrium_venus2_vn_ring_submit_command_locked(
    const uint32_t head = yttrium_venus_ring_head_or_zero(venus);
    yttrium_venus_trace_timing(YTTRIUM_TRACE_TIMING_VENUS_RING_SUBMIT,
                               0, start_us,
-                              yttrium_venus_command_type_name(command_type),
+                              command_count == 1 ?
+                                 yttrium_venus_command_type_name(command_type) :
+                                 "Deferred draw command stream",
                               command_size, submit->reply_size, seqno, head);
    return true;
+}
+
+bool
+yttrium_venus2_vn_ring_submit_command_locked(
+   struct vn_ring *vn_ring,
+   struct vn_ring_submit_command *submit)
+{
+   return yttrium_venus2_vn_ring_submit_commands_locked(vn_ring, submit, 1);
+}
+
+bool
+yttrium_venus2_command_stream_flush(struct yttrium_venus_command_stream *stream)
+{
+   if (stream->failed)
+      return false;
+   if (!stream->size)
+      return true;
+
+   struct vn_ring_submit_command submit;
+   struct vn_cs_encoder *enc = vn_ring_submit_command_init(
+      &stream->venus->vn_ring, &submit, stream->data, stream->size, 0);
+   enc->cur = stream->data + stream->size;
+   stream->failed = !yttrium_venus2_vn_ring_submit_commands_locked(
+      &stream->venus->vn_ring, &submit, stream->command_count);
+   stream->size = 0;
+   stream->command_count = 0;
+   return !stream->failed;
+}
+
+static bool
+yttrium_venus2_command_stream_submit(struct vn_ring *vn_ring,
+                                     struct vn_ring_submit_command *submit)
+{
+   struct yttrium_venus_command_stream *stream = vn_ring->driver;
+   if (stream->failed)
+      return false;
+
+   const size_t size = vn_cs_encoder_get_len(&submit->command);
+   if (submit->reply_size || !size ||
+       yttrium_venus_warn_encoder_overflow("deferred-command-stream",
+                                           &submit->command,
+                                           submit->reply_size)) {
+      YTTRIUM_WARN("yttrium: ERROR: deferred command stream rejected command owner=venus2-ring size=%llu reply_size=%llu\n",
+                   (unsigned long long)size,
+                   (unsigned long long)submit->reply_size);
+      stream->failed = true;
+      return false;
+   }
+
+   /* Never split an encoded command. Larger commands use their own write;
+    * the pending prefix must precede it. Both use the same locked transport.
+    */
+   if (size > sizeof(stream->data) - stream->size &&
+       !yttrium_venus2_command_stream_flush(stream))
+      return false;
+   if (size > sizeof(stream->data)) {
+      stream->failed = !yttrium_venus2_vn_ring_submit_command_locked(
+         &stream->venus->vn_ring, submit);
+      return !stream->failed;
+   }
+
+   memcpy(stream->data + stream->size, submit->buffer.base, size);
+   stream->size += (uint32_t)size;
+   stream->command_count++;
+   /* The transaction owns the ring until the prefix has been flushed. No
+    * caller of this async-only sink consumes the seqno before that boundary.
+    */
+   submit->ring_seqno = stream->venus->ring.cur + stream->size;
+   return true;
+}
+
+void
+yttrium_venus2_command_stream_init(struct yttrium_venus_command_stream *stream,
+                                  struct yttrium_venus *venus)
+{
+   assert(venus->ring_transaction_active &&
+          venus->ring_transaction_thread_id == GetCurrentThreadId());
+   stream->vn_ring = (struct vn_ring) {
+      .driver = stream,
+      .submit_command = yttrium_venus2_command_stream_submit,
+   };
+   stream->venus = venus;
+   stream->size = 0;
+   stream->command_count = 0;
+   stream->failed = false;
 }
 
 bool

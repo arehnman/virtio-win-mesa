@@ -12,6 +12,138 @@
 #include <d3dkmthk.h>
 #include "winddk_compat.h"
 
+struct gdikmt_d3dddi_residency {
+   SRWLOCK lock;
+   D3DDDICB_CREATEPAGINGQUEUE queue;
+   PFND3DDDI_MAKERESIDENTCB make_resident;
+   PFND3DDDI_EVICTCB evict;
+   PFND3DDDI_WAITFORSYNCHRONIZATIONOBJECTFROMCPUCB wait;
+   PFND3DDDI_DESTROYPAGINGQUEUECB destroy_queue;
+   PFND3DDDI_CREATESYNCHRONIZATIONOBJECT2CB create_sync;
+   PFND3DDDI_WAITFORSYNCHRONIZATIONOBJECTFROMGPUCB wait_gpu;
+   PFND3DDDI_SIGNALSYNCHRONIZATIONOBJECTFROMGPUCB signal_gpu;
+};
+
+HRESULT
+gdikmt_d3dddi_init_residency(struct gdikmt_device_d3dddi *device,
+                            const void *runtime_callbacks, UINT runtime_version)
+{
+   VIOGPU_ADAPTERINFO info = {};
+   D3DDDICB_QUERYADAPTERINFO query = {};
+   query.pPrivateDriverData = &info;
+   query.PrivateDriverDataSize = sizeof(info);
+   HRESULT hr = device->pAdapterCallbacks->pfnQueryAdapterInfoCb(
+      device->hRTAdapter, &query);
+   if (FAILED(hr))
+      return hr;
+   if (info.IamVioGPU != VIOGPU_IAM)
+      return E_INVALIDARG;
+   if (!info.Flags.requires_explicit_residency)
+      return S_OK;
+
+   /* D3D9's local KTCallbacks ends at Win7. Only read the newer entries from
+    * the original runtime table, and only when its reported version has them. */
+   if (!runtime_callbacks || runtime_version < D3D_UMD_INTERFACE_VERSION_WDDM2_0) {
+      yttrium_gdi_trace_warnf("yttrium: ERROR residency initialization owner=d3dddi reason=WDDM2-runtime-callbacks-required version=0x%x\n", runtime_version);
+      return E_NOTIMPL;
+   }
+   const D3DDDI_DEVICECALLBACKS *callbacks =
+      (const D3DDDI_DEVICECALLBACKS *)runtime_callbacks;
+   if (!callbacks->pfnMakeResidentCb || !callbacks->pfnEvictCb ||
+       !callbacks->pfnWaitForSynchronizationObjectFromCpuCb ||
+       !callbacks->pfnCreatePagingQueueCb || !callbacks->pfnDestroyPagingQueueCb) {
+      yttrium_gdi_trace_warnf("yttrium: ERROR residency initialization owner=d3dddi reason=missing-WDDM2-callback\n");
+      return E_NOTIMPL;
+   }
+
+   struct gdikmt_d3dddi_residency *state = CALLOC_STRUCT(gdikmt_d3dddi_residency);
+   if (!state)
+      return E_OUTOFMEMORY;
+   InitializeSRWLock(&state->lock);
+   state->make_resident = callbacks->pfnMakeResidentCb;
+   state->evict = callbacks->pfnEvictCb;
+   state->wait = callbacks->pfnWaitForSynchronizationObjectFromCpuCb;
+   state->destroy_queue = callbacks->pfnDestroyPagingQueueCb;
+   /* This Win8 callback is also beyond D3D9's Win7-sized local table. */
+   state->create_sync = callbacks->pfnCreateSynchronizationObject2Cb;
+   state->wait_gpu = callbacks->pfnWaitForSynchronizationObjectFromGpuCb;
+   state->signal_gpu = callbacks->pfnSignalSynchronizationObjectFromGpuCb;
+   state->queue.Priority = D3DDDI_PAGINGQUEUE_PRIORITY_NORMAL;
+   hr = callbacks->pfnCreatePagingQueueCb(device->hRTDevice, &state->queue);
+   if (FAILED(hr)) {
+      yttrium_gdi_trace_warnf("yttrium: ERROR residency initialization owner=d3dddi operation=CreatePagingQueue status=0x%lx\n", (unsigned long)hr);
+      FREE(state);
+      return hr;
+   }
+   device->residency = state;
+   return S_OK;
+}
+
+static HRESULT
+gdikmt_d3dddi_make_resident(struct gdikmt_device_d3dddi *device,
+                           UINT count, const D3DKMT_HANDLE *allocations)
+{
+   struct gdikmt_d3dddi_residency *state = device->residency;
+   if (!state || !count)
+      return S_OK;
+
+   AcquireSRWLockExclusive(&state->lock);
+   D3DDDI_MAKERESIDENT resident = {};
+   resident.hPagingQueue = state->queue.hPagingQueue;
+   resident.NumAllocations = count;
+   resident.AllocationList = allocations;
+   /* Blob backing is retained for the allocation lifetime. There is no idle
+    * backing to trim here. Permit the current budget to be exceeded, but keep
+    * the OS maximum budget and normal OOM handling (never MustSucceed). */
+   resident.Flags.CantTrimFurther = 1;
+   HRESULT hr = state->make_resident(device->hRTDevice, &resident);
+   /* MakeResident is atomic on failure: NumAllocations may still contain the
+    * input count, but no residency references were acquired. Only a successful
+    * request (including E_PENDING) can need rollback after the fence wait. */
+   const UINT acquired = SUCCEEDED(hr) || hr == E_PENDING ? resident.NumAllocations : 0;
+   if (hr == E_PENDING) {
+      D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait = {};
+      wait.ObjectCount = 1;
+      wait.ObjectHandleArray = &state->queue.hSyncObject;
+      wait.FenceValueArray = &resident.PagingFenceValue;
+      hr = state->wait(device->hRTDevice, &wait);
+   }
+   if (SUCCEEDED(hr) && resident.NumAllocations != count)
+      hr = E_FAIL;
+   if (FAILED(hr)) {
+      yttrium_gdi_trace_warnf("yttrium: ERROR allocation residency owner=d3dddi status=0x%lx requested=%u acquired=%u bytes_to_trim=%llu\n", (unsigned long)hr, count, acquired, resident.NumBytesToTrim);
+      /* Undo only references acquired by this request; opened allocations
+       * remain owned by the runtime. */
+      if (acquired && acquired <= count) {
+         D3DDDICB_EVICT rollback = {};
+         rollback.NumAllocations = acquired;
+         rollback.AllocationList = allocations;
+         HRESULT rollback_hr = state->evict(device->hRTDevice, &rollback);
+         if (FAILED(rollback_hr))
+            yttrium_gdi_trace_warnf("yttrium: ERROR residency rollback owner=d3dddi status=0x%lx count=%u\n", (unsigned long)rollback_hr, rollback.NumAllocations);
+      }
+   }
+   ReleaseSRWLockExclusive(&state->lock);
+   return hr;
+}
+
+static HRESULT
+gdikmt_d3dddi_open_residency(struct gdikmt_device_d3dddi *device,
+                            struct gdikmt_openallocation *options)
+{
+   if (!device->residency || !options->NumAllocations)
+      return S_OK;
+   D3DKMT_HANDLE *handles = (D3DKMT_HANDLE *)
+      CALLOC(options->NumAllocations, sizeof(*handles));
+   if (!handles)
+      return E_OUTOFMEMORY;
+   for (UINT i = 0; i < options->NumAllocations; ++i)
+      handles[i] = options->pOpenAllocation[i].hAllocation;
+   HRESULT hr = gdikmt_d3dddi_make_resident(device, options->NumAllocations, handles);
+   FREE(handles);
+   return hr;
+}
+
 /*
  * Measurement knob for the KMD present round trip.  Rendering is published
  * independently before this layer is reached.  This option controls only
@@ -102,6 +234,7 @@ gdikmt_is_known_viogpu_escape_type(USHORT type)
    case VIOGPU_RES_ATTACH_WAIT:
    case VIOGPU_CTX_INIT:
    case VIOGPU_SUBMIT_CMD:
+   case VIOGPU_QUERY_TIMELINE_SUBMIT:
       return true;
    default:
       return false;
@@ -297,11 +430,83 @@ gdikmt_d3dddi_render(struct gdikmt_context *_ctx, struct gdikmt_render *options)
    return Status;
 }
 
+static HRESULT
+gdikmt_d3dddi_reserve_present(struct gdikmt_context *_ctx,
+                             struct gdikmt_context **consumer, uint64_t *value)
+{
+   struct gdikmt_context_d3dddi *ctx = gdikmt_context_d3dddi(_ctx);
+   struct gdikmt_device_d3dddi *dev = gdikmt_device_d3dddi(_ctx->device);
+   if (!ctx->present_fence) {
+      D3DDDICB_CREATESYNCHRONIZATIONOBJECT2 create = {};
+      create.Info.Type = D3DDDI_MONITORED_FENCE;
+      HRESULT hr = dev->residency->create_sync(dev->hRTDevice, &create);
+      if (FAILED(hr)) return hr;
+      ctx->present_fence = create.hSyncObject;
+   }
+   if (!ctx->present_context) {
+      HRESULT hr = dev->base.createContext(&dev->base, &ctx->present_context);
+      if (FAILED(hr)) return hr;
+   }
+   if (ctx->present_value == UINT64_MAX)
+      return E_FAIL;
+   *consumer = ctx->present_context;
+   *value = ++ctx->present_value;
+   return S_OK;
+}
+
+static HRESULT
+gdikmt_d3dddi_signal_present(struct gdikmt_context *_ctx, uint64_t value)
+{
+   struct gdikmt_context_d3dddi *ctx = gdikmt_context_d3dddi(_ctx);
+   struct gdikmt_device_d3dddi *dev = gdikmt_device_d3dddi(_ctx->device);
+   D3DDDICB_SIGNALSYNCHRONIZATIONOBJECTFROMGPU signal = {};
+   signal.hContext = ctx->hContext;
+   signal.ObjectCount = 1;
+   signal.ObjectHandleArray = &ctx->present_fence;
+   signal.MonitoredFenceValueArray = &value;
+   HRESULT hr = dev->residency->signal_gpu(dev->hRTDevice, &signal);
+   yttrium_gdi_trace_debugf("yttrium: scheduled Present GPU signal producer=%p fence=%x value=%llu hr=%lx\n", ctx->hContext, ctx->present_fence, value, (unsigned long)hr);
+   if (FAILED(hr)) {
+      yttrium_gdi_trace_warnf("yttrium: ERROR scheduled Present owner=d3dddi operation=SignalFromGpu value=%llu hr=%lx\n", value, (unsigned long)hr);
+      gdikmt_device_report_reset(&dev->base, PIPE_UNKNOWN_CONTEXT_RESET);
+   }
+   return hr;
+}
+
+static HRESULT
+gdikmt_d3dddi_wait_present(struct gdikmt_context *_ctx, uint64_t value)
+{
+   struct gdikmt_context_d3dddi *ctx = gdikmt_context_d3dddi(_ctx);
+   struct gdikmt_device_d3dddi *dev = gdikmt_device_d3dddi(_ctx->device);
+   if (gdikmt_device_get_reset_status(&dev->base) != PIPE_NO_RESET)
+      return D3DDDIERR_DEVICEREMOVED;
+   D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMGPU wait = {};
+   wait.hContext = gdikmt_context_d3dddi(ctx->present_context)->hContext;
+   wait.ObjectCount = 1;
+   wait.ObjectHandleArray = &ctx->present_fence;
+   wait.MonitoredFenceValueArray = &value;
+   HRESULT hr = dev->residency->wait_gpu(dev->hRTDevice, &wait);
+   yttrium_gdi_trace_debugf("yttrium: scheduled Present GPU wait consumer=%p fence=%x value=%llu hr=%lx\n", wait.hContext, ctx->present_fence, value, (unsigned long)hr);
+   if (FAILED(hr))
+      yttrium_gdi_trace_warnf("yttrium: ERROR scheduled Present owner=d3dddi operation=WaitFromGpu value=%llu hr=%lx\n", value, (unsigned long)hr);
+   return hr;
+}
+
 void
 gdikmt_d3dddi_destroycontext(struct gdikmt_context *_ctx)
 {
    struct gdikmt_context_d3dddi *ctx = gdikmt_context_d3dddi(_ctx);
    struct gdikmt_device_d3dddi *dev = gdikmt_device_d3dddi(ctx->base.device);
+
+   if (ctx->present_context)
+      ctx->present_context->destroy(ctx->present_context);
+   if (ctx->present_fence && !dev->base.runtime_destroying) {
+      D3DDDICB_DESTROYSYNCHRONIZATIONOBJECT destroy = {};
+      destroy.hSyncObject = ctx->present_fence;
+      HRESULT hr = dev->KTCallbacks.pfnDestroySynchronizationObjectCb(dev->hRTDevice, &destroy);
+      if (FAILED(hr))
+         yttrium_gdi_trace_warnf("yttrium: ERROR scheduled Present owner=d3dddi operation=DestroyFence hr=%lx\n", (unsigned long)hr);
+   }
 
    D3DDDICB_DESTROYCONTEXT destroyContext;
    memset(&destroyContext, 0, sizeof(destroyContext));
@@ -379,6 +584,43 @@ gdikmt_d3dddi_createcontext(struct gdikmt_device *_device,
       ctx->base.render = gdikmt_d3dddi_render;
       ctx->base.kmt_handle = gdikmt_d3dddi_context_kmt_handle;
 
+      /* Read once per process so producer and Present contexts use one mode.
+       * Scheduled Present is the default; a process can opt out with 0. */
+      static const int scheduled_mode = []() {
+         char mode[8] = {};
+         const DWORD length = GetEnvironmentVariableA(
+            "D3D10UMD_YTTRIUM_SCHEDULED_PRESENT", mode, sizeof(mode));
+         if (length >= sizeof(mode) ||
+             (length && strcmp(mode, "0") && strcmp(mode, "1")))
+            return -1;
+         return !length || !strcmp(mode, "1") ? 1 : 0;
+      }();
+      if (scheduled_mode < 0) {
+         yttrium_gdi_trace_warnf("yttrium: ERROR scheduled Present owner=d3dddi reason=invalid-mode expected=0-or-1\n");
+         ctx->base.destroy(&ctx->base);
+         return E_INVALIDARG;
+      }
+      if (scheduled_mode) {
+         VIOGPU_ESCAPE query = {};
+         query.Type = VIOGPU_QUERY_TIMELINE_SUBMIT;
+         query.DataLength = sizeof(UINT);
+         HRESULT hr = device->base.escape(&device->base, &query, sizeof(query));
+         if (FAILED(hr) || query.Id != VIOGPU_TIMELINE_SUBMIT_VERSION ||
+             !device->residency || !device->residency->wait_gpu ||
+             !device->residency->signal_gpu ||
+             !device->residency->create_sync ||
+             !device->KTCallbacks.pfnDestroySynchronizationObjectCb) {
+            yttrium_gdi_trace_warnf("yttrium: ERROR scheduled Present owner=d3dddi reason=unsupported-KMD-or-runtime hr=%lx version=%u\n", (unsigned long)hr, query.Id);
+            ctx->base.destroy(&ctx->base);
+            return E_NOTIMPL;
+         }
+         ctx->base.scheduled_present_mode = 1;
+         ctx->base.reserve_present = gdikmt_d3dddi_reserve_present;
+         ctx->base.signal_present = gdikmt_d3dddi_signal_present;
+         ctx->base.wait_present = gdikmt_d3dddi_wait_present;
+         yttrium_gdi_trace_debugf("yttrium: scheduled Present mode=%u context=%p\n", ctx->base.scheduled_present_mode, ctx->hContext);
+      }
+
       *out_ctx = &ctx->base;
    }
 
@@ -390,6 +632,13 @@ gdikmt_d3dddi_createallocation(struct gdikmt_device *_device,
                                struct gdikmt_createallocation *options)
 {
    struct gdikmt_device_d3dddi *device = gdikmt_device_d3dddi(_device);
+   D3DKMT_HANDLE *resident_handles = NULL;
+   if (device->residency && options->NumAllocations) {
+      resident_handles = (D3DKMT_HANDLE *)
+         CALLOC(options->NumAllocations, sizeof(*resident_handles));
+      if (!resident_handles)
+         return E_OUTOFMEMORY;
+   }
 
    D3DDDICB_ALLOCATE createAllocation;
    memset(&createAllocation, 0, sizeof(createAllocation));
@@ -449,6 +698,28 @@ gdikmt_d3dddi_createallocation(struct gdikmt_device *_device,
    options->hResourceIsD3D9Runtime =
       hRTResource && device->hRTResourceIsD3D9;
 
+   if (NT_SUCCESS(Status) && resident_handles) {
+      for (UINT i = 0; i < createAllocation.NumAllocations; ++i)
+         resident_handles[i] = createAllocation.pAllocationInfo[i].hAllocation;
+      Status = gdikmt_d3dddi_make_resident(device, createAllocation.NumAllocations,
+                                          resident_handles);
+      if (!NT_SUCCESS(Status)) {
+         D3DDDICB_DEALLOCATE cleanup = {};
+         cleanup.hResource = hRTResource;
+         if (!cleanup.hResource) {
+            cleanup.NumAllocations = createAllocation.NumAllocations;
+            cleanup.HandleList = resident_handles;
+         }
+         HRESULT cleanup_hr = device->KTCallbacks.pfnDeallocateCb(device->hRTDevice, &cleanup);
+         if (FAILED(cleanup_hr))
+            yttrium_gdi_trace_warnf("yttrium: ERROR allocation residency cleanup owner=d3dddi status=0x%lx\n", (unsigned long)cleanup_hr);
+         for (UINT i = 0; i < createAllocation.NumAllocations; ++i)
+            createAllocation.pAllocationInfo[i].hAllocation = 0;
+         options->hResource = options->hAllocationResource = NULL;
+         options->hResourceIsD3D9Runtime = false;
+      }
+   }
+   FREE(resident_handles);
    return Status;
 }
 
@@ -631,7 +902,7 @@ gdikmt_d3dddi_openallocation(struct gdikmt_device *_device,
          device->hRTResource && device->hRTResourceIsD3D9;
       options->PrivateDriverDataSize =
          device->pD3D9OpenResource->PrivateDriverDataSize;
-      return STATUS_SUCCESS;
+      return gdikmt_d3dddi_open_residency(device, options);
    }
 
    if (!device->pOpenResource)
@@ -655,7 +926,7 @@ gdikmt_d3dddi_openallocation(struct gdikmt_device *_device,
    options->PrivateDriverDataSize =
       device->pOpenResource->PrivateDriverDataSize;
 
-   return STATUS_SUCCESS;
+   return gdikmt_d3dddi_open_residency(device, options);
 }
 
 NTSTATUS
@@ -823,7 +1094,24 @@ gdikmt_d3dddi_setdisplaymode(struct gdikmt_device *_device,
                                       "pfnSetDisplayModeCb");
 };
 
-void gdikmt_d3dddi_destroy(struct gdikmt_device *_device){};
+void
+gdikmt_d3dddi_destroy(struct gdikmt_device *_device)
+{
+   struct gdikmt_device_d3dddi *device = gdikmt_device_d3dddi(_device);
+   struct gdikmt_d3dddi_residency *state = device->residency;
+   if (!state)
+      return;
+   /* Called after the Gallium workers and contexts have been destroyed. The
+    * runtime releases remaining allocation residency references when it
+    * closes the allocations/device; do not evict live GPU storage early. */
+   D3DDDI_DESTROYPAGINGQUEUE destroy = {};
+   destroy.hPagingQueue = state->queue.hPagingQueue;
+   HRESULT hr = state->destroy_queue(device->hRTDevice, &destroy);
+   if (FAILED(hr))
+      yttrium_gdi_trace_warnf("yttrium: ERROR residency teardown owner=d3dddi operation=DestroyPagingQueue status=0x%lx\n", (unsigned long)hr);
+   FREE(state);
+   device->residency = NULL;
+}
 
 void
 gdikmt_d3dddi_fill_basefuncs(struct gdikmt_device_d3dddi *device)

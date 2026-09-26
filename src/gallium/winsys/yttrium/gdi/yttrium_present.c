@@ -39,6 +39,28 @@ yttrium_present_driver_context(struct pipe_context *ctx)
    return driver && driver->flush == yttrium_flush ? driver : ctx;
 }
 
+struct yttrium_present_publication {
+   struct yttrium_gdi_flush_issuance *issuance;
+   struct gdikmt_context *producer;
+   uint64_t value;
+};
+
+static HRESULT
+yttrium_prepare_present_publication(void *data)
+{
+   struct yttrium_present_publication *publication = data;
+
+   if (!publication)
+      return E_FAIL;
+   if (publication->issuance &&
+       !yttrium_gdi_wait_flush_issuance(publication->issuance, 5000))
+      return E_FAIL;
+   if (publication->producer)
+      return publication->producer->wait_present(publication->producer,
+                                                 publication->value);
+   return publication->issuance ? S_OK : E_FAIL;
+}
+
 void
 yttrium_flush_frontbuffer(struct pipe_screen *pscreen,
                           struct pipe_context *ctx,
@@ -95,8 +117,10 @@ yttrium_flush_frontbuffer(struct pipe_screen *pscreen,
    /* Direct application scanout updates must follow GPU completion, so hand
     * them to the ordered worker and let that worker issue the scanout escape.
     * Windowed and DWM presents retain the ordinary pfnPresentCb path. */
+   const bool scheduled = present_ctx->scheduled_present_mode != 0;
+   struct gdikmt_context *producer = present_ctx;
    const bool worker_publish =
-      yttrium_present_timeline_sync_enabled() && present_info &&
+      !scheduled && yttrium_present_timeline_sync_enabled() && present_info &&
       present_info->version >= 3 && present_info->application_scanout;
 
    if (worker_publish) {
@@ -107,7 +131,7 @@ yttrium_flush_frontbuffer(struct pipe_screen *pscreen,
       };
 
       if (!yttrium_gdi_flush_async_present(
-             frontend_ctx, "display Present worker publication", &publish)) {
+             frontend_ctx, "display Present worker publication", &publish, NULL)) {
          if (present_status)
             present_status->status = E_FAIL;
          return;
@@ -124,8 +148,43 @@ yttrium_flush_frontbuffer(struct pipe_screen *pscreen,
       return;
    }
 
-   yttrium_gdi_flush_labeled(frontend_ctx, NULL, PIPE_FLUSH_ASYNC,
-                             "display Present publication");
+   struct yttrium_gdi_flush_issuance *issuance = NULL;
+   const bool wait_for_issuance = yttrium_present_issuance_wait_enabled();
+   struct yttrium_present_publication publication = {0};
+
+   if (scheduled) {
+      HRESULT hr = producer->reserve_present(producer, &present_ctx, &publication.value);
+      if (FAILED(hr)) {
+         YTTRIUM_WARN("yttrium: ERROR scheduled Present owner=yttrium-present operation=reserve hr=%lx\n", (unsigned long)hr);
+         if (present_status) present_status->status = hr;
+         return;
+      }
+      publication.producer = producer;
+      const struct yttrium_gdi_present_publish_request publish = {
+         .allocation = (uint32_t)res->hAllocation,
+         .valid = true,
+         .signal_context = producer,
+         .signal_value = publication.value,
+      };
+      if (!yttrium_gdi_flush_async_present(frontend_ctx, "scheduled Present signal",
+             &publish, &issuance)) {
+         if (present_status) present_status->status = E_FAIL;
+         return;
+      }
+   } else if (wait_for_issuance) {
+      issuance = yttrium_gdi_flush_async_issuance(
+         frontend_ctx, "display Present publication");
+      if (!issuance) {
+         if (present_status)
+            present_status->status = E_FAIL;
+         return;
+      }
+   } else {
+      yttrium_gdi_flush_labeled(frontend_ctx, NULL, PIPE_FLUSH_ASYNC,
+                                "display Present publication");
+   }
+
+   publication.issuance = issuance;
 
    struct gdikmt_present_info device_present_info;
    memset(&device_present_info, 0, sizeof(device_present_info));
@@ -135,9 +194,15 @@ yttrium_flush_frontbuffer(struct pipe_screen *pscreen,
    device_present_info.hDstAllocation =
       present_info ? present_info->hDstAllocation : 0;
    device_present_info.status = S_OK;
+   if (scheduled || wait_for_issuance) {
+      device_present_info.prepare_present =
+         yttrium_prepare_present_publication;
+      device_present_info.prepare_present_data = &publication;
+   }
 
    NTSTATUS status = screen->device->present(present_ctx, res->hAllocation,
                                              &device_present_info, boxes);
+   yttrium_gdi_flush_issuance_release(issuance);
    if (present_status)
       present_status->status = status;
    if (!NT_SUCCESS(status)) {

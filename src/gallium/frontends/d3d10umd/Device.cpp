@@ -409,8 +409,55 @@ CalcPrivateShaderSize11_1(D3D10DDI_HDEVICE hDevice,
                           __in_ecount(pShaderCode[1]) const UINT *pShaderCode,
                           __in const D3D11_1DDIARG_STAGE_IO_SIGNATURES *pSignatures)
 {
-   return CalcPrivateShaderSize(hDevice, pShaderCode,
-      reinterpret_cast<const D3D10DDIARG_STAGE_IO_SIGNATURES *>(pSignatures));
+   return CalcPrivateShaderSize(hDevice, pShaderCode, NULL);
+}
+
+struct StageSignatures11_1
+{
+   D3D10DDIARG_SIGNATURE_ENTRY input[128];
+   D3D10DDIARG_SIGNATURE_ENTRY output[128];
+   D3D10DDIARG_STAGE_IO_SIGNATURES signatures;
+};
+
+static bool
+ConvertStageSignatures11_1(
+   D3D10DDI_HDEVICE hDevice,
+   const D3D11_1DDIARG_STAGE_IO_SIGNATURES *source,
+   StageSignatures11_1 *destination,
+   const D3D10DDIARG_STAGE_IO_SIGNATURES **signatures)
+{
+   if (!source) {
+      *signatures = NULL;
+      return true;
+   }
+
+   if (source->NumInputSignatureEntries > ARRAY_SIZE(destination->input) ||
+       source->NumOutputSignatureEntries > ARRAY_SIZE(destination->output) ||
+       (source->NumInputSignatureEntries && !source->pInputSignature) ||
+       (source->NumOutputSignatureEntries && !source->pOutputSignature)) {
+      SetError(hDevice, E_INVALIDARG);
+      return false;
+   }
+
+   for (unsigned i = 0; i < source->NumInputSignatureEntries; ++i) {
+      const D3D11_1DDIARG_SIGNATURE_ENTRY2 &entry =
+         source->pInputSignature[i];
+      destination->input[i] = {entry.SystemValue, entry.Register, entry.Mask};
+   }
+   for (unsigned i = 0; i < source->NumOutputSignatureEntries; ++i) {
+      const D3D11_1DDIARG_SIGNATURE_ENTRY2 &entry =
+         source->pOutputSignature[i];
+      destination->output[i] = {entry.SystemValue, entry.Register, entry.Mask};
+   }
+
+   destination->signatures = {
+      destination->input,
+      source->NumInputSignatureEntries,
+      destination->output,
+      source->NumOutputSignatureEntries,
+   };
+   *signatures = &destination->signatures;
+   return true;
 }
 
 static void APIENTRY
@@ -420,8 +467,13 @@ CreateVertexShader11_1(D3D10DDI_HDEVICE hDevice,
                        D3D10DDI_HRTSHADER hRTShader,
                        __in const D3D11_1DDIARG_STAGE_IO_SIGNATURES *pSignatures)
 {
-   CreateVertexShader(hDevice, pShaderCode, hShader, hRTShader,
-      reinterpret_cast<const D3D10DDIARG_STAGE_IO_SIGNATURES *>(pSignatures));
+   StageSignatures11_1 converted = {};
+   const D3D10DDIARG_STAGE_IO_SIGNATURES *signatures;
+
+   if (!ConvertStageSignatures11_1(hDevice, pSignatures, &converted,
+                                   &signatures))
+      return;
+   CreateVertexShader(hDevice, pShaderCode, hShader, hRTShader, signatures);
 }
 
 static void APIENTRY
@@ -431,8 +483,13 @@ CreateGeometryShader11_1(D3D10DDI_HDEVICE hDevice,
                          D3D10DDI_HRTSHADER hRTShader,
                          __in const D3D11_1DDIARG_STAGE_IO_SIGNATURES *pSignatures)
 {
-   CreateGeometryShader(hDevice, pShaderCode, hShader, hRTShader,
-      reinterpret_cast<const D3D10DDIARG_STAGE_IO_SIGNATURES *>(pSignatures));
+   StageSignatures11_1 converted = {};
+   const D3D10DDIARG_STAGE_IO_SIGNATURES *signatures;
+
+   if (!ConvertStageSignatures11_1(hDevice, pSignatures, &converted,
+                                   &signatures))
+      return;
+   CreateGeometryShader(hDevice, pShaderCode, hShader, hRTShader, signatures);
 }
 
 static void APIENTRY
@@ -442,8 +499,13 @@ CreatePixelShader11_1(D3D10DDI_HDEVICE hDevice,
                       D3D10DDI_HRTSHADER hRTShader,
                       __in const D3D11_1DDIARG_STAGE_IO_SIGNATURES *pSignatures)
 {
-   CreatePixelShader(hDevice, pShaderCode, hShader, hRTShader,
-      reinterpret_cast<const D3D10DDIARG_STAGE_IO_SIGNATURES *>(pSignatures));
+   StageSignatures11_1 converted = {};
+   const D3D10DDIARG_STAGE_IO_SIGNATURES *signatures;
+
+   if (!ConvertStageSignatures11_1(hDevice, pSignatures, &converted,
+                                   &signatures))
+      return;
+   CreatePixelShader(hDevice, pShaderCode, hShader, hRTShader, signatures);
 }
 
 static SIZE_T APIENTRY
@@ -453,8 +515,7 @@ CalcPrivateGeometryShaderWithStreamOutput11_1(
    __in const D3D11_1DDIARG_STAGE_IO_SIGNATURES *pSignatures)
 {
    return CalcPrivateGeometryShaderWithStreamOutput11(hDevice,
-      pCreateGeometryShaderWithStreamOutput,
-      reinterpret_cast<const D3D10DDIARG_STAGE_IO_SIGNATURES *>(pSignatures));
+      pCreateGeometryShaderWithStreamOutput, NULL);
 }
 
 static void APIENTRY
@@ -465,9 +526,15 @@ CreateGeometryShaderWithStreamOutput11_1(
    D3D10DDI_HRTSHADER hRTShader,
    __in const D3D11_1DDIARG_STAGE_IO_SIGNATURES *pSignatures)
 {
+   StageSignatures11_1 converted = {};
+   const D3D10DDIARG_STAGE_IO_SIGNATURES *signatures;
+
+   if (!ConvertStageSignatures11_1(hDevice, pSignatures, &converted,
+                                   &signatures))
+      return;
    CreateGeometryShaderWithStreamOutput11(hDevice,
       pCreateGeometryShaderWithStreamOutput, hShader, hRTShader,
-      reinterpret_cast<const D3D10DDIARG_STAGE_IO_SIGNATURES *>(pSignatures));
+      signatures);
 }
 
 static SIZE_T APIENTRY
@@ -877,6 +944,11 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
 
    gdikmt_d3dddi_fill_basefuncs(&pDevice->device);
 
+   HRESULT residency_hr = gdikmt_d3dddi_init_residency(
+      &pDevice->device, pCreateData->pKTCallbacks, D3D_UMD_INTERFACE_VERSION);
+   if (FAILED(residency_hr))
+      return residency_hr;
+
    pDevice->hRTCoreLayer = pCreateData->hRTCoreLayer;
    pDevice->UMCallbacks = *pCreateData->pUMCallbacks;
 
@@ -889,6 +961,7 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
       yttrium_gdi_user_logf("d3d10umd: CreateDevice failed to create pipe screen hAdapter=%p hDevice=%p\n",
                             hAdapter.pDrvPrivate,
                             pCreateData->hDrvDevice.pDrvPrivate);
+      pDevice->device.base.destroy(&pDevice->device.base);
       mtx_destroy(&pDevice->CreateResourceMtx);
       return E_FAIL;
    }
@@ -901,6 +974,7 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
                             pCreateData->hDrvDevice.pDrvPrivate,
                             screen);
       screen->destroy(screen);
+      pDevice->device.base.destroy(&pDevice->device.base);
       mtx_destroy(&pDevice->CreateResourceMtx);
       return E_FAIL;
    }
@@ -915,6 +989,7 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
                             pipe);
       pipe->destroy(pipe);
       screen->destroy(screen);
+      pDevice->device.base.destroy(&pDevice->device.base);
       mtx_destroy(&pDevice->CreateResourceMtx);
       return E_FAIL;
    }
@@ -947,6 +1022,7 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
       cso_destroy_context(cso);
       pipe->destroy(pipe);
       screen->destroy(screen);
+      pDevice->device.base.destroy(&pDevice->device.base);
       mtx_destroy(&pDevice->CreateResourceMtx);
       return E_FAIL;
    }
@@ -967,6 +1043,11 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
    
    // HACK: Use old texture operations if on virgl or Yttrium.
    const char *screen_name = screen->get_name(screen);
+   const bool is_yttrium =
+      screen_name &&
+      (strncmp(screen_name, "Yttrium", 7) == 0 ||
+       strncmp(screen_name, "yttrium", 7) == 0);
+   pDevice->yttrium_sampler_binding_map_enabled = is_yttrium;
    pDevice->constant_publication_enabled =
       pipe->const_uploader && screen_name &&
       strcmp(screen_name, "yttrium") == 0 &&
@@ -974,9 +1055,8 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
          "D3D10UMD_YTTRIUM_CONSTANT_BUFFER_PUBLICATION", true) &&
       yttrium_gdi_debug_get_bool_option(
          "D3D10UMD_YTTRIUM_ORDERED_CONTEXT_WORKER", true);
-   if(strncmp(screen_name, "virgl", 5) == 0 ||
-      strncmp(screen_name, "Yttrium", 7) == 0 ||
-      strncmp(screen_name, "yttrium", 7) == 0) {
+   if ((screen_name && strncmp(screen_name, "virgl", 5) == 0) ||
+       is_yttrium) {
       use_old_tex_ops = true;
    }
 
@@ -1366,6 +1446,7 @@ DestroyDevice(D3D10DDI_HDEVICE hDevice)   // IN
                  pDevice, NULL, 0, 0, 0,
                  (uint64_t)(uintptr_t)pDevice->screen);
    pDevice->screen->destroy(pDevice->screen);
+   pDevice->device.base.destroy(&pDevice->device.base);
    ResourceEvent(RESOURCE_EVENT_DEVICE_DESTROY_END,
                  (uint64_t)(uintptr_t)hDevice.pDrvPrivate,
                  pDevice, NULL, 0, 0, 0, 0);

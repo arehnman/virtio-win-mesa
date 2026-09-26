@@ -604,6 +604,8 @@ vn_wsi_clone_present_info(struct vn_device *dev, const VkPresentInfoKHR *pi)
    /* VK_KHR_incremental_present */
    VkPresentRegionsKHR *_pr;
    VkPresentRegionKHR *_pr_regions;
+   VkRectLayerKHR *_pr_rects;
+   size_t _pr_rect_count = 0;
 
    /* VK_KHR_present_id */
    VkPresentIdKHR *_id;
@@ -643,9 +645,17 @@ vn_wsi_clone_present_info(struct vn_device *dev, const VkPresentInfoKHR *pi)
                         dgpi->swapchainCount);
    }
    if (pr) {
+      for (uint32_t i = 0; i < pr->swapchainCount; i++) {
+         if (pr->pRegions[i].rectangleCount >
+             SIZE_MAX / sizeof(*_pr_rects) - _pr_rect_count)
+            return NULL;
+         _pr_rect_count += pr->pRegions[i].rectangleCount;
+      }
       vk_multialloc_add(&ma, &_pr, __typeof__(*_pr), 1);
       vk_multialloc_add(&ma, &_pr_regions, __typeof__(*_pr_regions),
                         pr->swapchainCount);
+      vk_multialloc_add(&ma, &_pr_rects, __typeof__(*_pr_rects),
+                        _pr_rect_count);
    }
    if (id) {
       vk_multialloc_add(&ma, &_id, __typeof__(*_id), 1);
@@ -703,7 +713,18 @@ vn_wsi_clone_present_info(struct vn_device *dev, const VkPresentInfoKHR *pi)
    }
 
    if (pr) {
-      typed_memcpy(_pr_regions, pr->pRegions, pr->swapchainCount);
+      VkRectLayerKHR *rects = _pr_rects;
+      for (uint32_t i = 0; i < pr->swapchainCount; i++) {
+         _pr_regions[i] = pr->pRegions[i];
+         if (_pr_regions[i].rectangleCount) {
+            typed_memcpy(rects, pr->pRegions[i].pRectangles,
+                         _pr_regions[i].rectangleCount);
+            _pr_regions[i].pRectangles = rects;
+            rects += _pr_regions[i].rectangleCount;
+         } else {
+            _pr_regions[i].pRectangles = NULL;
+         }
+      }
 
       *_pr = (VkPresentRegionsKHR){
          .sType = VK_STRUCTURE_TYPE_PRESENT_REGIONS_KHR,
@@ -837,9 +858,14 @@ vn_wsi_present_async(struct vn_device *dev,
    assert(!queue->async_present.pending);
    result = queue->async_present.result;
    if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
-      queue->async_present.info = vn_wsi_clone_present_info(dev, pi);
-      queue->async_present.pending = true;
-      cnd_signal(&queue->async_present.cond);
+      VkPresentInfoKHR *info = vn_wsi_clone_present_info(dev, pi);
+      if (!info) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      } else {
+         queue->async_present.info = info;
+         queue->async_present.pending = true;
+         cnd_signal(&queue->async_present.cond);
+      }
    }
    queue->async_present.result = VK_SUCCESS;
    mtx_unlock(&queue->async_present.mutex);

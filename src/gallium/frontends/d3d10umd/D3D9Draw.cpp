@@ -40,6 +40,18 @@ D3D9OrderedContextWorkerEnabled()
    return enabled != 0;
 }
 
+static bool
+D3D9ConsumeBackendDrawFailure(D3D9Device *device)
+{
+   if (!device ||
+       !yttrium_gdi_take_draw_failure(device->pipe))
+      return false;
+
+   D3D9Warnf("draw failed owner=d3d9umd "
+             "reason=backend_native_draw_failed action=return_E_FAIL\n");
+   return true;
+}
+
 struct D3D9AutoUploadResources
 {
    struct pipe_context *pipe = NULL;
@@ -2692,6 +2704,9 @@ D3D9DrawDiffuse(D3D9Device *device, D3DPRIMITIVETYPE primitive_type,
                 UINT index_size, const void *user_indices,
                 bool runtime_transformed_vertices)
 {
+   if (D3D9ConsumeBackendDrawFailure(device))
+      return E_FAIL;
+
    const enum mesa_prim mode = D3D9PrimitiveToPipe(primitive_type);
    const UINT vertex_count =
       D3D9PrimitiveVertexCount(primitive_type, primitive_count);
@@ -3088,7 +3103,7 @@ D3D9DrawDiffuse(D3D9Device *device, D3DPRIMITIVETYPE primitive_type,
               primitive_type, primitive_count, start_vertex,
               first_vertex_offset, vertex_count, indexed ? 1 : 0,
               index_bias, start_index, index_size, 0);
-   return S_OK;
+   return D3D9ConsumeBackendDrawFailure(device) ? E_FAIL : S_OK;
 }
 
 HRESULT APIENTRY

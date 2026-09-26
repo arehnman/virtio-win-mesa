@@ -15,6 +15,10 @@
  * image for a legacy blt Present, so its exported backing must be cached. */
 #define YTTRIUM_GDI_RESOURCE_FLAG_CPU_READBACK PIPE_RESOURCE_FLAG_DRV_PRIV
 
+/* Internal per-UAV counter image.  Its one R32_UINT texel may be copied to
+ * an aligned byte offset in a buffer by CopyStructureCount. */
+#define YTTRIUM_GDI_RESOURCE_FLAG_UAV_COUNTER (PIPE_RESOURCE_FLAG_DRV_PRIV << 1)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -22,6 +26,7 @@ extern "C" {
 struct pipe_resource;
 struct pipe_context;
 struct pipe_fence_handle;
+struct yttrium_gdi_flush_issuance;
 struct pipe_screen *
 yttrium_gdi_screen_create(struct gdikmt_device *device);
 
@@ -31,22 +36,43 @@ yttrium_gdi_flush_labeled(struct pipe_context *ctx,
                           unsigned flags,
                           const char *label);
 
+struct yttrium_gdi_flush_issuance *
+yttrium_gdi_flush_async_issuance(struct pipe_context *ctx,
+                                 const char *label);
+
+bool
+yttrium_gdi_wait_flush_issuance(
+   struct yttrium_gdi_flush_issuance *issuance,
+   uint32_t timeout_ms);
+
+void
+yttrium_gdi_flush_issuance_release(
+   struct yttrium_gdi_flush_issuance *issuance);
+
 /* The display allocation a Present published, handed to the ordered worker so
  * that it can issue the display flush after the frame completes. */
 struct yttrium_gdi_present_publish_request {
    uint32_t allocation;
    uint32_t scanout_id;
    bool valid;
+   struct gdikmt_context *signal_context;
+   uint64_t signal_value;
 };
 
 bool
 yttrium_gdi_flush_async_present(
    struct pipe_context *ctx,
    const char *label,
-   const struct yttrium_gdi_present_publish_request *publish);
+   const struct yttrium_gdi_present_publish_request *publish,
+   struct yttrium_gdi_flush_issuance **issued);
 
 bool
 yttrium_gdi_screen_supports_logic_op(struct pipe_screen *screen);
+
+/* Nonblocking handoff of an asynchronously detected native draw failure to
+ * the D3D DDI entry point.  Reading the latch never drains the worker. */
+bool
+yttrium_gdi_take_draw_failure(struct pipe_context *ctx);
 
 void
 yttrium_gdi_resource_set_primary_target(struct pipe_resource *resource,

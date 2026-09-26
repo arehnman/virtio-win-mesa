@@ -12,6 +12,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include "compiler/shader_enums.h"
 #include "pipe/p_state.h"
 #include "util/format/u_formats.h"
 
@@ -40,6 +41,11 @@ struct yttrium_venus_present_publication {
 #define YTTRIUM_VENUS_MAX_PIPELINE_UBO_SLOTS 32
 #define YTTRIUM_VENUS_MAX_PIPELINE_UBO_BINDINGS \
    YTTRIUM_VENUS_MAX_PIPELINE_UBO_SLOTS
+/* Sampled-resource slots are local to each shader stage.  Keep the active
+ * descriptor limit compact, but reserve a disjoint binding bank for every GL
+ * shader stage so (for example) VS s0 and FS s0 cannot alias.
+ */
+#define YTTRIUM_VENUS_SAMPLED_STAGE_COUNT MESA_SHADER_STAGES
 #define YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES PIPE_MAX_SAMPLERS
 #define YTTRIUM_VENUS_PIPELINE_SAMPLED_IMAGE_MASK UINT32_MAX
 #define YTTRIUM_VENUS_MAX_PIPELINE_STORAGE_IMAGES PIPE_MAX_SHADER_IMAGES
@@ -47,7 +53,6 @@ struct yttrium_venus_present_publication {
    UINT64_MAX
 #define YTTRIUM_VENUS_MAX_PIPELINE_VERTEX_BINDINGS 32
 #define YTTRIUM_VENUS_MAX_STREAM_OUTPUT_TARGETS 4
-#define YTTRIUM_VENUS_SAMPLE_IMAGE_VIEW_CACHE_SIZE 8
 #define YTTRIUM_VENUS_MAX_DS_CLEAR_HISTORY 32
 #define YTTRIUM_VENUS_SAMPLE_SWIZZLE_BITS 3
 #define YTTRIUM_VENUS_SAMPLE_SWIZZLE_MASK \
@@ -153,10 +158,21 @@ struct yttrium_venus_sampler_state {
    VkBool32 anisotropy_enable;
    VkBool32 compare_enable;
    VkCompareOp compare_op;
+   VkBorderColor border_color;
+   VkClearColorValue custom_border_color;
    float mip_lod_bias;
    float min_lod;
    float max_lod;
    float max_anisotropy;
+};
+
+struct yttrium_venus_sampled_binding_layout {
+   uint32_t binding;
+   uint32_t stage;
+   uint32_t raw_slot;
+   VkShaderStageFlags stage_flags;
+   VkBool32 buffer;
+   struct yttrium_venus_sampler_state sampler;
 };
 
 struct yttrium_venus_sampled_image {
@@ -216,6 +232,7 @@ struct yttrium_venus_stream_output_target {
 };
 
 struct yttrium_venus_sample_image_view {
+   struct yttrium_venus_sample_image_view *next;
    struct yttrium_venus_object obj;
    VkImageView view;
    VkFormat vk_format;
@@ -283,8 +300,7 @@ struct yttrium_venus_resource {
    VkBuffer buffer;
    VkDeviceMemory memory;
    VkImageView image_view;
-   struct yttrium_venus_sample_image_view
-      sample_image_view_cache[YTTRIUM_VENUS_SAMPLE_IMAGE_VIEW_CACHE_SIZE];
+   struct yttrium_venus_sample_image_view *sample_image_views;
    struct yttrium_venus_sample_buffer_view *sample_buffer_views;
    VkRenderPass render_pass;
    VkFramebuffer framebuffer;
@@ -392,6 +408,11 @@ struct yttrium_venus_draw_state {
    VkPrimitiveTopology topology;
    VkBool32 primitive_restart_enable;
    VkBool32 rasterizer_discard_enable;
+   /*
+    * The draw has live stream-output state but no colour or depth target.
+    * resource remains a lifetime/submission anchor; it is not an attachment.
+    */
+   VkBool32 targetless_stream_output;
    VkCullModeFlags cull_mode;
    VkFrontFace front_face;
    VkBool32 depth_bias_enable;
@@ -451,6 +472,9 @@ struct yttrium_venus_draw_state {
    uint16_t push_constant_vs_size;
    uint16_t push_constant_fs_size;
    uint8_t push_constant_data[YTTRIUM_SHADER_PUSH_CONSTANT_BYTES];
+   /* Per-draw arguments, never part of the immutable pipeline key. */
+   struct yttrium_venus_resource *indirect_resource;
+   VkDeviceSize indirect_offset;
 };
 
 struct yttrium_venus;
@@ -503,14 +527,15 @@ yttrium_venus_pipeline_init(struct yttrium_venus *venus,
                             uint32_t attrib_count,
                             const struct yttrium_venus_ubo_binding_layout *ubo_bindings,
                             uint32_t ubo_binding_count,
-                            uint32_t sampled_image_mask,
-                            uint32_t sampled_buffer_mask,
-                            VkShaderStageFlags sampled_stage_flags,
+                            const struct yttrium_venus_sampled_binding_layout *sampled_bindings,
+                            uint32_t sampled_binding_count,
                             uint64_t storage_image_mask,
                             uint64_t storage_buffer_mask,
                             VkShaderStageFlags storage_stage_flags,
-                            const struct yttrium_venus_sampler_state *samplers,
                             const struct yttrium_venus_draw_state *draw_state);
+
+bool
+yttrium_venus_supports_load_store_op_none(struct yttrium_venus *venus);
 
 bool
 yttrium_venus_supports_multisampled_render_to_single_sampled(
@@ -532,12 +557,23 @@ yttrium_venus_sampled_texture_format_supported(
    enum pipe_texture_target target);
 
 bool
+yttrium_venus_storage_image_without_format_supported(
+   struct yttrium_venus *venus, bool read, bool write);
+
+bool
+yttrium_venus_storage_image_formatless_format_supported(
+   struct yttrium_venus *venus, enum pipe_format format,
+   bool read, bool write);
+
+bool
 yttrium_venus_compute_pipeline_init(
    struct yttrium_venus *venus,
    struct yttrium_pipeline *pipeline,
    VkShaderModule compute_shader,
    const struct yttrium_venus_ubo_binding_layout *ubo_bindings,
    uint32_t ubo_binding_count,
+   const struct yttrium_venus_sampled_binding_layout *sampled_bindings,
+   uint32_t sampled_binding_count,
    uint64_t storage_image_mask,
    uint64_t storage_buffer_mask);
 
@@ -584,6 +620,8 @@ bool
 yttrium_venus_dispatch_compute(
    struct yttrium_venus *venus,
    struct yttrium_pipeline *pipeline,
+   const struct yttrium_venus_sampled_image *sampled_images,
+   uint32_t sampled_image_count,
    const struct yttrium_venus_storage_image *storage_images,
    uint32_t storage_image_count,
    const struct yttrium_venus_ubo_upload *ubo_uploads,

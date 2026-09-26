@@ -41,6 +41,7 @@
 #include "util/u_memory.h"
 
 #include "gallium/winsys/yttrium/gdi/yttrium_gdi_public.h"
+#include "gallium/winsys/yttrium/gdi/yttrium_trace.h"
 
 static bool
 OrderedContextWorkerEnabled()
@@ -55,38 +56,15 @@ OrderedContextWorkerEnabled()
 }
 
 static bool
-ReadBufferRange(struct pipe_context *pipe, Resource *resource,
-                unsigned offset, unsigned size, void *data)
+ConsumeBackendDrawFailure(D3D10DDI_HDEVICE hDevice)
 {
-   if (!pipe || !resource || !resource->resource ||
-       resource->resource->target != PIPE_BUFFER || !data ||
-       offset > resource->resource->width0 ||
-       size > resource->resource->width0 - offset)
+   if (!yttrium_gdi_take_draw_failure(CastPipeContext(hDevice)))
       return false;
 
-   struct pipe_box box = {};
-   box.x = offset;
-   box.width = size;
-   box.height = 1;
-   box.depth = 1;
-
-   struct pipe_transfer *transfer = NULL;
-   void *map = pipe->buffer_map(pipe, resource->resource, 0, PIPE_MAP_READ,
-                                &box, &transfer);
-   if (map) {
-      memcpy(data, map, size);
-      pipe->buffer_unmap(pipe, transfer);
-      return true;
-   }
-
-   if (resource->buffer_shadow &&
-       offset <= resource->buffer_shadow_size &&
-       size <= resource->buffer_shadow_size - offset) {
-      memcpy(data, (const uint8_t *)resource->buffer_shadow + offset, size);
-      return true;
-   }
-
-   return false;
+   YTTRIUM_WARN("yttrium: draw failed owner=d3d10umd "
+                "reason=backend_native_draw_failed action=SetError\n");
+   SetError(hDevice, E_FAIL);
+   return true;
 }
 
 static unsigned
@@ -113,43 +91,112 @@ update_velems(Device *pDevice)
       for (unsigned i = 0; i < state->count; i++)
          state->velems[i].src_stride = pDevice->vertex_strides[state->velems[i].vertex_buffer_index];
       cso_set_vertex_elements(pDevice->cso, state);
+   } else {
+      /* IASetInputLayout(NULL) must retire the previous layout.  System-value
+       * only shaders need no vertex buffers, including on indirect draws.
+       */
+      struct cso_velems_state empty = {};
+      cso_set_vertex_elements(pDevice->cso, &empty);
    }
 
    pDevice->velems_changed = false;
 }
 
-/*
- * We have to resolve the stream output state for empty geometry shaders.
- * In particular we've remapped the output indices when translating the
- * shaders so now the register_index variables in the stream output
- * state are incorrect and we need to remap them back to the correct
- * state.
+/* A tokenless geometry shader inherits the active vertex shader.  Its stream
+ * output declaration names original D3D output registers, while translation
+ * packs the active shader's outputs into TGSI register indices.  Always map
+ * from the preserved D3D registers so switching vertex shaders cannot remap
+ * an already-remapped index.
  */
-static void
-ResolveState(Device *pDevice)
+static bool
+ResolveState(D3D10DDI_HDEVICE hDevice)
 {
+   Device *pDevice = CastDevice(hDevice);
+
    RefreshBoundShaderResourceViews(pDevice);
 
-   if (pDevice->bound_empty_gs && pDevice->bound_vs &&
-       pDevice->bound_vs->state.tokens) {
+   if (pDevice->bound_empty_gs) {
       Shader *gs = pDevice->bound_empty_gs;
       Shader *vs = pDevice->bound_vs;
-      bool remapped = false;
       struct pipe_context *pipe = pDevice->pipe;
-      if (!gs->output_resolved) {
-         for (unsigned i = 0; i < gs->state.stream_output.num_outputs; ++i) {
-            unsigned mapping =
-               ShaderFindOutputMapping(vs, gs->state.stream_output.output[i].register_index);
-            if (mapping != gs->state.stream_output.output[i].register_index) {
-               gs->state.stream_output.output[i].register_index = mapping;
-               remapped = true;
+      if (!vs || !vs->state.tokens) {
+         YTTRIUM_WARN("yttrium: d3d10umd tokenless geometry stream-output "
+                      "remap failed; draw rejected vs=%p "
+                      "reason=vertex_shader_unavailable\n",
+                      vs);
+         SetError(hDevice, E_FAIL);
+         return false;
+      }
+
+      const struct pipe_stream_output_info *stream_output_template =
+         &gs->stream_output_template;
+      struct pipe_stream_output_info resolved = {};
+      memcpy(resolved.stride, stream_output_template->stride,
+             sizeof(resolved.stride));
+
+      for (unsigned i = 0; i < stream_output_template->num_outputs; ++i) {
+         const unsigned d3d_register =
+            gs->stream_output_d3d_registers[i];
+         const unsigned mapping = ShaderFindOutputMapping(vs, d3d_register);
+         if (mapping == ~0u) {
+            const struct pipe_stream_output *unwritten =
+               &stream_output_template->output[i];
+            const unsigned declaration_mask =
+               ((1u << unwritten->num_components) - 1u) <<
+               unwritten->start_component;
+            if (d3d_register >= PIPE_MAX_SHADER_OUTPUTS ||
+                (declaration_mask &
+                 ~gs->stream_output_signature_masks[d3d_register])) {
+               YTTRIUM_WARN("yttrium: d3d10umd tokenless geometry "
+                            "stream-output remap failed; draw rejected "
+                            "output=%u d3d_register=%u mask=0x%x "
+                            "reason=unmapped_output_not_in_signature\n",
+                            i, d3d_register, declaration_mask);
+               SetError(hDevice, E_FAIL);
+               return false;
             }
+
+            /* The complete tokenless-SO signature may contain an output that
+             * this particular VS does not declare.  Its captured value is
+             * undefined.  Omit that write while preserving the declaration's
+             * destination offset and the complete record stride.
+             */
+            continue;
          }
-         if (remapped) {
-            pipe->delete_gs_state(pipe, gs->handle);
-            gs->handle = pipe->create_gs_state(pipe, &gs->state);
+
+         struct pipe_stream_output *output =
+            &resolved.output[resolved.num_outputs++];
+         *output = stream_output_template->output[i];
+         output->register_index = mapping;
+      }
+
+      if (stream_output_template->num_outputs && !resolved.num_outputs) {
+         YTTRIUM_WARN("yttrium: d3d10umd tokenless geometry stream-output "
+                      "remap failed; draw rejected vs=%p "
+                      "reason=no_declared_outputs_for_primitive_accounting\n",
+                      vs);
+         SetError(hDevice, E_FAIL);
+         return false;
+      }
+
+      const bool remapped =
+         memcmp(&resolved, &gs->state.stream_output, sizeof(resolved)) != 0;
+      if (remapped) {
+         struct pipe_shader_state resolved_state = gs->state;
+         resolved_state.stream_output = resolved;
+         void *resolved_handle = pipe->create_gs_state(pipe, &resolved_state);
+         if (!resolved_handle) {
+            YTTRIUM_WARN("yttrium: d3d10umd tokenless geometry stream-output "
+                         "state creation failed; draw rejected vs=%p "
+                         "outputs=%u\n",
+                         vs, resolved.num_outputs);
+            SetError(hDevice, E_FAIL);
+            return false;
          }
-         gs->output_resolved = true;
+
+         pipe->delete_gs_state(pipe, gs->handle);
+         gs->handle = resolved_handle;
+         gs->state.stream_output = resolved;
       }
       pipe->bind_gs_state(pipe, gs->handle);
    }
@@ -175,6 +222,8 @@ ResolveState(Device *pDevice)
                              pDevice->vertex_buffers);
       pDevice->vbuffers_changed = false;
    }
+
+   return true;
 }
 
 
@@ -221,7 +270,10 @@ Draw(D3D10DDI_HDEVICE hDevice,   // IN
 
    Device *pDevice = CastDevice(hDevice);
 
-   ResolveState(pDevice);
+   if (ConsumeBackendDrawFailure(hDevice))
+      return;
+   if (!ResolveState(hDevice))
+      return;
    if (RunVertexShaderEmulation(pDevice, VertexCount))
       return;
    if (RunPixelShaderEmulation(pDevice))
@@ -232,6 +284,7 @@ Draw(D3D10DDI_HDEVICE hDevice,   // IN
                     pDevice->primitive,
                     StartVertexLocation,
                     VertexCount);
+   (void)ConsumeBackendDrawFailure(hDevice);
 }
 
 
@@ -261,6 +314,8 @@ DrawIndexed(D3D10DDI_HDEVICE hDevice,  // IN
    unsigned index_size = pDevice->index_size;
    unsigned ib_offset = pDevice->ib_offset;
 
+   if (ConsumeBackendDrawFailure(hDevice))
+      return;
    assert(pDevice->primitive < MESA_PRIM_COUNT);
 
    /* XXX I don't think draw still needs this? */
@@ -271,7 +326,11 @@ DrawIndexed(D3D10DDI_HDEVICE hDevice,  // IN
                                   &restart_index, &index_size, &ib_offset);
    }
 
-   ResolveState(pDevice);
+   if (!ResolveState(hDevice)) {
+      if (null_ib)
+         pipe_resource_reference(&null_ib, NULL);
+      return;
+   }
    if (RunPixelShaderEmulation(pDevice)) {
       if (null_ib)
          pipe_resource_reference(&null_ib, NULL);
@@ -289,6 +348,7 @@ DrawIndexed(D3D10DDI_HDEVICE hDevice,  // IN
    info.restart_index = restart_index;
 
    pDevice->pipe->draw_vbo(pDevice->pipe, &info, 0, NULL, &draw, 1);
+   (void)ConsumeBackendDrawFailure(hDevice);
 
    if (null_ib) {
       pipe_resource_reference(&null_ib, NULL);
@@ -318,11 +378,14 @@ DrawInstanced(D3D10DDI_HDEVICE hDevice,      // IN
 
    Device *pDevice = CastDevice(hDevice);
 
+   if (ConsumeBackendDrawFailure(hDevice))
+      return;
    if (!InstanceCount) {
       return;
    }
 
-   ResolveState(pDevice);
+   if (!ResolveState(hDevice))
+      return;
    if (RunPixelShaderEmulation(pDevice))
       return;
 
@@ -333,6 +396,7 @@ DrawInstanced(D3D10DDI_HDEVICE hDevice,      // IN
                               VertexCountPerInstance,
                               StartInstanceLocation,
                               InstanceCount);
+   (void)ConsumeBackendDrawFailure(hDevice);
 }
 
 
@@ -365,6 +429,8 @@ DrawIndexedInstanced(D3D10DDI_HDEVICE hDevice,   // IN
    unsigned index_size = pDevice->index_size;
    unsigned ib_offset = pDevice->ib_offset;
 
+   if (ConsumeBackendDrawFailure(hDevice))
+      return;
    assert(pDevice->primitive < MESA_PRIM_COUNT);
 
    if (!InstanceCount) {
@@ -379,7 +445,11 @@ DrawIndexedInstanced(D3D10DDI_HDEVICE hDevice,   // IN
                                   &restart_index, &index_size, &ib_offset);
    }
 
-   ResolveState(pDevice);
+   if (!ResolveState(hDevice)) {
+      if (null_ib)
+         pipe_resource_reference(&null_ib, NULL);
+      return;
+   }
    if (RunPixelShaderEmulation(pDevice)) {
       if (null_ib)
          pipe_resource_reference(&null_ib, NULL);
@@ -399,10 +469,63 @@ DrawIndexedInstanced(D3D10DDI_HDEVICE hDevice,   // IN
    info.restart_index = restart_index;
 
    pDevice->pipe->draw_vbo(pDevice->pipe, &info, 0, NULL, &draw, 1);
+   (void)ConsumeBackendDrawFailure(hDevice);
 
    if (null_ib) {
       pipe_resource_reference(&null_ib, NULL);
    }
+}
+
+static void
+DrawIndirect(D3D10DDI_HDEVICE hDevice,
+             D3D10DDI_HRESOURCE hBufferForArgs,
+             UINT AlignedByteOffsetForArgs, bool indexed)
+{
+   Device *pDevice = CastDevice(hDevice);
+   Resource *pArgs = CastResource(hBufferForArgs);
+   const UINT args_size = (indexed ? 5 : 4) * sizeof(UINT);
+   if (ConsumeBackendDrawFailure(hDevice))
+      return;
+   if (!pArgs || !pArgs->resource ||
+       pArgs->resource->target != PIPE_BUFFER ||
+       !(pArgs->resource->bind & PIPE_BIND_COMMAND_ARGS_BUFFER) ||
+       (AlignedByteOffsetForArgs & 3) ||
+       AlignedByteOffsetForArgs > pArgs->resource->width0 ||
+       args_size > pArgs->resource->width0 - AlignedByteOffsetForArgs ||
+       (indexed && (!pDevice->index_buffer ||
+                    (pDevice->index_size != 2 && pDevice->index_size != 4) ||
+                    pDevice->ib_offset % pDevice->index_size))) {
+      YTTRIUM_WARN("yttrium: draw failed owner=d3d10umd "
+                   "component=DrawIndirect reason=invalid_buffer_or_offset "
+                   "indexed=%u offset=%u action=SetError\n",
+                   indexed, AlignedByteOffsetForArgs);
+      SetError(hDevice, E_INVALIDARG);
+      return;
+   }
+
+   if (!ResolveState(hDevice))
+      return;
+
+   struct pipe_draw_info info;
+   util_draw_init_info(&info);
+   info.mode = pDevice->primitive;
+   if (indexed) {
+      info.index_size = pDevice->index_size;
+      info.index.resource = pDevice->index_buffer;
+      info.primitive_restart = true;
+      info.restart_index = pDevice->restart_index;
+   }
+   struct pipe_draw_indirect_info indirect = {};
+   indirect.buffer = pArgs->resource;
+   indirect.offset = AlignedByteOffsetForArgs;
+   indirect.stride = args_size;
+   indirect.draw_count = 1;
+   /* Gallium adds draw.start to indirect firstIndex.  Preserve the IA byte
+    * offset here; the backend binds the index buffer at that byte offset. */
+   struct pipe_draw_start_count_bias draw = {};
+   draw.start = indexed ? pDevice->ib_offset / pDevice->index_size : 0;
+   pDevice->pipe->draw_vbo(pDevice->pipe, &info, 0, &indirect, &draw, 1);
+   (void)ConsumeBackendDrawFailure(hDevice);
 }
 
 void APIENTRY
@@ -411,26 +534,7 @@ DrawIndexedInstancedIndirect(D3D10DDI_HDEVICE hDevice,
                              UINT AlignedByteOffsetForArgs)
 {
    LOG_ENTRYPOINT();
-
-   struct DrawIndexedInstancedIndirectArgs {
-      UINT IndexCountPerInstance;
-      UINT InstanceCount;
-      UINT StartIndexLocation;
-      INT BaseVertexLocation;
-      UINT StartInstanceLocation;
-   } args = {};
-
-   Device *pDevice = CastDevice(hDevice);
-   Resource *pArgs = CastResource(hBufferForArgs);
-   if (!ReadBufferRange(pDevice->pipe, pArgs, AlignedByteOffsetForArgs,
-                        sizeof(args), &args)) {
-      LOG_UNSUPPORTED("DrawIndexedInstancedIndirect failed to read args");
-      return;
-   }
-
-   DrawIndexedInstanced(hDevice, args.IndexCountPerInstance,
-                        args.InstanceCount, args.StartIndexLocation,
-                        args.BaseVertexLocation, args.StartInstanceLocation);
+   DrawIndirect(hDevice, hBufferForArgs, AlignedByteOffsetForArgs, true);
 }
 
 void APIENTRY
@@ -440,23 +544,7 @@ DrawInstancedIndirect(D3D10DDI_HDEVICE hDevice,
 {
    LOG_ENTRYPOINT();
 
-   struct DrawInstancedIndirectArgs {
-      UINT VertexCountPerInstance;
-      UINT InstanceCount;
-      UINT StartVertexLocation;
-      UINT StartInstanceLocation;
-   } args = {};
-
-   Device *pDevice = CastDevice(hDevice);
-   Resource *pArgs = CastResource(hBufferForArgs);
-   if (!ReadBufferRange(pDevice->pipe, pArgs, AlignedByteOffsetForArgs,
-                        sizeof(args), &args)) {
-      LOG_UNSUPPORTED("DrawInstancedIndirect failed to read args");
-      return;
-   }
-
-   DrawInstanced(hDevice, args.VertexCountPerInstance, args.InstanceCount,
-                 args.StartVertexLocation, args.StartInstanceLocation);
+   DrawIndirect(hDevice, hBufferForArgs, AlignedByteOffsetForArgs, false);
 }
 
 
@@ -484,15 +572,20 @@ DrawAuto(D3D10DDI_HDEVICE hDevice)  // IN
    struct pipe_draw_info info;
    struct pipe_draw_indirect_info indirect;
 
-
+   if (ConsumeBackendDrawFailure(hDevice))
+      return;
    if (!pDevice->draw_so_target) {
-      LOG_UNSUPPORTED("DrawAuto without a set source buffer!");
+      YTTRIUM_WARN("yttrium: draw failed owner=d3d10umd "
+                   "component=DrawAuto reason=no_stream_output_source "
+                   "action=SetError\n");
+      SetError(hDevice, E_FAIL);
       return;
    }
 
    assert(pDevice->primitive < MESA_PRIM_COUNT);
 
-   ResolveState(pDevice);
+   if (!ResolveState(hDevice))
+      return;
    if (RunPixelShaderEmulation(pDevice))
       return;
 
@@ -502,4 +595,5 @@ DrawAuto(D3D10DDI_HDEVICE hDevice)  // IN
    indirect.count_from_stream_output = pDevice->draw_so_target;
 
    pDevice->pipe->draw_vbo(pDevice->pipe, &info, 0, &indirect, NULL, 1);
+   (void)ConsumeBackendDrawFailure(hDevice);
 }

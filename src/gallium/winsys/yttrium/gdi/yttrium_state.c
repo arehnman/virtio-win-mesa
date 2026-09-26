@@ -7,6 +7,7 @@
 
 #include <string.h>
 
+#include "util/blend.h"
 #include "util/format/u_format.h"
 #include "util/u_framebuffer.h"
 #include "util/u_inlines.h"
@@ -187,6 +188,13 @@ yttrium_build_vertex_input_state(struct yttrium_vertex_elements_state *state)
       int mapped_binding;
       VkFormat vk_format;
 
+      /* D3D input layouts are indexed by shader register and can have gaps.
+       * A hole must not create a binding: its zero divisor could otherwise
+       * conflict with real per-instance elements using the same buffer.
+       */
+      if (elem->src_format == PIPE_FORMAT_NONE)
+         continue;
+
       if (source_binding >= PIPE_MAX_ATTRIBS) {
          state->vk_vertex_input_valid = false;
          continue;
@@ -221,10 +229,12 @@ yttrium_build_vertex_input_state(struct yttrium_vertex_elements_state *state)
       if (vk_format == VK_FORMAT_UNDEFINED)
          state->vk_vertex_input_valid = false;
 
-      state->attribs[i].location = i;
-      state->attribs[i].binding = mapped_binding < 0 ? 0 : mapped_binding;
-      state->attribs[i].format = vk_format;
-      state->attribs[i].offset = elem->src_offset;
+      VkVertexInputAttributeDescription *attrib =
+         &state->attribs[state->num_attribs++];
+      attrib->location = i;
+      attrib->binding = mapped_binding;
+      attrib->format = vk_format;
+      attrib->offset = elem->src_offset;
    }
 }
 
@@ -246,22 +256,28 @@ yttrium_create_vertex_elements_state(
    }
    yttrium_build_vertex_input_state(state);
 
-   YTTRIUM_LOG("yttrium: create vertex elements count=%u stored=%u vk_valid=%u vk_bindings=%u\n",
+   YTTRIUM_LOG("yttrium: create vertex elements count=%u stored=%u vk_valid=%u vk_bindings=%u vk_attribs=%u\n",
                 num_elements, state->num_elements,
-                state->vk_vertex_input_valid, state->num_bindings);
+                state->vk_vertex_input_valid, state->num_bindings,
+                state->num_attribs);
    for (unsigned i = 0; i < state->num_bindings; i++) {
       const VkVertexInputBindingDescription *binding = &state->bindings[i];
       YTTRIUM_LOG("yttrium:   vi binding[%u] source_vb=%u stride=%u rate=%u divisor=%u\n",
                    i, state->binding_map[i], binding->stride,
                    binding->inputRate, state->binding_divisor[i]);
    }
+   unsigned attrib_index = 0;
    for (unsigned i = 0; i < state->num_elements; i++) {
       const struct pipe_vertex_element *ve = &state->elements[i];
-      const VkVertexInputAttributeDescription *attrib = &state->attribs[i];
+      const VkVertexInputAttributeDescription *attrib =
+         attrib_index < state->num_attribs &&
+         state->attribs[attrib_index].location == i ?
+         &state->attribs[attrib_index++] : NULL;
       YTTRIUM_LOG("yttrium:   ve[%u] vb=%u offset=%u stride=%u format=%u divisor=%u vk_binding=%u vk_format=%u\n",
                    i, ve->vertex_buffer_index, ve->src_offset,
                    ve->src_stride, ve->src_format, ve->instance_divisor,
-                   attrib->binding, attrib->format);
+                   attrib ? attrib->binding : ~0u,
+                   attrib ? attrib->format : VK_FORMAT_UNDEFINED);
    }
 
    return state;
@@ -401,6 +417,157 @@ yttrium_delete_rasterizer_state(struct pipe_context *ctx, void *state)
    FREE(state);
 }
 
+static VkBlendFactor
+yttrium_pipe_blend_factor(enum pipe_blendfactor factor)
+{
+   switch (factor) {
+   case PIPE_BLENDFACTOR_ONE:
+      return VK_BLEND_FACTOR_ONE;
+   case PIPE_BLENDFACTOR_SRC_COLOR:
+      return VK_BLEND_FACTOR_SRC_COLOR;
+   case PIPE_BLENDFACTOR_SRC_ALPHA:
+      return VK_BLEND_FACTOR_SRC_ALPHA;
+   case PIPE_BLENDFACTOR_DST_ALPHA:
+      return VK_BLEND_FACTOR_DST_ALPHA;
+   case PIPE_BLENDFACTOR_DST_COLOR:
+      return VK_BLEND_FACTOR_DST_COLOR;
+   case PIPE_BLENDFACTOR_SRC_ALPHA_SATURATE:
+      return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+   case PIPE_BLENDFACTOR_CONST_COLOR:
+      return VK_BLEND_FACTOR_CONSTANT_COLOR;
+   case PIPE_BLENDFACTOR_CONST_ALPHA:
+      return VK_BLEND_FACTOR_CONSTANT_ALPHA;
+   case PIPE_BLENDFACTOR_SRC1_COLOR:
+      return VK_BLEND_FACTOR_SRC1_COLOR;
+   case PIPE_BLENDFACTOR_SRC1_ALPHA:
+      return VK_BLEND_FACTOR_SRC1_ALPHA;
+   case PIPE_BLENDFACTOR_ZERO:
+      return VK_BLEND_FACTOR_ZERO;
+   case PIPE_BLENDFACTOR_INV_SRC_COLOR:
+      return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+   case PIPE_BLENDFACTOR_INV_SRC_ALPHA:
+      return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+   case PIPE_BLENDFACTOR_INV_DST_ALPHA:
+      return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+   case PIPE_BLENDFACTOR_INV_DST_COLOR:
+      return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+   case PIPE_BLENDFACTOR_INV_CONST_COLOR:
+      return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+   case PIPE_BLENDFACTOR_INV_CONST_ALPHA:
+      return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+   case PIPE_BLENDFACTOR_INV_SRC1_COLOR:
+      return VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR;
+   case PIPE_BLENDFACTOR_INV_SRC1_ALPHA:
+      return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
+   default:
+      YTTRIUM_LOG("yttrium: unsupported blend factor %u, using ONE\n",
+                   factor);
+      return VK_BLEND_FACTOR_ONE;
+   }
+}
+
+static VkBlendOp
+yttrium_pipe_blend_op(enum pipe_blend_func func)
+{
+   switch (func) {
+   case PIPE_BLEND_ADD:
+      return VK_BLEND_OP_ADD;
+   case PIPE_BLEND_SUBTRACT:
+      return VK_BLEND_OP_SUBTRACT;
+   case PIPE_BLEND_REVERSE_SUBTRACT:
+      return VK_BLEND_OP_REVERSE_SUBTRACT;
+   case PIPE_BLEND_MIN:
+      return VK_BLEND_OP_MIN;
+   case PIPE_BLEND_MAX:
+      return VK_BLEND_OP_MAX;
+   default:
+      YTTRIUM_LOG("yttrium: unsupported blend op %u, using ADD\n", func);
+      return VK_BLEND_OP_ADD;
+   }
+}
+
+static VkLogicOp
+yttrium_pipe_logic_op(unsigned logic_op)
+{
+   switch (logic_op) {
+   case PIPE_LOGICOP_CLEAR:
+      return VK_LOGIC_OP_CLEAR;
+   case PIPE_LOGICOP_NOR:
+      return VK_LOGIC_OP_NOR;
+   case PIPE_LOGICOP_AND_INVERTED:
+      return VK_LOGIC_OP_AND_INVERTED;
+   case PIPE_LOGICOP_COPY_INVERTED:
+      return VK_LOGIC_OP_COPY_INVERTED;
+   case PIPE_LOGICOP_AND_REVERSE:
+      return VK_LOGIC_OP_AND_REVERSE;
+   case PIPE_LOGICOP_INVERT:
+      return VK_LOGIC_OP_INVERT;
+   case PIPE_LOGICOP_XOR:
+      return VK_LOGIC_OP_XOR;
+   case PIPE_LOGICOP_NAND:
+      return VK_LOGIC_OP_NAND;
+   case PIPE_LOGICOP_AND:
+      return VK_LOGIC_OP_AND;
+   case PIPE_LOGICOP_EQUIV:
+      return VK_LOGIC_OP_EQUIVALENT;
+   case PIPE_LOGICOP_NOOP:
+      return VK_LOGIC_OP_NO_OP;
+   case PIPE_LOGICOP_OR_INVERTED:
+      return VK_LOGIC_OP_OR_INVERTED;
+   case PIPE_LOGICOP_COPY:
+      return VK_LOGIC_OP_COPY;
+   case PIPE_LOGICOP_OR_REVERSE:
+      return VK_LOGIC_OP_OR_REVERSE;
+   case PIPE_LOGICOP_OR:
+      return VK_LOGIC_OP_OR;
+   case PIPE_LOGICOP_SET:
+      return VK_LOGIC_OP_SET;
+   default:
+      YTTRIUM_LOG("yttrium: unsupported logic op %u, using COPY\n", logic_op);
+      return VK_LOGIC_OP_COPY;
+   }
+}
+
+static VkColorComponentFlags
+yttrium_pipe_colormask(unsigned colormask)
+{
+   VkColorComponentFlags vk_mask = 0;
+
+   if (colormask & PIPE_MASK_R)
+      vk_mask |= VK_COLOR_COMPONENT_R_BIT;
+   if (colormask & PIPE_MASK_G)
+      vk_mask |= VK_COLOR_COMPONENT_G_BIT;
+   if (colormask & PIPE_MASK_B)
+      vk_mask |= VK_COLOR_COMPONENT_B_BIT;
+   if (colormask & PIPE_MASK_A)
+      vk_mask |= VK_COLOR_COMPONENT_A_BIT;
+
+   return vk_mask;
+}
+
+static void
+yttrium_init_blend_state(struct yttrium_blend_state *blend)
+{
+   blend->logic_op = yttrium_pipe_logic_op(blend->state.logicop_func);
+   for (uint32_t i = 0; i < PIPE_MAX_COLOR_BUFS; i++) {
+      const uint32_t rt_index = blend->state.independent_blend_enable ? i : 0;
+      const struct pipe_rt_blend_state *rt = &blend->state.rt[rt_index];
+
+      blend->rt_blend_enable[i] = rt->blend_enable ? VK_TRUE : VK_FALSE;
+      blend->rt_color_write_mask[i] = yttrium_pipe_colormask(rt->colormask);
+      blend->rt_src_color_blend_factor[i] =
+         yttrium_pipe_blend_factor(rt->rgb_src_factor);
+      blend->rt_dst_color_blend_factor[i] =
+         yttrium_pipe_blend_factor(rt->rgb_dst_factor);
+      blend->rt_color_blend_op[i] = yttrium_pipe_blend_op(rt->rgb_func);
+      blend->rt_src_alpha_blend_factor[i] =
+         yttrium_pipe_blend_factor(util_blendfactor_to_alpha(rt->alpha_src_factor));
+      blend->rt_dst_alpha_blend_factor[i] =
+         yttrium_pipe_blend_factor(util_blendfactor_to_alpha(rt->alpha_dst_factor));
+      blend->rt_alpha_blend_op[i] = yttrium_pipe_blend_op(rt->alpha_func);
+   }
+}
+
 void *
 yttrium_create_blend_state(struct pipe_context *ctx,
                            const struct pipe_blend_state *state)
@@ -411,6 +578,7 @@ yttrium_create_blend_state(struct pipe_context *ctx,
       return NULL;
 
    blend->state = *state;
+   yttrium_init_blend_state(blend);
    YTTRIUM_LOG("yttrium: create blend state=%p rt0 enable=%u rgb=(%u,%u,%u) alpha=(%u,%u,%u) mask=0x%x indep=%u logic=%u atoc=%u\n",
                 blend, blend->state.rt[0].blend_enable,
                 blend->state.rt[0].rgb_func,

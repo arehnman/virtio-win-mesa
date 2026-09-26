@@ -1531,6 +1531,34 @@ yttrium_trace_cmd_batch_submit(uint32_t async_submit,
 }
 
 void
+yttrium_trace_deferred_draw_state(
+   const struct yttrium_trace_deferred_draw_stats *stats)
+{
+   /* These batch totals are also useful with the low-volume wait profile. */
+   if (!yttrium_trace_sync_wait_is_enabled())
+      return;
+
+   TraceLoggingWrite(
+      yttrium_tracelogging_provider,
+      "DeferredDrawState",
+      TraceLoggingLevel(5),
+      TraceLoggingUInt32(stats->draws, "draws"),
+      TraceLoggingUInt32(stats->render_passes, "render_passes"),
+      TraceLoggingUInt32(stats->pipeline_binds, "pipeline_binds"),
+      TraceLoggingUInt32(stats->pipeline_binds_skipped, "pipeline_binds_skipped"),
+      TraceLoggingUInt32(stats->descriptor_binds, "descriptor_binds"),
+      TraceLoggingUInt32(stats->descriptor_binds_skipped, "descriptor_binds_skipped"),
+      TraceLoggingUInt32(stats->push_calls, "push_calls"),
+      TraceLoggingUInt32(stats->push_writes, "push_writes"),
+      TraceLoggingUInt32(stats->repeated_push_layouts, "repeated_push_layouts"),
+      TraceLoggingUInt32(stats->requested_push_calls, "requested_push_calls"),
+      TraceLoggingUInt32(stats->requested_push_writes, "requested_push_writes"),
+      TraceLoggingUInt32(stats->push_comparisons, "push_comparisons"),
+      TraceLoggingUInt32(stats->push_calls_skipped, "push_calls_skipped"),
+      TraceLoggingUInt32(stats->push_writes_skipped, "push_writes_skipped"));
+}
+
+void
 yttrium_trace_venus_upload(uint32_t kind,
                            uint32_t flags,
                            uint64_t bytes,

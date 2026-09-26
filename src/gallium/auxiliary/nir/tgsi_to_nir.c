@@ -408,6 +408,12 @@ ttn_emit_declaration(struct ttn_compile *c)
                   var->type =
                      glsl_array_type(var->type,
                                      b->shader->info.gs.vertices_in, 0);
+               else if (!patch_input)
+                  /* Tessellation inputs are indexed by control point. TGSI
+                   * does not declare their count, so use the maximum patch
+                   * size, as for NIR tessellation inputs from GLSL.
+                   */
+                  var->type = glsl_array_type(var->type, 32, 0);
                else if (var->data.location ==
                         VARYING_SLOT_TESS_LEVEL_OUTER)
                   var->type =
@@ -876,9 +882,17 @@ ttn_src_for_file_and_index(struct ttn_compile *c, unsigned file, unsigned index,
             assert(!dim);
          }
 
-         if (b->shader->options->compact_arrays &&
-             (c->inputs[index]->data.location == VARYING_SLOT_CLIP_DIST0 ||
-              c->inputs[index]->data.location == VARYING_SLOT_CULL_DIST0) &&
+         /* Tessellation levels are scalar arrays in NIR, but one packed
+          * TGSI source vector. Reconstruct it before applying TGSI swizzles,
+          * padding the two-component inner levels with zeroes. */
+         const bool tess_level_input =
+            c->scan->processor == MESA_SHADER_TESS_EVAL && patch_input &&
+            (c->inputs[index]->data.location == VARYING_SLOT_TESS_LEVEL_OUTER ||
+             c->inputs[index]->data.location == VARYING_SLOT_TESS_LEVEL_INNER);
+         if ((tess_level_input ||
+              (b->shader->options->compact_arrays &&
+               (c->inputs[index]->data.location == VARYING_SLOT_CLIP_DIST0 ||
+                c->inputs[index]->data.location == VARYING_SLOT_CULL_DIST0))) &&
              glsl_type_is_array(deref->type)) {
             nir_def *components[4];
             const unsigned component_count =
@@ -1042,6 +1056,8 @@ ttn_get_src(struct ttn_compile *c, struct tgsi_full_src_register *tgsi_fsrc,
    struct tgsi_src_register *tgsi_src = &tgsi_fsrc->Register;
    enum tgsi_opcode opcode = c->token->FullInstruction.Instruction.Opcode;
    unsigned tgsi_src_type = tgsi_opcode_infer_src_type(opcode, src_idx);
+   if (opcode == TGSI_OPCODE_INTERP_SAMPLE && src_idx == 1)
+      tgsi_src_type = TGSI_TYPE_SIGNED;
    bool src_is_float = (tgsi_src_type == TGSI_TYPE_FLOAT ||
                         tgsi_src_type == TGSI_TYPE_DOUBLE ||
                         tgsi_src_type == TGSI_TYPE_UNTYPED);
@@ -1102,6 +1118,51 @@ ttn_get_src(struct ttn_compile *c, struct tgsi_full_src_register *tgsi_fsrc,
    }
 
    return def;
+}
+
+static nir_def *
+ttn_interp_sample(struct ttn_compile *c,
+                  struct tgsi_full_instruction *inst, nir_def *sample)
+{
+   nir_builder *b = &c->build;
+   struct tgsi_src_register *src = &inst->Src[0].Register;
+
+   /* Like ordinary TTN input loads, this path does not support indirect
+    * fragment input arrays.  Do not silently interpolate the base element.
+    */
+   if (b->shader->info.stage != MESA_SHADER_FRAGMENT ||
+       src->File != TGSI_FILE_INPUT || src->Indirect || src->Dimension ||
+       src->Index >= b->shader->num_inputs) {
+      fprintf(stderr, "tgsi_to_nir: unsupported INTERP_SAMPLE input addressing\n");
+      abort();
+   }
+
+   nir_variable *var = c->inputs[src->Index];
+   if (!var || var->data.mode != nir_var_shader_in ||
+       var->type != glsl_vec4_type()) {
+      fprintf(stderr, "tgsi_to_nir: unsupported INTERP_SAMPLE input declaration\n");
+      abort();
+   }
+
+   /* Flat inputs have the same value at every sample. */
+   if (var->data.interpolation == INTERP_MODE_FLAT)
+      return ttn_get_src(c, &inst->Src[0], 0);
+
+   nir_deref_instr *deref = nir_build_deref_var(b, var);
+   nir_def *value = nir_interp_deref_at_sample(
+      b, 4, 32, &deref->def, ttn_channel(b, sample, X));
+   unsigned swizzle[4] = {
+      src->SwizzleX, src->SwizzleY, src->SwizzleZ, src->SwizzleW,
+   };
+   value = nir_swizzle(b, value, swizzle, 4);
+
+   /* Modifiers apply to the interpolated value, not the vertex values. */
+   if (src->Absolute)
+      value = nir_fabs(b, value);
+   if (src->Negate)
+      value = nir_fneg(b, value);
+
+   return value;
 }
 
 static nir_def *
@@ -2368,7 +2429,7 @@ static const nir_op op_trans[TGSI_OPCODE_LAST] = {
    [TGSI_OPCODE_UMSB] = nir_op_ufind_msb,
 
    [TGSI_OPCODE_INTERP_CENTROID] = 0, /* XXX */
-   [TGSI_OPCODE_INTERP_SAMPLE] = 0, /* XXX */
+   [TGSI_OPCODE_INTERP_SAMPLE] = 0,
    [TGSI_OPCODE_INTERP_OFFSET] = 0, /* XXX */
 
    [TGSI_OPCODE_F2D] = nir_op_f2f64,
@@ -2408,6 +2469,11 @@ ttn_emit_instruction(struct ttn_compile *c)
 
    nir_def *src[TGSI_FULL_MAX_SRC_REGISTERS];
    for (i = 0; i < tgsi_inst->Instruction.NumSrcRegs; i++) {
+      /* INTERP_SAMPLE needs an input deref, not a load at its declared
+       * interpolation location.  Its handler applies the source modifiers.
+       */
+      if (tgsi_op == TGSI_OPCODE_INTERP_SAMPLE && i == 0)
+         continue;
       src[i] = ttn_get_src(c, &tgsi_inst->Src[i], i);
    }
 
@@ -2425,6 +2491,10 @@ ttn_emit_instruction(struct ttn_compile *c)
    nir_def *dst = NULL;
 
    switch (tgsi_op) {
+   case TGSI_OPCODE_INTERP_SAMPLE:
+      dst = ttn_interp_sample(c, tgsi_inst, src[1]);
+      break;
+
    case TGSI_OPCODE_EMIT:
       ttn_add_output_stores(c);
       nir_emit_vertex(b, 0);

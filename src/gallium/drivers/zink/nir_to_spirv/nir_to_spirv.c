@@ -3158,8 +3158,15 @@ emit_image_deref_load(struct ntv_context *ctx, nir_intrinsic_instr *intr)
    bool use_sample = glsl_get_sampler_dim(type) == GLSL_SAMPLER_DIM_MS ||
                      glsl_get_sampler_dim(type) == GLSL_SAMPLER_DIM_SUBPASS_MS;
    SpvId sample = use_sample ? get_src(ctx, &intr->src[2], &atype) : 0;
-   SpvId dest_type = spirv_builder_type_vector(&ctx->builder, base_type,
-                                               intr->def.num_components);
+   /* spirv_builder_type_vector() is only valid for two or more components,
+    * and a single-component image load - a D3D typed UAV load of a
+    * single-channel image, which GL never produces - would otherwise emit
+    * OpTypeVector with a count of one.
+    */
+   SpvId dest_type = intr->def.num_components > 1 ?
+      spirv_builder_type_vector(&ctx->builder, base_type,
+                                intr->def.num_components) :
+      base_type;
 
    SpvId result;
    uint32_t access = nir_intrinsic_access(intr);
@@ -3172,10 +3179,25 @@ emit_image_deref_load(struct ntv_context *ctx, nir_intrinsic_instr *intr)
       bool coherent = ctx->sinfo->have_vulkan_memory_model && (access & ACCESS_COHERENT);
       SpvId img_type = find_image_type(ctx, var);
       SpvId img = spirv_builder_emit_load(&ctx->builder, img_type, img_var, false);
-      result = spirv_builder_emit_image_read(&ctx->builder, dest_type,
+      /* SPIR-V requires the result of OpImageRead to be a four-component
+       * vector whatever the image format holds, so read a vec4 and narrow it
+       * to what the load asked for.  GL image loads are always four
+       * components, so this only shows up on the D3D path.
+       */
+      SpvId read_type = spirv_builder_type_vector(&ctx->builder, base_type, 4);
+      result = spirv_builder_emit_image_read(&ctx->builder, read_type,
                                              img, coord, 0, sample, sparse, coherent);
       if (sparse)
-         result = extract_sparse_load(ctx, result, dest_type, &intr->def);
+         result = extract_sparse_load(ctx, result, read_type, &intr->def);
+      if (intr->def.num_components == 1) {
+         result = spirv_builder_emit_vector_extract(&ctx->builder, dest_type,
+                                                    result, 0);
+      } else if (intr->def.num_components < 4) {
+         uint32_t constituents[4] = {0, 1, 2, 3};
+         result = spirv_builder_emit_vector_shuffle(&ctx->builder, dest_type,
+                                                    result, result, constituents,
+                                                    intr->def.num_components);
+      }
    }
 
    if (!sparse && mediump) {

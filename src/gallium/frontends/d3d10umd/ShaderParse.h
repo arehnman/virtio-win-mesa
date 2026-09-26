@@ -268,6 +268,7 @@ struct Shader_opcode {
       unsigned dcl_tess_output_primitive;
       unsigned dcl_hs_max_tessfactor_bits;
       unsigned dcl_hs_phase_instance_count;
+      unsigned sample_pos_compatibility;
    } specific;
    D3D10_SB_NAME dcl_siv_name;
    D3D10_SB_RESOURCE_RETURN_TYPE dcl_resource_ret_type[4];
@@ -286,6 +287,7 @@ struct Shader_opcode {
 struct Shader_parser {
    const unsigned *code;
    const unsigned *curr;
+   bool failed;
 
    struct Shader_header header;
 };
@@ -315,7 +317,11 @@ Shader_tgsi_translate(const unsigned *code,
                       const struct Shader_tessellation_io_signatures *
                       tessellation_signatures,
                       const struct Shader_tessellation_properties *
-                      tessellation_properties);
+                      tessellation_properties,
+                      const D3D10DDIARG_STAGE_IO_SIGNATURES *stage_signatures,
+                      struct pipe_shader_sampler_binding_map *
+                      sampler_binding_map,
+                      uint8_t *counter_image_slots);
 
 
 #ifdef __cplusplus

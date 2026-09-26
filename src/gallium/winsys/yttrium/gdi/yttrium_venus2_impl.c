@@ -783,7 +783,10 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
    bool have_multisampled_render_to_single_sampled_ext = false;
    bool have_fragment_shader_interlock_ext = false;
    bool have_attachment_feedback_loop_layout_ext = false;
+   bool have_load_store_op_none_khr = false;
+   bool have_load_store_op_none_ext = false;
    bool have_vulkan_memory_model_khr = false;
+   bool have_custom_border_color_ext = false;
    uint32_t extension_count = 0;
    result = vn_call_vkEnumerateDeviceExtensionProperties(
       &venus->vn_ring, venus->physical_device, NULL, &extension_count, NULL);
@@ -825,8 +828,23 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
                                   VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME)) {
                   have_attachment_feedback_loop_layout_ext = true;
                } else if (!strcmp(extensions[i].extensionName,
+                                  VK_KHR_LOAD_STORE_OP_NONE_EXTENSION_NAME)) {
+                  have_load_store_op_none_khr =
+                     vn_cs_renderer_protocol_has_extension(
+                        527 /* VK_KHR_load_store_op_none */);
+               } else if (!strcmp(extensions[i].extensionName,
+                                  VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME)) {
+                  have_load_store_op_none_ext =
+                     vn_cs_renderer_protocol_has_extension(
+                        401 /* VK_EXT_load_store_op_none */);
+               } else if (!strcmp(extensions[i].extensionName,
                                   VK_KHR_VULKAN_MEMORY_MODEL_EXTENSION_NAME)) {
                   have_vulkan_memory_model_khr = true;
+               } else if (!strcmp(extensions[i].extensionName,
+                                  VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME)) {
+                  have_custom_border_color_ext =
+                     vn_cs_renderer_protocol_has_extension(
+                        288 /* VK_EXT_custom_border_color */);
                }
             }
          }
@@ -867,10 +885,17 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
       .sType =
          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT,
    };
+   VkPhysicalDeviceCustomBorderColorFeaturesEXT custom_border_color = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT,
+   };
    const bool have_vertex_attribute_divisor =
       have_vertex_attribute_divisor_khr || have_vertex_attribute_divisor_ext;
    features12.pNext = &features11;
    void *features_pnext = &features12;
+   if (have_custom_border_color_ext) {
+      custom_border_color.pNext = features_pnext;
+      features_pnext = &custom_border_color;
+   }
    if (have_multisampled_render_to_single_sampled_ext) {
       multisampled_render_to_single_sampled.pNext = features_pnext;
       features_pnext = &multisampled_render_to_single_sampled;
@@ -931,6 +956,13 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
       push_descriptor_props.pNext = properties_pnext;
       properties_pnext = &push_descriptor_props;
    }
+   VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_border_color_props = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT,
+   };
+   if (have_custom_border_color_ext) {
+      custom_border_color_props.pNext = properties_pnext;
+      properties_pnext = &custom_border_color_props;
+   }
    VkPhysicalDeviceProperties2 properties2 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
       .pNext = properties_pnext,
@@ -961,6 +993,11 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
          vertex_divisor_props_ext.maxVertexAttribDivisor;
    if (!venus->max_vertex_attrib_divisor)
       venus->max_vertex_attrib_divisor = 1;
+   venus->vertex_divisor_nonzero_first_instance =
+      have_vertex_attribute_divisor_khr &&
+      vertex_divisor_props.supportsNonZeroFirstInstance;
+   venus->draw_indirect_first_instance =
+      features2.features.drawIndirectFirstInstance;
    venus->multi_viewport = features2.features.multiViewport &&
       properties2.properties.limits.maxViewports > 1;
    venus->shader_output_viewport_index =
@@ -980,12 +1017,21 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
       features2.features.tessellationShader && have_vulkan_memory_model;
    venus->fragment_stores_and_atomics =
       features2.features.fragmentStoresAndAtomics;
+   venus->storage_image_read_without_format =
+      features2.features.shaderStorageImageReadWithoutFormat;
+   venus->storage_image_write_without_format =
+      features2.features.shaderStorageImageWriteWithoutFormat;
    venus->fragment_shader_pixel_interlock =
       have_fragment_shader_interlock_ext &&
       fragment_shader_interlock.fragmentShaderPixelInterlock;
    venus->attachment_feedback_loop_layout =
       have_attachment_feedback_loop_layout_ext &&
       attachment_feedback_loop_layout.attachmentFeedbackLoopLayout;
+   venus->load_store_op_none =
+      have_load_store_op_none_khr || have_load_store_op_none_ext;
+   YTTRIUM_LOG("yttrium: Venus read-only depth capability load_store_op_none=%u khr=%u ext=%u\n",
+               venus->load_store_op_none, have_load_store_op_none_khr,
+               have_load_store_op_none_ext);
    venus->multisampled_render_to_single_sampled =
       have_multisampled_render_to_single_sampled_ext &&
       have_create_renderpass2_khr &&
@@ -994,6 +1040,14 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
       have_push_descriptor_ext && push_descriptor_props.maxPushDescriptors;
    venus->max_push_descriptors =
       venus->push_descriptor ? push_descriptor_props.maxPushDescriptors : 0;
+   /* The pipeline key carries a typed color, not a concrete image format. */
+   venus->custom_border_colors =
+      have_custom_border_color_ext && custom_border_color.customBorderColors &&
+      custom_border_color.customBorderColorWithoutFormat &&
+      custom_border_color_props.maxCustomBorderColorSamplers;
+   venus->custom_border_color_without_format = venus->custom_border_colors;
+   venus->max_custom_border_color_samplers = venus->custom_border_colors ?
+      custom_border_color_props.maxCustomBorderColorSamplers : 0;
    venus->max_dual_source_render_targets = venus->dual_src_blend ?
       properties2.properties.limits.maxFragmentDualSrcAttachments : 0;
    venus->max_sampler_anisotropy = features2.features.samplerAnisotropy ?
@@ -1057,6 +1111,15 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
                features12.vulkanMemoryModel,
                features12.vulkanMemoryModelDeviceScope,
                properties2.properties.apiVersion);
+   YTTRIUM_LOG("yttrium: Venus storage image formatless features read=%u write=%u\n",
+               venus->storage_image_read_without_format,
+               venus->storage_image_write_without_format);
+   YTTRIUM_LOG("yttrium: Venus custom border color ext=%u supported=%u without_format=%u enabled=%u max_samplers=%u\n",
+               have_custom_border_color_ext,
+               custom_border_color.customBorderColors,
+               custom_border_color.customBorderColorWithoutFormat,
+               venus->custom_border_colors,
+               venus->max_custom_border_color_samplers);
    depth_bias_control.depthBiasControl = venus->depth_bias_control;
    depth_bias_control.depthBiasExact = VK_FALSE;
    transform_feedback.transformFeedback = venus->transform_feedback;
@@ -1079,9 +1142,21 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
    fragment_shader_interlock.fragmentShaderShadingRateInterlock = VK_FALSE;
    attachment_feedback_loop_layout.attachmentFeedbackLoopLayout =
       venus->attachment_feedback_loop_layout;
+   custom_border_color.customBorderColors = venus->custom_border_colors;
+   custom_border_color.customBorderColorWithoutFormat =
+      venus->custom_border_color_without_format;
    VkPhysicalDeviceFeatures enabled_features = {
+      .drawIndirectFirstInstance = venus->draw_indirect_first_instance,
       .shaderClipDistance = features2.features.shaderClipDistance,
       .shaderCullDistance = features2.features.shaderCullDistance,
+      /* Required by work the driver already submits: geometry-shader stages,
+       * cube-array image views, and the dynamically indexed UBO array the
+       * shader translation emits.  Leaving them off made those draws
+       * undefined behaviour that happened to run on the host driver. */
+      .geometryShader = features2.features.geometryShader,
+      .imageCubeArray = features2.features.imageCubeArray,
+      .shaderUniformBufferArrayDynamicIndexing =
+         features2.features.shaderUniformBufferArrayDynamicIndexing,
       .depthClamp = venus->depth_clamp,
       .dualSrcBlend = venus->dual_src_blend,
       .independentBlend = venus->independent_blend,
@@ -1090,10 +1165,14 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
       .sampleRateShading = venus->sample_rate_shading,
       .tessellationShader = venus->tessellation_shader,
       .fragmentStoresAndAtomics = venus->fragment_stores_and_atomics,
+      .shaderStorageImageReadWithoutFormat =
+         venus->storage_image_read_without_format,
+      .shaderStorageImageWriteWithoutFormat =
+         venus->storage_image_write_without_format,
       .multiViewport = venus->multi_viewport,
    };
 
-   const char *device_extensions[10];
+   const char *device_extensions[12];
    uint32_t device_extension_count = 0;
    if (venus->depth_bias_control)
       device_extensions[device_extension_count++] =
@@ -1123,9 +1202,17 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
    if (venus->attachment_feedback_loop_layout)
       device_extensions[device_extension_count++] =
          VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME;
+   if (venus->load_store_op_none)
+      device_extensions[device_extension_count++] =
+         have_load_store_op_none_khr ?
+            VK_KHR_LOAD_STORE_OP_NONE_EXTENSION_NAME :
+            VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME;
    if (venus->tessellation_shader && have_vulkan_memory_model_khr)
       device_extensions[device_extension_count++] =
          VK_KHR_VULKAN_MEMORY_MODEL_EXTENSION_NAME;
+   if (venus->custom_border_colors)
+      device_extensions[device_extension_count++] =
+         VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME;
 
    yttrium_venus_init_object(venus, &venus->device_obj);
    venus->device_handle = YTTRIUM_VENUS_HANDLE(VkDevice, &venus->device_obj);
@@ -1240,9 +1327,7 @@ yttrium_venus_ensure_transport(struct yttrium_venus *venus)
    memset(&ctx_init, 0, sizeof(ctx_init));
    ctx_init.Type = VIOGPU_CTX_INIT;
    ctx_init.DataLength = sizeof(VIOGPU_CTX_INIT_REQ);
-   ctx_init.CtxInit.CapsetID =
-      VIRTGPU_DRM_CAPSET_VENUS |
-      VIRGL_RENDERER_CONTEXT_FLAG_GLOBAL_RESOURCE_IDS;
+   ctx_init.CtxInit.CapsetID = VIRTGPU_DRM_CAPSET_VENUS;
 
    NTSTATUS status = venus->device->escape(venus->device, &ctx_init,
                                            sizeof(ctx_init));
@@ -1319,6 +1404,110 @@ yttrium_venus_ensure_initialized(struct yttrium_venus *venus)
    return true;
 }
 
+bool
+yttrium_venus2_storage_image_without_format_supported(
+   struct yttrium_venus *venus, bool read, bool write)
+{
+   if (!yttrium_venus_ensure_initialized(venus))
+      return false;
+
+   return (!read || venus->storage_image_read_without_format) &&
+          (!write || venus->storage_image_write_without_format);
+}
+
+static bool
+yttrium_venus_storage_image_without_format_listed(VkFormat format)
+{
+   /* Vulkan "Formats Without Shader Storage Format": the device feature
+    * guarantees apply only to this list, not every storage-capable format.
+    * This deliberately uses the enabled core features, not the Vulkan 1.3
+    * per-format feature-flags2 route.
+    */
+   switch (format) {
+   case VK_FORMAT_R8G8B8A8_UNORM:
+   case VK_FORMAT_R8G8B8A8_SNORM:
+   case VK_FORMAT_R8G8B8A8_UINT:
+   case VK_FORMAT_R8G8B8A8_SINT:
+   case VK_FORMAT_R32_UINT:
+   case VK_FORMAT_R32_SINT:
+   case VK_FORMAT_R32_SFLOAT:
+   case VK_FORMAT_R32G32_UINT:
+   case VK_FORMAT_R32G32_SINT:
+   case VK_FORMAT_R32G32_SFLOAT:
+   case VK_FORMAT_R32G32B32A32_UINT:
+   case VK_FORMAT_R32G32B32A32_SINT:
+   case VK_FORMAT_R32G32B32A32_SFLOAT:
+   case VK_FORMAT_R16G16B16A16_UINT:
+   case VK_FORMAT_R16G16B16A16_SINT:
+   case VK_FORMAT_R16G16B16A16_SFLOAT:
+   case VK_FORMAT_R16G16_SFLOAT:
+   case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+   case VK_FORMAT_R16_SFLOAT:
+   case VK_FORMAT_R16G16B16A16_UNORM:
+   case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+   case VK_FORMAT_R16G16_UNORM:
+   case VK_FORMAT_R8G8_UNORM:
+   case VK_FORMAT_R16_UNORM:
+   case VK_FORMAT_R8_UNORM:
+   case VK_FORMAT_R16G16B16A16_SNORM:
+   case VK_FORMAT_R16G16_SNORM:
+   case VK_FORMAT_R8G8_SNORM:
+   case VK_FORMAT_R16_SNORM:
+   case VK_FORMAT_R8_SNORM:
+   case VK_FORMAT_R16G16_SINT:
+   case VK_FORMAT_R8G8_SINT:
+   case VK_FORMAT_R16_SINT:
+   case VK_FORMAT_R8_SINT:
+   case VK_FORMAT_A2B10G10R10_UINT_PACK32:
+   case VK_FORMAT_R16G16_UINT:
+   case VK_FORMAT_R8G8_UINT:
+   case VK_FORMAT_R16_UINT:
+   case VK_FORMAT_R8_UINT:
+   case VK_FORMAT_A8_UNORM:
+      return true;
+   default:
+      return false;
+   }
+}
+
+bool
+yttrium_venus2_storage_image_formatless_format_supported(
+   struct yttrium_venus *venus, enum pipe_format format,
+   bool read, bool write)
+{
+   if (format == PIPE_FORMAT_NONE || (unsigned)format >= PIPE_FORMAT_COUNT ||
+       !yttrium_venus2_storage_image_without_format_supported(venus,
+                                                               read, write))
+      return false;
+
+   uint8_t *cached = &venus->storage_image_formatless_formats[format];
+   if (*cached)
+      return *cached == 2;
+
+   const VkFormat vk_format = yttrium_venus2_pipe_format(format);
+   if (!yttrium_venus_storage_image_without_format_listed(vk_format)) {
+      *cached = 1;
+      return false;
+   }
+
+   VkFormatProperties2 properties = {
+      .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+   };
+   vn_call_vkGetPhysicalDeviceFormatProperties2(
+      &venus->vn_ring, venus->physical_device, vk_format, &properties);
+   const bool supported =
+      properties.formatProperties.optimalTilingFeatures &
+      VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+   *cached = supported ? 2 : 1;
+   return supported;
+}
+
+bool
+yttrium_venus2_supports_load_store_op_none(struct yttrium_venus *venus)
+{
+   return venus && venus->load_store_op_none;
+}
+
 static VkPipelineStageFlags
 yttrium_venus_layout_stage(VkImageLayout layout)
 {
@@ -1334,6 +1523,8 @@ yttrium_venus_layout_stage(VkImageLayout layout)
    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
       return VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
              VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+   case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+      return VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
       return VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -1360,6 +1551,12 @@ yttrium_venus_sampled_stage_flags(const struct yttrium_pipeline *pipeline)
 
    if (stage_mask & (1u << MESA_SHADER_VERTEX))
       flags |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
+   if (stage_mask & (1u << MESA_SHADER_TESS_CTRL))
+      flags |= VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT;
+   if (stage_mask & (1u << MESA_SHADER_TESS_EVAL))
+      flags |= VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT;
+   if (stage_mask & (1u << MESA_SHADER_GEOMETRY))
+      flags |= VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT;
    if (stage_mask & (1u << MESA_SHADER_FRAGMENT))
       flags |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
 
@@ -1382,6 +1579,9 @@ yttrium_venus_layout_access(VkImageLayout layout)
    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
       return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+   case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+      return VK_ACCESS_SHADER_READ_BIT |
+             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
       return VK_ACCESS_TRANSFER_WRITE_BIT;
    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
@@ -1555,11 +1755,28 @@ yttrium_venus_cmd_batch_transition_image(struct yttrium_venus *venus,
                                          VkPipelineStageFlags dst_stage,
                                          const VkImageSubresourceRange *range)
 {
+   /* Both uses are reads, so the image-role index allows them to share a
+    * command buffer.  Their layouts still differ: deferred barriers run
+    * before all queued draws, so emit those draws before changing layout.
+    * Keep the current batch and its transient allocations alive.
+    */
+   if (venus->cmd_batch_deferred_draw_count &&
+       ((resource->layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
+         new_layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL) ||
+        (resource->layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL &&
+         new_layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)) &&
+       !yttrium_venus_cmd_batch_emit_deferred_draws(
+          venus, "read-only depth layout boundary"))
+      return false;
+
    VkPipelineStageFlags src_stage = 0;
    VkImageMemoryBarrier barrier;
    if (!yttrium_venus_build_image_transition(
           resource, new_layout, dst_access, range, &src_stage, &barrier))
       return true;
+   if (barrier.oldLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
+       barrier.newLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+      src_stage = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
    if (barrier.oldLayout ==
           VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT ||
        barrier.newLayout ==
@@ -1979,6 +2196,10 @@ yttrium_venus2_pipeline_fini(struct yttrium_venus *venus,
             vn_async_vkDestroySampler(&venus->vn_ring, venus->device_handle,
                                       pipeline->samplers[i], NULL);
       }
+      assert(venus->custom_border_color_sampler_count >=
+             pipeline->custom_border_color_sampler_count);
+      venus->custom_border_color_sampler_count -=
+         pipeline->custom_border_color_sampler_count;
       if (pipeline->descriptor_set_layout)
          vn_async_vkDestroyDescriptorSetLayout(&venus->vn_ring,
                                                venus->device_handle,
@@ -2049,6 +2270,7 @@ yttrium_venus2_pipeline_fini(struct yttrium_venus *venus,
    pipeline->descriptor_pool = VK_NULL_HANDLE;
    pipeline->descriptor_set = VK_NULL_HANDLE;
    memset(pipeline->samplers, 0, sizeof(pipeline->samplers));
+   pipeline->custom_border_color_sampler_count = 0;
    pipeline->pipeline_layout = VK_NULL_HANDLE;
    pipeline->pipeline = VK_NULL_HANDLE;
    pipeline->push_descriptor_set_layout = VK_NULL_HANDLE;
@@ -2064,8 +2286,6 @@ yttrium_venus2_pipeline_fini(struct yttrium_venus *venus,
    pipeline->sampled_buffer_descriptor_count = 0;
    pipeline->storage_image_descriptor_count = 0;
    pipeline->storage_buffer_descriptor_count = 0;
-   pipeline->sampled_image_mask = 0;
-   pipeline->sampled_buffer_mask = 0;
    pipeline->storage_image_mask = 0;
    pipeline->storage_buffer_mask = 0;
    pipeline->has_sampled_image = false;
@@ -2080,36 +2300,25 @@ yttrium_venus_pipeline_prepare_ubo_descriptors(
    struct yttrium_pipeline *pipeline,
    const struct yttrium_venus_ubo_binding_layout *ubo_bindings,
    uint32_t ubo_binding_count,
-   uint32_t sampled_image_mask,
-   uint32_t sampled_buffer_mask,
-   VkShaderStageFlags sampled_stage_flags,
+   const struct yttrium_venus_sampled_binding_layout *sampled_bindings,
+   uint32_t sampled_binding_count,
    uint64_t storage_image_mask,
    uint64_t storage_buffer_mask,
    VkShaderStageFlags storage_stage_flags,
-   const struct yttrium_venus_sampler_state *samplers,
    bool allow_push_layout_rotation)
 {
-   const uint32_t sampled_mask = sampled_image_mask | sampled_buffer_mask;
    const uint64_t storage_mask = storage_image_mask | storage_buffer_mask;
-   if (!sampled_stage_flags)
-      sampled_stage_flags = VK_SHADER_STAGE_FRAGMENT_BIT;
    if (!storage_stage_flags)
       storage_stage_flags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
-   if (!ubo_binding_count && !sampled_mask && !storage_mask)
+   if (!ubo_binding_count && !sampled_binding_count && !storage_mask)
       return true;
 
    if (!pipeline || (ubo_binding_count && !ubo_bindings) ||
-       ubo_binding_count > YTTRIUM_VENUS_MAX_PIPELINE_UBO_BINDINGS)
+       ubo_binding_count > YTTRIUM_VENUS_MAX_PIPELINE_UBO_BINDINGS ||
+       (sampled_binding_count && !sampled_bindings) ||
+       sampled_binding_count > YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES)
       return false;
-
-   if ((sampled_mask & ~YTTRIUM_VENUS_PIPELINE_SAMPLED_IMAGE_MASK) ||
-       (sampled_image_mask & sampled_buffer_mask)) {
-      YTTRIUM_LOG("yttrium: Venus native descriptors rejected sampled masks image=0x%x buffer=0x%x supported=0x%x\n",
-                  sampled_image_mask, sampled_buffer_mask,
-                  YTTRIUM_VENUS_PIPELINE_SAMPLED_IMAGE_MASK);
-      return false;
-   }
    if ((storage_mask & ~YTTRIUM_VENUS_PIPELINE_STORAGE_IMAGE_MASK) ||
        (storage_image_mask & storage_buffer_mask)) {
       YTTRIUM_LOG("yttrium: Venus native descriptors rejected storage masks image=0x%llx buffer=0x%llx supported=0x%llx\n",
@@ -2136,8 +2345,6 @@ yttrium_venus_pipeline_prepare_ubo_descriptors(
    pipeline->sampled_buffer_descriptor_count = 0;
    pipeline->storage_image_descriptor_count = 0;
    pipeline->storage_buffer_descriptor_count = 0;
-   pipeline->sampled_image_mask = 0;
-   pipeline->sampled_buffer_mask = 0;
    pipeline->storage_image_mask = 0;
    pipeline->storage_buffer_mask = 0;
    pipeline->has_sampled_image = false;
@@ -2151,17 +2358,14 @@ yttrium_venus_pipeline_prepare_ubo_descriptors(
       if (pipeline->ubo_count + ubo_bindings[i].descriptor_count >
           YTTRIUM_VENUS_MAX_PIPELINE_UBO_SLOTS)
          return false;
-      for (uint32_t slot = 0;
-           slot < YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES; slot++) {
-         if (!(sampled_mask & (1u << slot)))
-            continue;
-         const uint32_t sampled_binding = yttrium_shader_sampler_binding(slot);
-         if (sampled_binding == UINT32_MAX)
-            return false;
-         if (ubo_bindings[i].binding == sampled_binding) {
-            YTTRIUM_LOG("yttrium: Venus native descriptors rejected sampled binding collision ubo_binding=%u sampled_slot=%u ubos=%u image_mask=0x%x buffer_mask=0x%x\n",
-                        ubo_bindings[i].binding, slot, ubo_binding_count,
-                        sampled_image_mask, sampled_buffer_mask);
+      for (uint32_t sampled_index = 0;
+           sampled_index < sampled_binding_count; sampled_index++) {
+         if (ubo_bindings[i].binding ==
+             sampled_bindings[sampled_index].binding) {
+            YTTRIUM_LOG("yttrium: Venus native descriptors rejected sampled binding collision ubo_binding=%u sampled_index=%u sampled_binding=%u ubos=%u\n",
+                        ubo_bindings[i].binding, sampled_index,
+                        sampled_bindings[sampled_index].binding,
+                        ubo_binding_count);
             return false;
          }
       }
@@ -2198,32 +2402,41 @@ yttrium_venus_pipeline_prepare_ubo_descriptors(
       }
    }
 
-   for (uint32_t slot = 0;
-        slot < YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES; slot++) {
-      if (!(sampled_mask & (1u << slot)))
-         continue;
-      const uint32_t sampled_binding = yttrium_shader_sampler_binding(slot);
-      if (sampled_binding == UINT32_MAX)
+   for (uint32_t sampled_index = 0;
+        sampled_index < sampled_binding_count; sampled_index++) {
+      const struct yttrium_venus_sampled_binding_layout *sampled =
+         &sampled_bindings[sampled_index];
+      const mesa_shader_stage stage = (mesa_shader_stage)sampled->stage;
+      const uint32_t sampled_binding =
+         yttrium_shader_sampler_binding(stage, sampled->raw_slot);
+      if (stage < MESA_SHADER_VERTEX || stage > MESA_SHADER_COMPUTE ||
+          !sampled->stage_flags || sampled_binding == UINT32_MAX ||
+          sampled_binding != sampled->binding)
          return false;
+      for (uint32_t prior = 0; prior < sampled_index; prior++) {
+         if (sampled_bindings[prior].binding == sampled->binding) {
+            YTTRIUM_LOG("yttrium: Venus native descriptors rejected duplicate sampled binding index=%u prior=%u binding=%u\n",
+                        sampled_index, prior, sampled->binding);
+            return false;
+         }
+      }
 
       bindings[binding_count++] = (VkDescriptorSetLayoutBinding) {
          .binding = sampled_binding,
          .descriptorType =
-            (sampled_buffer_mask & (1u << slot)) ?
+            sampled->buffer ?
                VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER :
                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
          .descriptorCount = 1,
-         .stageFlags = sampled_stage_flags,
+         .stageFlags = sampled->stage_flags,
       };
-      if (sampled_buffer_mask & (1u << slot))
+      if (sampled->buffer)
          sampled_buffer_descriptor_count++;
       else
          sampled_image_descriptor_count++;
    }
-   pipeline->sampled_image_mask = sampled_image_mask;
-   pipeline->sampled_buffer_mask = sampled_buffer_mask;
-   pipeline->has_sampled_image = sampled_image_mask != 0;
-   pipeline->has_sampled_buffer = sampled_buffer_mask != 0;
+   pipeline->has_sampled_image = sampled_image_descriptor_count != 0;
+   pipeline->has_sampled_buffer = sampled_buffer_descriptor_count != 0;
    for (uint32_t slot = 0;
         slot < YTTRIUM_VENUS_MAX_PIPELINE_STORAGE_IMAGES; slot++) {
       if (!(storage_mask & (1ull << slot)))
@@ -2384,13 +2597,39 @@ yttrium_venus_pipeline_prepare_ubo_descriptors(
       storage_buffer_descriptor_count;
 
    if (sampled_image_descriptor_count) {
-      for (uint32_t slot = 0;
-           slot < YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES; slot++) {
-         if (!(sampled_image_mask & (1u << slot)))
+      for (uint32_t sampled_index = 0;
+           sampled_index < sampled_binding_count; sampled_index++) {
+         const struct yttrium_venus_sampled_binding_layout *layout =
+            &sampled_bindings[sampled_index];
+         if (layout->buffer)
             continue;
 
          const struct yttrium_venus_sampler_state *sampler =
-            samplers ? &samplers[slot] : NULL;
+            &layout->sampler;
+         const VkBorderColor border_color = sampler->border_color;
+         const bool custom_border =
+            border_color == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT ||
+            border_color == VK_BORDER_COLOR_INT_CUSTOM_EXT;
+         if (custom_border &&
+             (!venus->custom_border_colors ||
+              !venus->custom_border_color_without_format)) {
+            YTTRIUM_WARN("yttrium: Venus sampler rejected owner=venus2-sampler reason=custom-border-color-without-format-unavailable stage=%u raw_slot=%u border_color=%u\n",
+                         layout->stage, layout->raw_slot, border_color);
+            return false;
+         }
+         if (custom_border && venus->custom_border_color_sampler_count >=
+                              venus->max_custom_border_color_samplers) {
+            YTTRIUM_WARN("yttrium: Venus sampler rejected owner=venus2-sampler reason=max-custom-border-color-samplers stage=%u raw_slot=%u live=%u limit=%u\n",
+                         layout->stage, layout->raw_slot,
+                         venus->custom_border_color_sampler_count,
+                         venus->max_custom_border_color_samplers);
+            return false;
+         }
+         const VkSamplerCustomBorderColorCreateInfoEXT custom_border_info = {
+            .sType = VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT,
+            .customBorderColor = sampler->custom_border_color,
+            .format = VK_FORMAT_UNDEFINED,
+         };
          if (sampler && sampler->anisotropy_enable &&
              sampler->max_anisotropy > 1.0f &&
              venus->max_sampler_anisotropy <= 1.0f) {
@@ -2435,6 +2674,7 @@ yttrium_venus_pipeline_prepare_ubo_descriptors(
          }
          const VkSamplerCreateInfo sampler_info = {
             .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+            .pNext = custom_border ? &custom_border_info : NULL,
             .magFilter = sampler ? sampler->mag_filter : VK_FILTER_NEAREST,
             .minFilter = sampler ? sampler->min_filter : VK_FILTER_NEAREST,
             .mipmapMode = sampler ? sampler->mipmap_mode :
@@ -2455,29 +2695,36 @@ yttrium_venus_pipeline_prepare_ubo_descriptors(
                VK_COMPARE_OP_ALWAYS,
             .minLod = sampler ? sampler->min_lod : 0.0f,
             .maxLod = sampler ? sampler->max_lod : 0.0f,
-            .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
+            .borderColor = border_color,
          };
 
-         yttrium_venus_init_object(venus, &pipeline->sampler_objs[slot]);
-         pipeline->samplers[slot] =
+         yttrium_venus_init_object(
+            venus, &pipeline->sampler_objs[sampled_index]);
+         pipeline->samplers[sampled_index] =
             YTTRIUM_VENUS_HANDLE(VkSampler,
-                                  &pipeline->sampler_objs[slot]);
+                                  &pipeline->sampler_objs[sampled_index]);
          YTTRIUM_VENUS_SUBMIT_OBJECT_OR(
-            venus, vkCreateSampler, &pipeline->sampler_objs[slot],
-            &pipeline->samplers[slot], return false, venus->device_handle,
+            venus, vkCreateSampler,
+            &pipeline->sampler_objs[sampled_index],
+            &pipeline->samplers[sampled_index], return false,
+            venus->device_handle,
             &sampler_info, NULL,
-            &pipeline->samplers[slot]);
+            &pipeline->samplers[sampled_index]);
+         if (custom_border) {
+            venus->custom_border_color_sampler_count++;
+            pipeline->custom_border_color_sampler_count++;
+         }
       }
    }
 
-   YTTRIUM_LOG("yttrium: Venus native descriptors set_layout_id=%llu push_set_layout_id=%llu pool_id=%llu set_id=%llu bindings=%u descriptors=%u ubos=%u image_mask=0x%x buffer_mask=0x%x storage_image_mask=0x%llx storage_buffer_mask=0x%llx sampled_images=%u sampled_buffers=%u storage_images=%u storage_buffers=%u push_supported=%u max_push=%u\n",
+   YTTRIUM_LOG("yttrium: Venus native descriptors set_layout_id=%llu push_set_layout_id=%llu pool_id=%llu set_id=%llu bindings=%u descriptors=%u ubos=%u sampled_bindings=%u storage_image_mask=0x%llx storage_buffer_mask=0x%llx sampled_images=%u sampled_buffers=%u storage_images=%u storage_buffers=%u push_supported=%u max_push=%u\n",
                 (unsigned long long)pipeline->descriptor_set_layout_obj.id,
                 (unsigned long long)
                    pipeline->push_descriptor_set_layout_obj.id,
                 (unsigned long long)pipeline->descriptor_pool_obj.id,
                 (unsigned long long)pipeline->descriptor_set_obj.id,
                 binding_count, descriptor_count, ubo_descriptor_count,
-                sampled_image_mask, sampled_buffer_mask,
+                sampled_binding_count,
                 (unsigned long long)storage_image_mask,
                 (unsigned long long)storage_buffer_mask,
                 sampled_image_descriptor_count,
@@ -2737,13 +2984,11 @@ yttrium_venus2_pipeline_init(struct yttrium_venus *venus,
                             uint32_t attrib_count,
                             const struct yttrium_venus_ubo_binding_layout *ubo_bindings,
                             uint32_t ubo_binding_count,
-                            uint32_t sampled_image_mask,
-                            uint32_t sampled_buffer_mask,
-                            VkShaderStageFlags sampled_stage_flags,
+                            const struct yttrium_venus_sampled_binding_layout *sampled_bindings,
+                            uint32_t sampled_binding_count,
                             uint64_t storage_image_mask,
                             uint64_t storage_buffer_mask,
                             VkShaderStageFlags storage_stage_flags,
-                            const struct yttrium_venus_sampler_state *samplers,
                             const struct yttrium_venus_draw_state *draw_state)
 {
    const bool has_depth = depth_resource != NULL;
@@ -2760,10 +3005,24 @@ yttrium_venus2_pipeline_init(struct yttrium_venus *venus,
          break;
       }
    }
+   /* The actual target buffers are validated at draw time.  This exception
+    * only permits the pipeline shape explicitly tagged by the frontend. */
+   const bool targetless_stream_output =
+      draw_state && draw_state->targetless_stream_output &&
+      pipeline && pipeline->key.targetless_stream_output &&
+      !color_resource_count && !has_color && !has_depth &&
+      venus->transform_feedback;
    const uint32_t color_feedback_loop_mask =
       pipeline ? pipeline->key.color_feedback_loop_mask : 0;
    const bool depth_feedback_loop =
       pipeline && pipeline->key.depth_feedback_loop;
+   const bool depth_read_only = pipeline && pipeline->key.depth_read_only;
+   if (depth_read_only &&
+       (!venus->load_store_op_none || !has_depth || depth_feedback_loop)) {
+      YTTRIUM_WARN("yttrium: Venus native pipeline rejected owner=venus2 reason=invalid_read_only_depth store_none=%u has_depth=%u depth_feedback=%u\n",
+                   venus->load_store_op_none, has_depth, depth_feedback_loop);
+      return false;
+   }
    if ((color_feedback_loop_mask || depth_feedback_loop) &&
        (!venus->attachment_feedback_loop_layout ||
         (color_feedback_loop_mask &
@@ -2801,7 +3060,7 @@ yttrium_venus2_pipeline_init(struct yttrium_venus *venus,
    if (!pipeline || !resource ||
        (!storage_buffer_target && !render_image_target) ||
        (!has_color && !has_depth && !storage_image_mask &&
-        !storage_buffer_mask) ||
+        !storage_buffer_mask && !targetless_stream_output) ||
        (has_color && (!color_resources || !color_resource_ids)) ||
        !render_width || !render_height ||
        (render_image_target &&
@@ -2811,7 +3070,7 @@ yttrium_venus2_pipeline_init(struct yttrium_venus *venus,
        (binding_count && !bindings) || (attrib_count && !attribs) ||
        !draw_state ||
        ubo_binding_count > YTTRIUM_VENUS_MAX_PIPELINE_UBO_BINDINGS) {
-      YTTRIUM_WARN("yttrium: Venus native pipeline rejected res_id=%u initialized=%u buffer_backed=%u usage=0x%x format=%u extent=%ux%u subresource=%u/%u+%u sub_extent=%ux%u levels=%u layers=%u vs=0x%llx fs=0x%llx bindings=%u attribs=%u ubos=%u image_mask=0x%x buffer_mask=0x%x storage_image_mask=0x%llx storage_buffer_mask=0x%llx\n",
+      YTTRIUM_WARN("yttrium: Venus native pipeline rejected res_id=%u initialized=%u buffer_backed=%u usage=0x%x format=%u extent=%ux%u subresource=%u/%u+%u sub_extent=%ux%u levels=%u layers=%u vs=0x%llx fs=0x%llx bindings=%u attribs=%u ubos=%u sampled_bindings=%u storage_image_mask=0x%llx storage_buffer_mask=0x%llx targetless_so=%u tf=%u\n",
                    resource_id,
                    resource ? resource->initialized : 0,
                    resource ? resource->buffer_backed : 0,
@@ -2828,10 +3087,19 @@ yttrium_venus2_pipeline_init(struct yttrium_venus *venus,
                    (unsigned long long)YTTRIUM_VENUS_HANDLE_TO_U64(
                       fragment_shader),
                    binding_count, attrib_count,
-                   ubo_binding_count, sampled_image_mask,
-                   sampled_buffer_mask,
+                   ubo_binding_count, sampled_binding_count,
                    (unsigned long long)storage_image_mask,
-                   (unsigned long long)storage_buffer_mask);
+                   (unsigned long long)storage_buffer_mask,
+                   draw_state ? draw_state->targetless_stream_output : 0,
+                   venus->transform_feedback);
+      return false;
+   }
+
+   if (draw_state->targetless_stream_output &&
+       !targetless_stream_output) {
+      YTTRIUM_WARN("yttrium: Venus native pipeline rejected owner=venus2 reason=invalid_targetless_stream_output color_count=%u has_color=%u has_depth=%u tf=%u\n",
+                   color_resource_count, has_color, has_depth,
+                   venus->transform_feedback);
       return false;
    }
 
@@ -3012,6 +3280,7 @@ yttrium_venus2_pipeline_init(struct yttrium_venus *venus,
       render_target_key.color_feedback_loop_mask =
          color_feedback_loop_mask;
       render_target_key.depth_feedback_loop = depth_feedback_loop;
+      render_target_key.depth_read_only = depth_read_only;
       for (uint32_t i = 0; i < color_resource_count; i++) {
          struct yttrium_venus_resource *color = color_resources[i];
          if (!color)
@@ -3159,13 +3428,15 @@ yttrium_venus2_pipeline_init(struct yttrium_venus *venus,
          yttrium_venus_format_has_stencil(depth_resource->vk_format);
       const VkImageLayout attachment_layout = depth_feedback_loop ?
          VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT :
+         depth_read_only ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL :
          VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
       attachments[attachment_count++] = (VkAttachmentDescription) {
          .format = depth_resource->vk_format,
          .samples = depth_resource->samples ?
             depth_resource->samples : VK_SAMPLE_COUNT_1_BIT,
          .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
-         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+         .storeOp = depth_read_only ? VK_ATTACHMENT_STORE_OP_NONE :
+                    VK_ATTACHMENT_STORE_OP_STORE,
          .stencilLoadOp = has_stencil ? VK_ATTACHMENT_LOAD_OP_LOAD :
                           VK_ATTACHMENT_LOAD_OP_DONT_CARE,
          .stencilStoreOp = has_stencil ? VK_ATTACHMENT_STORE_OP_STORE :
@@ -3179,7 +3450,8 @@ yttrium_venus2_pipeline_init(struct yttrium_venus *venus,
          .samples = depth_resource->samples ?
             depth_resource->samples : VK_SAMPLE_COUNT_1_BIT,
          .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
-         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+         .storeOp = depth_read_only ? VK_ATTACHMENT_STORE_OP_NONE :
+                    VK_ATTACHMENT_STORE_OP_STORE,
          .stencilLoadOp = has_stencil ? VK_ATTACHMENT_LOAD_OP_LOAD :
                           VK_ATTACHMENT_LOAD_OP_DONT_CARE,
          .stencilStoreOp = has_stencil ? VK_ATTACHMENT_STORE_OP_STORE :
@@ -3207,6 +3479,7 @@ yttrium_venus2_pipeline_init(struct yttrium_venus *venus,
    }
    const VkImageLayout depth_attachment_layout = depth_feedback_loop ?
       VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT :
+      depth_read_only ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL :
       VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
    const VkAttachmentReference depth_ref = {
       .attachment = depth_attachment,
@@ -3315,9 +3588,9 @@ yttrium_venus2_pipeline_init(struct yttrium_venus *venus,
 
    if (!yttrium_venus_pipeline_prepare_ubo_descriptors(
           venus, pipeline, ubo_bindings, ubo_binding_count,
-          sampled_image_mask, sampled_buffer_mask, sampled_stage_flags,
+          sampled_bindings, sampled_binding_count,
           storage_image_mask, storage_buffer_mask, storage_stage_flags,
-          samplers, true)) {
+          true)) {
       yttrium_venus2_pipeline_fini(venus, pipeline);
       return false;
    }
@@ -3628,7 +3901,7 @@ yttrium_venus2_pipeline_init(struct yttrium_venus *venus,
       }
    }
 
-   YTTRIUM_LOG("yttrium: Venus native pipeline setup res_id=%u image_id=%llu depth_res_id=%u depth_image_id=%llu pipeline_id=%llu push_pipeline_id=%llu push_layout_id=%llu extent=%ux%u topology=%u restart=%u cull=0x%x front=%u blend=%u color_mask=0x%x sample_mask=0x%x bindings=%u attribs=%u ubo_bindings=%u ubo_slots=%u image_mask=0x%x buffer_mask=0x%x depth_test=%u depth_write=%u depth_compare=%u\n",
+   YTTRIUM_LOG("yttrium: Venus native pipeline setup res_id=%u image_id=%llu depth_res_id=%u depth_image_id=%llu pipeline_id=%llu push_pipeline_id=%llu push_layout_id=%llu extent=%ux%u topology=%u restart=%u cull=0x%x front=%u blend=%u color_mask=0x%x sample_mask=0x%x bindings=%u attribs=%u ubo_bindings=%u ubo_slots=%u sampled_bindings=%u depth_test=%u depth_write=%u depth_compare=%u\n",
                 resource_id,
                 (unsigned long long)resource->image_obj.id,
                 has_depth ? depth_resource_id : 0,
@@ -3647,7 +3920,7 @@ yttrium_venus2_pipeline_init(struct yttrium_venus *venus,
                  draw_state->sample_mask,
                  binding_count, attrib_count,
                  ubo_binding_count, pipeline->ubo_count,
-                 sampled_image_mask, sampled_buffer_mask,
+                 sampled_binding_count,
                  draw_state->depth_test_enable,
                  draw_state->depth_write_enable,
                  draw_state->depth_compare_op);
@@ -3665,6 +3938,8 @@ yttrium_venus2_compute_pipeline_init(
    VkShaderModule compute_shader,
    const struct yttrium_venus_ubo_binding_layout *ubo_bindings,
    uint32_t ubo_binding_count,
+   const struct yttrium_venus_sampled_binding_layout *sampled_bindings,
+   uint32_t sampled_binding_count,
    uint64_t storage_image_mask,
    uint64_t storage_buffer_mask)
 {
@@ -3672,14 +3947,15 @@ yttrium_venus2_compute_pipeline_init(
       return false;
    if (!pipeline || !compute_shader ||
        (!storage_image_mask && !storage_buffer_mask) ||
-       ubo_binding_count > YTTRIUM_VENUS_MAX_PIPELINE_UBO_BINDINGS)
+       ubo_binding_count > YTTRIUM_VENUS_MAX_PIPELINE_UBO_BINDINGS ||
+       sampled_binding_count > YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES)
       return false;
 
    if (!yttrium_venus_pipeline_prepare_ubo_descriptors(
           venus, pipeline, ubo_bindings, ubo_binding_count,
-          0, 0, VK_SHADER_STAGE_COMPUTE_BIT,
+          sampled_bindings, sampled_binding_count,
           storage_image_mask, storage_buffer_mask,
-          VK_SHADER_STAGE_COMPUTE_BIT, NULL, false)) {
+          VK_SHADER_STAGE_COMPUTE_BIT, true)) {
       yttrium_venus2_pipeline_fini(venus, pipeline);
       return false;
    }
@@ -3715,6 +3991,23 @@ yttrium_venus2_compute_pipeline_init(
          goto compute_submit_failed,
          venus->device_handle, &push_layout_info, NULL,
          &pipeline->push_pipeline_layout);
+      if (pipeline->push_descriptor_set_layout_alt) {
+         yttrium_venus_init_object(
+            venus, &pipeline->push_pipeline_layout_alt_obj);
+         pipeline->push_pipeline_layout_alt =
+            YTTRIUM_VENUS_HANDLE(
+               VkPipelineLayout, &pipeline->push_pipeline_layout_alt_obj);
+         VkPipelineLayoutCreateInfo push_layout_alt_info = push_layout_info;
+         push_layout_alt_info.pSetLayouts =
+            &pipeline->push_descriptor_set_layout_alt;
+         YTTRIUM_VENUS_SUBMIT_OBJECT_OR(
+            venus, vkCreatePipelineLayout,
+            &pipeline->push_pipeline_layout_alt_obj,
+            &pipeline->push_pipeline_layout_alt,
+            goto compute_submit_failed, venus->device_handle,
+            &push_layout_alt_info, NULL,
+            &pipeline->push_pipeline_layout_alt);
+      }
    }
 
    yttrium_venus_init_object(venus, &pipeline->pipeline_obj);
@@ -3905,6 +4198,98 @@ yttrium_venus_sample_view_format(VkFormat resource_format,
    return view_format;
 }
 
+/*
+ * Per-resource image views are keyed by the exact view description.  A mip
+ * chain that is sampled or stored one level at a time (an HZB build, a
+ * downsample pyramid) needs one view per level, so the list grows on demand
+ * instead of rejecting the draw or dispatch at a fixed bound.
+ *
+ * Each entry is allocated on its own and never moves: a Venus object handle
+ * IS the address of its yttrium_venus_object (YTTRIUM_VENUS_HANDLE), and
+ * handed-out VkImageViews stay live in descriptor writes and recorded
+ * batches.  Relocating an entry dangles every handle already issued from it,
+ * which the host reports as a failed object lookup.
+ */
+static struct yttrium_venus_sample_image_view *
+yttrium_venus_find_image_view(struct yttrium_venus_resource *resource,
+                              VkFormat vk_format,
+                              uint32_t swizzle_key,
+                              VkImageViewType view_type,
+                              VkImageAspectFlags aspect_mask,
+                              uint32_t first_level,
+                              uint32_t level_count,
+                              uint32_t first_layer,
+                              uint32_t layer_count)
+{
+   for (struct yttrium_venus_sample_image_view *entry =
+           resource->sample_image_views;
+        entry; entry = entry->next) {
+      if (entry->view && entry->vk_format == vk_format &&
+          entry->swizzle_key == swizzle_key &&
+          entry->view_type == view_type &&
+          entry->aspect_mask == aspect_mask &&
+          entry->first_level == first_level &&
+          entry->level_count == level_count &&
+          entry->first_layer == first_layer &&
+          entry->layer_count == layer_count)
+         return entry;
+   }
+   return NULL;
+}
+
+/*
+ * Link a zeroed entry into the resource.  The caller fills the view key in
+ * with yttrium_venus_commit_image_view() once the view exists, and unlinks it
+ * with yttrium_venus_discard_image_view() if the create fails.
+ */
+static struct yttrium_venus_sample_image_view *
+yttrium_venus_add_image_view(struct yttrium_venus_resource *resource,
+                             uint32_t resource_id)
+{
+   struct yttrium_venus_sample_image_view *entry =
+      CALLOC_STRUCT(yttrium_venus_sample_image_view);
+   if (!entry) {
+      YTTRIUM_WARN("yttrium: Venus image view allocation failed owner=venus2 res_id=%u image_id=%llu\n",
+                   resource_id,
+                   (unsigned long long)resource->image_obj.id);
+      return NULL;
+   }
+
+   entry->next = resource->sample_image_views;
+   resource->sample_image_views = entry;
+   return entry;
+}
+
+static void
+yttrium_venus_discard_image_view(struct yttrium_venus_resource *resource,
+                                 struct yttrium_venus_sample_image_view *entry)
+{
+   assert(resource->sample_image_views == entry);
+   resource->sample_image_views = entry->next;
+   FREE(entry);
+}
+
+static void
+yttrium_venus_commit_image_view(struct yttrium_venus_sample_image_view *entry,
+                                VkFormat vk_format,
+                                uint32_t swizzle_key,
+                                VkImageViewType view_type,
+                                VkImageAspectFlags aspect_mask,
+                                uint32_t first_level,
+                                uint32_t level_count,
+                                uint32_t first_layer,
+                                uint32_t layer_count)
+{
+   entry->vk_format = vk_format;
+   entry->swizzle_key = swizzle_key;
+   entry->view_type = view_type;
+   entry->aspect_mask = aspect_mask;
+   entry->first_level = first_level;
+   entry->level_count = level_count;
+   entry->first_layer = first_layer;
+   entry->layer_count = layer_count;
+}
+
 static bool
 yttrium_venus_ensure_sample_image_view(struct yttrium_venus *venus,
                                        struct yttrium_venus_resource *resource,
@@ -3976,38 +4361,18 @@ yttrium_venus_ensure_sample_image_view(struct yttrium_venus *venus,
       return false;
    }
 
-   for (unsigned i = 0; i < YTTRIUM_VENUS_SAMPLE_IMAGE_VIEW_CACHE_SIZE; i++) {
-      struct yttrium_venus_sample_image_view *entry =
-         &resource->sample_image_view_cache[i];
-      if (entry->view && entry->vk_format == vk_format &&
-          entry->swizzle_key == swizzle_key &&
-          entry->view_type == view_type &&
-          entry->aspect_mask == aspect_mask &&
-          entry->first_level == first_level &&
-          entry->level_count == level_count &&
-          entry->first_layer == first_layer &&
-          entry->layer_count == layer_count) {
-         *out_view = entry->view;
-         return true;
-      }
+   struct yttrium_venus_sample_image_view *entry =
+      yttrium_venus_find_image_view(resource, vk_format, swizzle_key,
+                                    view_type, aspect_mask, first_level,
+                                    level_count, first_layer, layer_count);
+   if (entry) {
+      *out_view = entry->view;
+      return true;
    }
 
-   struct yttrium_venus_sample_image_view *entry = NULL;
-   for (unsigned i = 0; i < YTTRIUM_VENUS_SAMPLE_IMAGE_VIEW_CACHE_SIZE; i++) {
-      if (!resource->sample_image_view_cache[i].view) {
-         entry = &resource->sample_image_view_cache[i];
-         break;
-      }
-   }
-   if (!entry) {
-      YTTRIUM_WARN("yttrium: Venus sampled image view cache full res_id=%u image_id=%llu format=%u aspect=0x%x swizzle_key=0x%x\n",
-                  resource_id,
-                  (unsigned long long)resource->image_obj.id,
-                  vk_format,
-                  aspect_mask,
-                  swizzle_key);
+   entry = yttrium_venus_add_image_view(resource, resource_id);
+   if (!entry)
       return false;
-   }
 
    yttrium_venus_init_object(venus, &entry->obj);
    entry->view = YTTRIUM_VENUS_HANDLE(VkImageView, &entry->obj);
@@ -4031,20 +4396,14 @@ yttrium_venus_ensure_sample_image_view(struct yttrium_venus *venus,
       venus, vkCreateImageView, &entry->obj, &entry->view,
       goto sample_image_view_submit_failed, venus->device_handle,
       &view_info, NULL, &entry->view);
-
-   entry->vk_format = vk_format;
-   entry->swizzle_key = swizzle_key;
-   entry->view_type = view_type;
-   entry->aspect_mask = aspect_mask;
-   entry->first_level = first_level;
-   entry->level_count = level_count;
-   entry->first_layer = first_layer;
-   entry->layer_count = layer_count;
+   yttrium_venus_commit_image_view(entry, vk_format, swizzle_key,
+                                   view_type, aspect_mask, first_level,
+                                   level_count, first_layer, layer_count);
    *out_view = entry->view;
    return true;
 
 sample_image_view_submit_failed:
-   memset(entry, 0, sizeof(*entry));
+   yttrium_venus_discard_image_view(resource, entry);
    return false;
 }
 
@@ -4087,29 +4446,16 @@ yttrium_venus_ensure_storage_image_view(struct yttrium_venus *venus,
       return false;
 
    const uint32_t swizzle_key = YTTRIUM_VENUS_SAMPLE_SWIZZLE_IDENTITY;
-   for (unsigned i = 0; i < YTTRIUM_VENUS_SAMPLE_IMAGE_VIEW_CACHE_SIZE; i++) {
-      struct yttrium_venus_sample_image_view *entry =
-         &resource->sample_image_view_cache[i];
-      if (entry->view && entry->vk_format == vk_format &&
-          entry->swizzle_key == swizzle_key &&
-          entry->view_type == view_type &&
-          entry->aspect_mask == aspect_mask &&
-          entry->first_level == first_level &&
-          entry->level_count == level_count &&
-          entry->first_layer == first_layer &&
-          entry->layer_count == layer_count) {
-         *out_view = entry->view;
-         return true;
-      }
+   struct yttrium_venus_sample_image_view *entry =
+      yttrium_venus_find_image_view(resource, vk_format, swizzle_key,
+                                    view_type, aspect_mask, first_level,
+                                    level_count, first_layer, layer_count);
+   if (entry) {
+      *out_view = entry->view;
+      return true;
    }
 
-   struct yttrium_venus_sample_image_view *entry = NULL;
-   for (unsigned i = 0; i < YTTRIUM_VENUS_SAMPLE_IMAGE_VIEW_CACHE_SIZE; i++) {
-      if (!resource->sample_image_view_cache[i].view) {
-         entry = &resource->sample_image_view_cache[i];
-         break;
-      }
-   }
+   entry = yttrium_venus_add_image_view(resource, resource_id);
    if (!entry)
       return false;
 
@@ -4133,19 +4479,14 @@ yttrium_venus_ensure_storage_image_view(struct yttrium_venus *venus,
       goto storage_image_view_submit_failed, venus->device_handle,
       &view_info, NULL, &entry->view);
 
-   entry->vk_format = vk_format;
-   entry->swizzle_key = swizzle_key;
-   entry->view_type = view_type;
-   entry->aspect_mask = aspect_mask;
-   entry->first_level = first_level;
-   entry->level_count = level_count;
-   entry->first_layer = first_layer;
-   entry->layer_count = layer_count;
+   yttrium_venus_commit_image_view(entry, vk_format, swizzle_key,
+                                   view_type, aspect_mask, first_level,
+                                   level_count, first_layer, layer_count);
    *out_view = entry->view;
    return true;
 
 storage_image_view_submit_failed:
-   memset(entry, 0, sizeof(*entry));
+   yttrium_venus_discard_image_view(resource, entry);
    return false;
 }
 
@@ -5449,6 +5790,25 @@ yttrium_venus2_update_buffer(struct yttrium_venus *venus,
       return false;
    }
 
+   /* A partial argument update can follow an indirect draw using the same
+    * bytes.  Queue order alone does not provide that read-to-write hazard. */
+   const VkBufferMemoryBarrier overwrite_barrier = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
+                       VK_ACCESS_HOST_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .buffer = resource->buffer,
+      .offset = offset,
+      .size = padded_size,
+   };
+   vn_async_vkCmdPipelineBarrier(
+      &venus->vn_ring, venus->command_buffer,
+      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+      0, NULL, 1, &overwrite_barrier, 0, NULL);
+
    if (!yttrium_venus_cmd_update_buffer_padded(venus, venus->command_buffer,
                                                resource->buffer, offset, size,
                                                data, &update_size)) {
@@ -5464,7 +5824,7 @@ yttrium_venus2_update_buffer(struct yttrium_venus *venus,
       .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
       .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
       .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT |
-                       VK_ACCESS_MEMORY_WRITE_BIT,
+                       VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT,
       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .buffer = resource->buffer,
@@ -5473,7 +5833,8 @@ yttrium_venus2_update_buffer(struct yttrium_venus *venus,
    };
    vn_async_vkCmdPipelineBarrier(&venus->vn_ring, venus->command_buffer,
                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT |
+                                 VK_PIPELINE_STAGE_HOST_BIT, 0,
                                  0, NULL, 1, &barrier, 0, NULL);
 
    return yttrium_venus_cmd_batch_after_record(venus, "buffer update");
@@ -5501,6 +5862,23 @@ yttrium_venus2_clear_buffer(struct yttrium_venus *venus,
          venus, "buffer clear tracking failure");
       return false;
    }
+
+   const VkBufferMemoryBarrier overwrite = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
+                       VK_ACCESS_HOST_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .buffer = resource->buffer,
+      .offset = offset,
+      .size = size,
+   };
+   vn_async_vkCmdPipelineBarrier(
+      &venus->vn_ring, venus->command_buffer,
+      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+      0, NULL, 1, &overwrite, 0, NULL);
 
    vn_async_vkCmdFillBuffer(&venus->vn_ring, venus->command_buffer,
                             resource->buffer, offset, size, value);
@@ -6164,9 +6542,9 @@ retry_layout:
              !resource->buffer || !resource->memory ||
              !(resource->buffer_usage & VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) ||
              (upload->direct_offset & (alignment - 1)) ||
-             upload->direct_offset > resource->allocation_size ||
-             upload->size > resource->allocation_size -
-                               upload->direct_offset)
+             upload->direct_offset > resource->image_size ||
+             upload->size > resource->image_size -
+                                upload->direct_offset)
             return false;
 
          slot->buffer = resource->buffer;
@@ -6490,12 +6868,6 @@ yttrium_venus_update_pipeline_ubo_descriptors(
       push_descriptors ? push_writes : local_writes;
    VkDescriptorBufferInfo *infos =
       push_descriptors ? push_infos : local_infos;
-   memset(writes, 0,
-          sizeof(VkWriteDescriptorSet) *
-          YTTRIUM_VENUS_MAX_PIPELINE_UBO_SLOTS);
-   memset(infos, 0,
-          sizeof(VkDescriptorBufferInfo) *
-          YTTRIUM_VENUS_MAX_PIPELINE_UBO_SLOTS);
 
    for (uint32_t i = 0; i < upload_count; i++) {
       const struct yttrium_venus_ubo_upload *upload = &uploads[i];
@@ -7315,14 +7687,36 @@ yttrium_venus_cmd_batch_add_upload_barrier(
    if (!venus || !barrier)
       return false;
 
-   for (uint32_t i = 0; i < venus->cmd_batch_upload_barrier_count; i++) {
+   const uint64_t buffer_key = YTTRIUM_VENUS_HANDLE_TO_U64(barrier->buffer);
+   const uint32_t bucket = (uint32_t)((buffer_key >> 4) ^ (buffer_key >> 10)) &
+      (ARRAY_SIZE(venus->cmd_batch_upload_barrier_candidates) - 1);
+   uint32_t existing_index =
+      venus->cmd_batch_upload_barrier_candidates[bucket] - 1;
+   /* A clear can leave an old index behind, and growth can move the array.
+    * Bounds and the full merge key make both cases safe without an epoch. */
+   if (existing_index >= venus->cmd_batch_upload_barrier_count ||
+       venus->cmd_batch_upload_barriers[existing_index].buffer != barrier->buffer ||
+       venus->cmd_batch_upload_barriers[existing_index].srcQueueFamilyIndex !=
+          barrier->srcQueueFamilyIndex ||
+       venus->cmd_batch_upload_barriers[existing_index].dstQueueFamilyIndex !=
+          barrier->dstQueueFamilyIndex ||
+       venus->cmd_batch_upload_barriers[existing_index].pNext || barrier->pNext) {
+      for (existing_index = 0;
+           existing_index < venus->cmd_batch_upload_barrier_count;
+           existing_index++) {
+         const VkBufferMemoryBarrier *existing =
+            &venus->cmd_batch_upload_barriers[existing_index];
+         if (existing->buffer == barrier->buffer &&
+             existing->srcQueueFamilyIndex == barrier->srcQueueFamilyIndex &&
+             existing->dstQueueFamilyIndex == barrier->dstQueueFamilyIndex &&
+             !existing->pNext && !barrier->pNext)
+            break;
+      }
+   }
+
+   if (existing_index < venus->cmd_batch_upload_barrier_count) {
       VkBufferMemoryBarrier *existing =
-         &venus->cmd_batch_upload_barriers[i];
-      if (existing->buffer != barrier->buffer ||
-          existing->srcQueueFamilyIndex != barrier->srcQueueFamilyIndex ||
-          existing->dstQueueFamilyIndex != barrier->dstQueueFamilyIndex ||
-          existing->pNext || barrier->pNext)
-         continue;
+         &venus->cmd_batch_upload_barriers[existing_index];
 
       const VkDeviceSize start = MIN2(existing->offset, barrier->offset);
       existing->srcAccessMask |= barrier->srcAccessMask;
@@ -7341,6 +7735,7 @@ yttrium_venus_cmd_batch_add_upload_barrier(
          existing->offset = start;
          existing->size = MAX2(existing_end, barrier_end) - start;
       }
+      venus->cmd_batch_upload_barrier_candidates[bucket] = existing_index + 1;
       venus->cmd_batch_upload_src_stages |= src_stages;
       venus->cmd_batch_upload_dst_stages |= dst_stages;
       return true;
@@ -7365,6 +7760,8 @@ yttrium_venus_cmd_batch_add_upload_barrier(
 
    venus->cmd_batch_upload_barriers
       [venus->cmd_batch_upload_barrier_count++] = *barrier;
+   venus->cmd_batch_upload_barrier_candidates[bucket] =
+      venus->cmd_batch_upload_barrier_count;
    venus->cmd_batch_upload_src_stages |= src_stages;
    venus->cmd_batch_upload_dst_stages |= dst_stages;
    return true;
@@ -7418,6 +7815,7 @@ yttrium_venus_deferred_draw_make_render_key(
    key->color_feedback_loop_mask =
       pipeline->key.color_feedback_loop_mask;
    key->depth_feedback_loop = pipeline->key.depth_feedback_loop;
+   key->depth_read_only = pipeline->key.depth_read_only;
 
    for (uint32_t i = 0; i < color_resource_count; i++) {
       struct yttrium_venus_resource *color =
@@ -7503,7 +7901,8 @@ yttrium_venus_deferred_draw_sampled_target_overlap(
    uint32_t sampled_image_count,
    struct yttrium_venus_resource **color_resources,
    uint32_t color_resource_count,
-   struct yttrium_venus_resource *depth_resource)
+   struct yttrium_venus_resource *depth_resource,
+   bool depth_read_only)
 {
    if (!sampled_images)
       return false;
@@ -7515,7 +7914,7 @@ yttrium_venus_deferred_draw_sampled_target_overlap(
          continue;
       if (yttrium_venus_resource_in_list(sampled, color_resources,
                                          color_resource_count) ||
-          sampled == depth_resource)
+          (sampled == depth_resource && !depth_read_only))
          return true;
    }
 
@@ -7538,12 +7937,19 @@ yttrium_venus_deferred_draw_allowed(
       return false;
    if (!pipeline || !pipeline->render_pass || !pipeline->framebuffer)
       return false;
+   /* Sampled buffers are repopulated with vkCmdUpdateBuffer for each draw.
+    * Deferred render-pass emission would record every update before any of
+    * the queued draws, so later contents could replace the data intended for
+    * earlier draws that reference the same buffer.  Keep those draws ordered
+    * with their uploads until sampled-buffer data has per-draw backing. */
+   if (pipeline->has_sampled_buffer)
+      return false;
    if (pipeline->has_storage_image || pipeline->has_storage_buffer ||
        storage_image_count || so_target_count || draw_auto)
       return false;
    if (yttrium_venus_deferred_draw_sampled_target_overlap(
           sampled_images, sampled_image_count, color_resources,
-          color_resource_count, depth_resource))
+          color_resource_count, depth_resource, pipeline->key.depth_read_only))
       return false;
 
    return true;
@@ -7635,6 +8041,12 @@ yttrium_venus_cmd_batch_append_compact_draw(
    draw->viewport_count = viewport_count;
    draw->vertex_buffer_count = vertex_buffer_count;
    draw->push_write_count = push_write_count;
+   draw->declared_push_descriptor_count =
+      pipeline->ubo_descriptor_count +
+      pipeline->sampled_image_descriptor_count +
+      pipeline->sampled_buffer_descriptor_count +
+      pipeline->storage_image_descriptor_count +
+      pipeline->storage_buffer_descriptor_count;
    draw->render_pass_obj = pipeline->render_pass_obj;
    draw->framebuffer_obj = pipeline->framebuffer_obj;
    draw->pipeline_obj = use_push_descriptors ?
@@ -7875,6 +8287,12 @@ yttrium_venus_cmd_batch_append_deferred_draw(
       }
       draw->sampled_push_write_count = sampled_update_count;
       draw->push_write_count = push_write_count;
+      draw->declared_push_descriptor_count =
+         pipeline->ubo_descriptor_count +
+         pipeline->sampled_image_descriptor_count +
+         pipeline->sampled_buffer_descriptor_count +
+         pipeline->storage_image_descriptor_count +
+         pipeline->storage_buffer_descriptor_count;
    }
 
    yttrium_venus_deferred_draw_fixup_handles(draw);
@@ -8005,9 +8423,76 @@ yttrium_venus_compact_draw_ensure_capacity(struct yttrium_venus *venus,
    return true;
 }
 
+/* Descriptor contents, not C wrapper/payload addresses. The zero-filled scalar
+ * representation keeps comparisons independent of compact/legacy packet
+ * storage and of copied sampler-object wrappers.
+ */
+struct yttrium_venus_single_push_descriptor {
+   uint64_t object_id;
+   uint64_t sampler_id;
+   VkDeviceSize offset;
+   VkDeviceSize range;
+   uint32_t binding;
+   uint32_t array_element;
+   VkDescriptorType type;
+   VkImageLayout image_layout;
+};
+
+static uint64_t
+yttrium_venus_push_descriptor_object_id(uint64_t handle)
+{
+   const struct yttrium_venus_object *object =
+      (const struct yttrium_venus_object *)(uintptr_t)handle;
+   return object ? object->id : 0;
+}
+
+static bool
+yttrium_venus_normalize_single_push_descriptor(
+   const VkWriteDescriptorSet *write,
+   struct yttrium_venus_single_push_descriptor *out)
+{
+   if (!write || write->sType != VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET ||
+       write->pNext || write->descriptorCount != 1)
+      return false;
+
+   *out = (struct yttrium_venus_single_push_descriptor) {
+      .binding = write->dstBinding,
+      .array_element = write->dstArrayElement,
+      .type = write->descriptorType,
+   };
+   switch (write->descriptorType) {
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+      if (!write->pBufferInfo)
+         return false;
+      out->object_id = yttrium_venus_push_descriptor_object_id(
+         YTTRIUM_VENUS_HANDLE_TO_U64(write->pBufferInfo->buffer));
+      out->offset = write->pBufferInfo->offset;
+      out->range = write->pBufferInfo->range;
+      return true;
+   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+      if (!write->pImageInfo)
+         return false;
+      out->object_id = yttrium_venus_push_descriptor_object_id(
+         YTTRIUM_VENUS_HANDLE_TO_U64(write->pImageInfo->imageView));
+      out->sampler_id = yttrium_venus_push_descriptor_object_id(
+         YTTRIUM_VENUS_HANDLE_TO_U64(write->pImageInfo->sampler));
+      out->image_layout = write->pImageInfo->imageLayout;
+      return true;
+   case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+      if (!write->pTexelBufferView)
+         return false;
+      out->object_id = yttrium_venus_push_descriptor_object_id(
+         YTTRIUM_VENUS_HANDLE_TO_U64(*write->pTexelBufferView));
+      return true;
+   default:
+      return false;
+   }
+}
+
 static void
 yttrium_venus_cmd_push_static_ubo_constants(
    struct yttrium_venus *venus,
+   struct vn_ring *command_ring,
    VkPipelineLayout pipeline_layout,
    const uint8_t *vs_data,
    uint16_t vs_size,
@@ -8016,13 +8501,13 @@ yttrium_venus_cmd_push_static_ubo_constants(
 {
    if (vs_size) {
       vn_async_vkCmdPushConstants(
-         &venus->vn_ring, venus->command_buffer, pipeline_layout,
+         command_ring, venus->command_buffer, pipeline_layout,
          VK_SHADER_STAGE_VERTEX_BIT,
          YTTRIUM_SHADER_VS_PUSH_CONSTANT_OFFSET, vs_size, vs_data);
    }
    if (fs_size) {
       vn_async_vkCmdPushConstants(
-         &venus->vn_ring, venus->command_buffer, pipeline_layout,
+         command_ring, venus->command_buffer, pipeline_layout,
          VK_SHADER_STAGE_FRAGMENT_BIT,
          YTTRIUM_SHADER_FS_PUSH_CONSTANT_OFFSET, fs_size, fs_data);
    }
@@ -8031,12 +8516,15 @@ yttrium_venus_cmd_push_static_ubo_constants(
 static bool
 yttrium_venus_cmd_batch_emit_deferred_draw_commands(
    struct yttrium_venus *venus,
+   struct vn_ring *command_ring,
    const char *label)
 {
    if (!venus || !venus->cmd_batch_deferred_draw_count)
       return true;
 
    (void)label;
+   struct yttrium_trace_deferred_draw_stats trace_stats = { 0 };
+   uint64_t last_push_layout_id = 0;
    struct yttrium_venus_render_pass_group_key current_key;
    bool render_pass_open = false;
    bool viewport_valid = false;
@@ -8044,13 +8532,30 @@ yttrium_venus_cmd_batch_emit_deferred_draw_commands(
    bool blend_constants_valid = false;
    bool pipeline_valid = false;
    bool descriptor_set_valid = false;
+   bool single_push_valid = false;
+   uint64_t single_push_pipeline_id = 0;
+   uint64_t single_push_layout_id = 0;
+   struct yttrium_venus_single_push_descriptor last_single_push;
    bool vertex_buffers_valid = false;
    bool index_buffer_valid = false;
+   /* Every packet producer uses yttrium_venus2_pipeline_init, whose
+    * ordinary/push/alternate layouts all have the same VS/FS push ranges
+    * while this process-immutable option is enabled. No compute packet or
+    * untracked command can enter this emitter's local cache lifetime. */
+   const bool canonical_push_ranges =
+      yttrium_gdi_static_ubo_sampled_cache_enabled();
+   bool push_constant_vs_valid = false;
+   bool push_constant_fs_valid = false;
+   uint16_t last_push_constant_vs_size = 0;
+   uint16_t last_push_constant_fs_size = 0;
+   uint8_t last_push_constant_vs[YTTRIUM_SHADER_VS_PUSH_CONSTANT_BYTES];
+   uint8_t last_push_constant_fs[YTTRIUM_SHADER_FS_PUSH_CONSTANT_BYTES];
    uint32_t last_viewport_count = 0;
    uint32_t last_scissor_count = 0;
    uint32_t last_vertex_buffer_count = 0;
-   VkPipeline last_pipeline = VK_NULL_HANDLE;
-   VkPipelineLayout last_descriptor_layout = VK_NULL_HANDLE;
+   uint64_t last_pipeline_id = 0;
+   uint64_t last_descriptor_layout_id = 0;
+   uint64_t last_descriptor_set_id = 0;
    VkDescriptorSet last_descriptor_set = VK_NULL_HANDLE;
    VkBuffer last_vertex_buffers[YTTRIUM_VENUS_MAX_PIPELINE_VERTEX_BINDINGS];
    VkDeviceSize
@@ -8089,6 +8594,9 @@ yttrium_venus_cmd_batch_emit_deferred_draw_commands(
       VkPipeline pipeline;
       VkPipelineLayout pipeline_layout;
       VkDescriptorSet descriptor_set;
+      uint64_t pipeline_id;
+      uint64_t pipeline_layout_id;
+      uint64_t descriptor_set_id;
       const VkViewport *viewports;
       const VkRect2D *scissors;
       const float *blend_constants;
@@ -8105,6 +8613,7 @@ yttrium_venus_cmd_batch_emit_deferred_draw_commands(
       uint32_t viewport_count;
       uint32_t vertex_buffer_count;
       uint32_t push_write_count;
+      uint32_t declared_push_descriptor_count;
       uint32_t vertex_count;
       uint32_t index_count;
       uint32_t instance_count;
@@ -8204,6 +8713,9 @@ yttrium_venus_cmd_batch_emit_deferred_draw_commands(
             YTTRIUM_VENUS_HANDLE(
                VkDescriptorSet, &draw->descriptor_set_obj) :
             draw->descriptor_set;
+         pipeline_id = draw->pipeline_obj.id;
+         pipeline_layout_id = draw->pipeline_layout_obj.id;
+         descriptor_set_id = draw->descriptor_set_obj.id;
          blend_constants = draw->blend_constants;
          push_writes = compact_push_writes;
          index_buffer = draw->index_buffer;
@@ -8214,6 +8726,7 @@ yttrium_venus_cmd_batch_emit_deferred_draw_commands(
          viewport_count = draw->viewport_count;
          vertex_buffer_count = draw->vertex_buffer_count;
          push_write_count = draw->push_write_count;
+         declared_push_descriptor_count = draw->declared_push_descriptor_count;
          vertex_count = draw->vertex_count;
          index_count = draw->index_count;
          instance_count = draw->instance_count;
@@ -8237,6 +8750,9 @@ yttrium_venus_cmd_batch_emit_deferred_draw_commands(
          pipeline = draw->pipeline;
          pipeline_layout = draw->pipeline_layout;
          descriptor_set = draw->descriptor_set;
+         pipeline_id = draw->pipeline_obj.id;
+         pipeline_layout_id = draw->pipeline_layout_obj.id;
+         descriptor_set_id = draw->descriptor_set_obj.id;
          viewports = draw->viewports;
          scissors = draw->scissors;
          blend_constants = draw->blend_constants;
@@ -8255,6 +8771,7 @@ yttrium_venus_cmd_batch_emit_deferred_draw_commands(
          viewport_count = draw->viewport_count;
          vertex_buffer_count = draw->vertex_buffer_count;
          push_write_count = draw->push_write_count;
+         declared_push_descriptor_count = draw->declared_push_descriptor_count;
          vertex_count = draw->vertex_count;
          index_count = draw->index_count;
          instance_count = draw->instance_count;
@@ -8271,7 +8788,7 @@ yttrium_venus_cmd_batch_emit_deferred_draw_commands(
 
       if (!compatible) {
          if (render_pass_open)
-            vn_async_vkCmdEndRenderPass(&venus->vn_ring,
+            vn_async_vkCmdEndRenderPass(command_ring,
                                         venus->command_buffer);
 
          const VkRenderPassBeginInfo render_pass_begin = {
@@ -8283,10 +8800,11 @@ yttrium_venus_cmd_batch_emit_deferred_draw_commands(
                .extent = { render_width, render_height },
             },
          };
-         vn_async_vkCmdBeginRenderPass(&venus->vn_ring,
+         vn_async_vkCmdBeginRenderPass(command_ring,
                                        venus->command_buffer,
                                        &render_pass_begin,
                                        VK_SUBPASS_CONTENTS_INLINE);
+         trace_stats.render_passes++;
          current_key = *render_key;
          render_pass_open = true;
          viewport_valid = false;
@@ -8294,14 +8812,17 @@ yttrium_venus_cmd_batch_emit_deferred_draw_commands(
          blend_constants_valid = false;
          pipeline_valid = false;
          descriptor_set_valid = false;
+         single_push_valid = false;
          vertex_buffers_valid = false;
          index_buffer_valid = false;
+         push_constant_vs_valid = false;
+         push_constant_fs_valid = false;
       }
 
       if (!viewport_valid || last_viewport_count != viewport_count ||
           memcmp(last_viewports, viewports,
                  viewport_count * sizeof(viewports[0])) != 0) {
-         vn_async_vkCmdSetViewport(&venus->vn_ring, venus->command_buffer, 0,
+         vn_async_vkCmdSetViewport(command_ring, venus->command_buffer, 0,
                                    viewport_count, viewports);
          memcpy(last_viewports, viewports,
                 viewport_count * sizeof(viewports[0]));
@@ -8312,7 +8833,7 @@ yttrium_venus_cmd_batch_emit_deferred_draw_commands(
       if (!scissor_valid || last_scissor_count != viewport_count ||
           memcmp(last_scissors, scissors,
                  viewport_count * sizeof(scissors[0])) != 0) {
-         vn_async_vkCmdSetScissor(&venus->vn_ring, venus->command_buffer, 0,
+         vn_async_vkCmdSetScissor(command_ring, venus->command_buffer, 0,
                                   viewport_count, scissors);
          memcpy(last_scissors, scissors,
                 viewport_count * sizeof(scissors[0]));
@@ -8320,45 +8841,125 @@ yttrium_venus_cmd_batch_emit_deferred_draw_commands(
          scissor_valid = true;
       }
 
-      if (!pipeline_valid || last_pipeline != pipeline) {
-         vn_async_vkCmdBindPipeline(&venus->vn_ring, venus->command_buffer,
+      /* Packet-local wrappers have different addresses even when they name
+       * the same Venus object.  Compare the copied IDs, not those handles. */
+      if (!pipeline_valid || last_pipeline_id != pipeline_id) {
+         vn_async_vkCmdBindPipeline(command_ring, venus->command_buffer,
                                     VK_PIPELINE_BIND_POINT_GRAPHICS,
                                     pipeline);
-         last_pipeline = pipeline;
+         last_pipeline_id = pipeline_id;
          pipeline_valid = true;
+         trace_stats.pipeline_binds++;
+      } else {
+         trace_stats.pipeline_binds_skipped++;
       }
 
       if (use_push_descriptors && push_write_count) {
-         vn_async_vkCmdPushDescriptorSet(
-            &venus->vn_ring, venus->command_buffer,
-            VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0,
-            push_write_count, push_writes);
+         trace_stats.requested_push_calls++;
+         trace_stats.requested_push_writes += push_write_count;
+         /* Restrict this first cache to a complete one-descriptor layout.
+          * Such layouts have no alternate layout/rotation. Multi-descriptor
+          * pushes always execute unchanged, so skipping cannot consume their
+          * parity and accidentally restore ANV's preservation-copy path.
+          * Producer uploads, barriers, role checks and held references have
+          * already run for every draw; only the redundant command is omitted.
+          */
+         struct yttrium_venus_single_push_descriptor current_single_push;
+         bool same_push = false;
+         if (declared_push_descriptor_count == 1 && push_write_count == 1 &&
+             yttrium_venus_normalize_single_push_descriptor(
+                push_writes, &current_single_push)) {
+            if (single_push_valid && single_push_pipeline_id == pipeline_id &&
+                single_push_layout_id == pipeline_layout_id) {
+               trace_stats.push_comparisons++;
+               same_push = memcmp(&last_single_push, &current_single_push,
+                                  sizeof(current_single_push)) == 0;
+            }
+            last_single_push = current_single_push;
+            single_push_pipeline_id = pipeline_id;
+            single_push_layout_id = pipeline_layout_id;
+            single_push_valid = true;
+         } else {
+            single_push_valid = false;
+         }
+         if (!same_push) {
+            vn_async_vkCmdPushDescriptorSet(
+               command_ring, venus->command_buffer,
+               VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0,
+               push_write_count, push_writes);
+            trace_stats.push_calls++;
+            trace_stats.push_writes += push_write_count;
+            if (last_push_layout_id == pipeline_layout_id)
+               trace_stats.repeated_push_layouts++;
+            last_push_layout_id = pipeline_layout_id;
+         } else {
+            trace_stats.push_calls_skipped++;
+            trace_stats.push_writes_skipped += push_write_count;
+         }
          descriptor_set_valid = false;
       } else if (descriptor_set) {
+         single_push_valid = false;
          if (!descriptor_set_valid ||
-             last_descriptor_layout != pipeline_layout ||
-             last_descriptor_set != descriptor_set) {
-            vn_async_vkCmdBindDescriptorSets(&venus->vn_ring,
+             last_descriptor_layout_id != pipeline_layout_id ||
+             last_descriptor_set_id != descriptor_set_id ||
+             (!descriptor_set_id && last_descriptor_set != descriptor_set)) {
+            vn_async_vkCmdBindDescriptorSets(command_ring,
                                              venus->command_buffer,
                                              VK_PIPELINE_BIND_POINT_GRAPHICS,
                                              pipeline_layout, 0, 1,
                                              &descriptor_set, 0, NULL);
-            last_descriptor_layout = pipeline_layout;
+            last_descriptor_layout_id = pipeline_layout_id;
+            last_descriptor_set_id = descriptor_set_id;
+            /* Batch-owned sets keep their original stable handles instead
+             * of embedding a copied descriptor_set_obj in the packet. */
             last_descriptor_set = descriptor_set;
             descriptor_set_valid = true;
+            trace_stats.descriptor_binds++;
+            last_push_layout_id = 0;
+         } else {
+            trace_stats.descriptor_binds_skipped++;
          }
       } else {
          descriptor_set_valid = false;
+         single_push_valid = false;
       }
 
+      /* Push-constant compatibility depends on the complete range
+       * definitions, not descriptor-layout identity. Preserve the shadow
+       * across the existing compatible descriptor-layout rotation. */
+      const bool update_push_constant_vs = push_constant_vs_size &&
+         (!canonical_push_ranges || !push_constant_vs_valid ||
+          last_push_constant_vs_size != push_constant_vs_size ||
+          memcmp(last_push_constant_vs, push_constant_vs,
+                 push_constant_vs_size) != 0);
+      const bool update_push_constant_fs = push_constant_fs_size &&
+         (!canonical_push_ranges || !push_constant_fs_valid ||
+          last_push_constant_fs_size != push_constant_fs_size ||
+          memcmp(last_push_constant_fs, push_constant_fs,
+                 push_constant_fs_size) != 0);
       yttrium_venus_cmd_push_static_ubo_constants(
-         venus, pipeline_layout, push_constant_vs, push_constant_vs_size,
-         push_constant_fs, push_constant_fs_size);
+         venus, command_ring, pipeline_layout,
+         push_constant_vs, update_push_constant_vs ? push_constant_vs_size : 0,
+         push_constant_fs, update_push_constant_fs ? push_constant_fs_size : 0);
+      if (update_push_constant_vs) {
+         memcpy(last_push_constant_vs, push_constant_vs,
+                push_constant_vs_size);
+         last_push_constant_vs_size = push_constant_vs_size;
+      }
+      if (update_push_constant_fs) {
+         memcpy(last_push_constant_fs, push_constant_fs,
+                push_constant_fs_size);
+         last_push_constant_fs_size = push_constant_fs_size;
+      }
+      push_constant_vs_valid =
+         canonical_push_ranges && push_constant_vs_size != 0;
+      push_constant_fs_valid =
+         canonical_push_ranges && push_constant_fs_size != 0;
 
       if (!blend_constants_valid ||
           memcmp(last_blend_constants, blend_constants,
                  sizeof(last_blend_constants)) != 0) {
-         vn_async_vkCmdSetBlendConstants(&venus->vn_ring,
+         vn_async_vkCmdSetBlendConstants(command_ring,
                                          venus->command_buffer,
                                          blend_constants);
          memcpy(last_blend_constants, blend_constants,
@@ -8374,7 +8975,7 @@ yttrium_venus_cmd_batch_emit_deferred_draw_commands(
              memcmp(last_vertex_offsets, vertex_offsets,
                     vertex_buffer_count * sizeof(vertex_offsets[0])) != 0) {
             vn_async_vkCmdBindVertexBuffers(
-               &venus->vn_ring, venus->command_buffer, 0,
+               command_ring, venus->command_buffer, 0,
                vertex_buffer_count, vertex_buffers, vertex_offsets);
             memcpy(last_vertex_buffers, vertex_buffers,
                    vertex_buffer_count * sizeof(vertex_buffers[0]));
@@ -8392,7 +8993,7 @@ yttrium_venus_cmd_batch_emit_deferred_draw_commands(
              last_index_buffer != index_buffer ||
              last_index_offset != index_offset ||
              last_index_type != index_type) {
-            vn_async_vkCmdBindIndexBuffer(&venus->vn_ring,
+            vn_async_vkCmdBindIndexBuffer(command_ring,
                                           venus->command_buffer,
                                           index_buffer, index_offset,
                                           index_type);
@@ -8401,13 +9002,14 @@ yttrium_venus_cmd_batch_emit_deferred_draw_commands(
             last_index_type = index_type;
             index_buffer_valid = true;
          }
-         vn_async_vkCmdDrawIndexed(&venus->vn_ring, venus->command_buffer,
+         vn_async_vkCmdDrawIndexed(command_ring, venus->command_buffer,
                                    index_count, instance_count, 0,
                                    vertex_offset, 0);
       } else {
-         vn_async_vkCmdDraw(&venus->vn_ring, venus->command_buffer,
+         vn_async_vkCmdDraw(command_ring, venus->command_buffer,
                             vertex_count, instance_count, 0, 0);
       }
+      trace_stats.draws++;
    }
 
    if (compact_packets &&
@@ -8418,8 +9020,9 @@ yttrium_venus_cmd_batch_emit_deferred_draw_commands(
    }
 
    if (render_pass_open)
-      vn_async_vkCmdEndRenderPass(&venus->vn_ring, venus->command_buffer);
+      vn_async_vkCmdEndRenderPass(command_ring, venus->command_buffer);
 
+   yttrium_trace_deferred_draw_state(&trace_stats);
    venus->cmd_batch_deferred_draw_count = 0;
    venus->cmd_batch_compact_draw_packet_size = 0;
    return true;
@@ -8430,17 +9033,19 @@ yttrium_venus_cmd_batch_emit_deferred_draws(struct yttrium_venus *venus,
                                             const char *label)
 {
    if (!venus || !venus->cmd_batch_deferred_draw_count)
-      return yttrium_venus_cmd_batch_emit_deferred_draw_commands(venus,
-                                                                 label);
+      return true;
 
    if (!yttrium_venus2_ring_transaction_begin(venus))
       return false;
 
-   const bool emit_ok =
-      yttrium_venus_cmd_batch_emit_deferred_draw_commands(venus, label);
+   struct yttrium_venus_command_stream stream;
+   yttrium_venus2_command_stream_init(&stream, venus);
+   const bool emit_ok = yttrium_venus_cmd_batch_emit_deferred_draw_commands(
+      venus, &stream.vn_ring, label);
+   const bool flush_ok = yttrium_venus2_command_stream_flush(&stream);
    const bool end_ok =
       yttrium_venus2_ring_transaction_end(venus, label);
-   return emit_ok && end_ok;
+   return emit_ok && flush_ok && end_ok;
 }
 
 static uint32_t
@@ -8650,8 +9255,8 @@ yttrium_venus_pipeline_sampled_cache_initialize(
 }
 
 static const struct yttrium_venus_object *
-yttrium_venus_select_draw_pipeline_layout(
-   struct yttrium_venus *venus,
+yttrium_venus_select_pipeline_layout(
+   uint32_t *layout_index,
    struct yttrium_pipeline *pipeline,
    bool use_push_descriptors,
    uint32_t push_descriptor_count)
@@ -8668,14 +9273,16 @@ yttrium_venus_select_draw_pipeline_layout(
 
    /*
     * ANV preserves push descriptors when a layout object is reused, which can
-    * copy the old host backing on every draw.  Alternating compatible layouts
-    * makes that preservation unnecessary.  This is valid only while the draw
-    * publishes every descriptor in the selected layout.
+    * copy the old host backing on every draw or dispatch. Alternating compatible
+    * layouts makes that preservation unnecessary. This is valid only while the
+    * command publishes every descriptor in the selected layout. Graphics and
+    * compute must use separate indices: interleaving bind points must not consume
+    * the other bind point's parity and repeat its previous layout.
     */
    if (pipeline->push_pipeline_layout_alt &&
        push_descriptor_count == expected_descriptor_count &&
        yttrium_venus_push_descriptor_layout_rotation_enabled()) {
-      const uint32_t index = venus->push_descriptor_layout_index++;
+      const uint32_t index = (*layout_index)++;
       if (index & 1)
          return &pipeline->push_pipeline_layout_alt_obj;
    }
@@ -8719,6 +9326,13 @@ yttrium_venus2_draw_pipeline(struct yttrium_venus *venus,
                             const struct yttrium_venus_draw_state *draw_state)
 {
    const bool draw_auto = draw_auto_target != NULL;
+   struct yttrium_venus_resource *indirect_resource =
+      draw_state ? draw_state->indirect_resource : NULL;
+   const bool draw_indirect = indirect_resource != NULL;
+   const VkDeviceSize indirect_offset = draw_indirect ?
+      draw_state->indirect_offset : 0;
+   const VkDeviceSize indirect_size = index_resource ?
+      sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
    const uint64_t total_start_us =
       yttrium_trace_is_enabled() ? yttrium_trace_now_us() : 0;
    uint64_t stage_start_us = total_start_us;
@@ -8726,10 +9340,53 @@ yttrium_venus2_draw_pipeline(struct yttrium_venus *venus,
 
    if (!venus || !resource || !pipeline || !pipeline->pipeline ||
        (!vertex_uploads && vertex_upload_count) ||
-       (!draw_auto && !vertex_count) ||
-       !instance_count || !draw_state ||
+       (!draw_auto && !draw_indirect && !vertex_count) ||
+       (!draw_indirect && !instance_count) || !draw_state ||
        vertex_upload_count > YTTRIUM_VENUS_MAX_PIPELINE_VERTEX_BINDINGS)
       return false;
+
+   if (draw_indirect) {
+      if (draw_auto || !venus->draw_indirect_first_instance ||
+          !indirect_resource->initialized || !indirect_resource->buffer_backed ||
+          !indirect_resource->buffer ||
+          !(indirect_resource->buffer_usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) ||
+          (indirect_offset & 3) ||
+          indirect_offset > indirect_resource->allocation_size ||
+          indirect_size > indirect_resource->allocation_size - indirect_offset) {
+         YTTRIUM_WARN("yttrium: native indirect draw rejected owner=venus2 reason=invalid_argument_buffer_or_missing_first_instance_feature first_instance=%u offset=%llu\n",
+                      venus->draw_indirect_first_instance,
+                      (unsigned long long)indirect_offset);
+         return false;
+      }
+      /* firstInstance is GPU-owned; it cannot be inspected to decide whether
+       * an optional vertex-divisor restriction applies to this command. */
+      for (uint32_t i = 0; i < pipeline->key.num_bindings; i++) {
+         if (pipeline->key.bindings[i].inputRate == VK_VERTEX_INPUT_RATE_INSTANCE &&
+             pipeline->key.binding_divisors[i] != 1 &&
+             !venus->vertex_divisor_nonzero_first_instance) {
+            YTTRIUM_WARN("yttrium: native indirect draw rejected owner=venus2 reason=divisor_nonzero_first_instance_unsupported binding=%u divisor=%u\n",
+                         i, pipeline->key.binding_divisors[i]);
+            return false;
+         }
+      }
+   }
+
+   if (pipeline->key.targetless_stream_output !=
+          draw_state->targetless_stream_output ||
+       (draw_state->targetless_stream_output &&
+        (pipeline->color_attachment_count || pipeline->depth_image_view ||
+         color_resource_count || depth_resource || !so_target_count ||
+         !so_targets || !venus->transform_feedback))) {
+      YTTRIUM_WARN("yttrium: Venus native draw rejected owner=venus2 reason=invalid_targetless_stream_output pipeline_id=%llu key_targetless_so=%u draw_targetless_so=%u pipeline_color_count=%u pipeline_depth=%u color_count=%u depth=%u so_targets=%u tf=%u\n",
+                   (unsigned long long)pipeline->pipeline_obj.id,
+                   pipeline->key.targetless_stream_output,
+                   draw_state->targetless_stream_output,
+                   pipeline->color_attachment_count,
+                   pipeline->depth_image_view != VK_NULL_HANDLE,
+                   color_resource_count, depth_resource != NULL,
+                   so_target_count, venus->transform_feedback);
+      return false;
+   }
 
    if (draw_auto) {
       if (!yttrium_venus2_transform_feedback_draw_enabled(venus) ||
@@ -8750,6 +9407,13 @@ yttrium_venus2_draw_pipeline(struct yttrium_venus *venus,
                      draw_auto_target,
                      draw_auto_target->counter_buffer_valid,
                      draw_auto_target->counter_resource);
+         return false;
+      }
+      const uint32_t max_stride =
+         yttrium_venus2_max_transform_feedback_stride(venus);
+      if (max_stride && draw_auto_stride > max_stride) {
+         YTTRIUM_LOG("yttrium: Venus native draw rejected DrawAuto stride=%u max_stride=%u\n",
+                     draw_auto_stride, max_stride);
          return false;
       }
    }
@@ -8873,7 +9537,8 @@ yttrium_venus2_draw_pipeline(struct yttrium_venus *venus,
       index_data || index_data_size || index_count || index_resource;
    if (indexed &&
        ((!index_data && !has_index_resource) || !index_data_size ||
-        !index_count || (index_resource && !has_index_resource) ||
+        (!draw_indirect && !index_count) ||
+        (index_resource && !has_index_resource) ||
         (index_type != VK_INDEX_TYPE_UINT16 &&
          index_type != VK_INDEX_TYPE_UINT32))) {
       YTTRIUM_LOG("yttrium: Venus native draw rejected invalid index args data=%p size=0x%llx count=%u type=%u resource=%p resource_id=%u initialized=%u buffer_backed=%u buffer=0x%llx usage=0x%x\n",
@@ -8966,7 +9631,7 @@ retry_batch_layout:
    bool render_pass_key_valid = false;
    memset(&render_pass_key, 0, sizeof(render_pass_key));
    const bool render_pass_batch_allowed =
-      native_draw_batch_candidate &&
+      native_draw_batch_candidate && !draw_indirect &&
       (!has_cpu_vertex_upload || !has_sampled_descriptor ||
        yttrium_venus_sampled_cpu_vertex_render_pass_batch_enabled()) &&
       yttrium_venus_deferred_draw_allowed(
@@ -8987,7 +9652,7 @@ retry_batch_layout:
        venus->cmd_batch_deferred_draw_count &&
        yttrium_venus_cmd_batch_deferred_image_role_conflict(
           venus, sampled_images, sampled_image_count, color_resources,
-          color_resource_count, depth_resource)) {
+          color_resource_count, depth_resource, pipeline->key.depth_read_only)) {
       if (!yttrium_venus_flush_command_batch(
              venus, "native draw deferred image role boundary")) {
          if (!venus->display_copy_batch_recording)
@@ -9204,59 +9869,44 @@ retry_batch_layout:
    }
 
    if (has_sampled_descriptor) {
-      const uint32_t sampled_mask =
-         pipeline->sampled_image_mask | pipeline->sampled_buffer_mask;
+      const uint32_t expected_sampled_count =
+         pipeline->key.sampled_binding_count;
       if (!sampled_images || !sampled_image_count ||
+          sampled_image_count != expected_sampled_count ||
           sampled_image_count > YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES)
          return false;
 
       if (!use_push_descriptors && !draw_descriptor_set) {
-         YTTRIUM_LOG("yttrium: Venus native draw rejected sampled descriptors pipeline_id=%llu descriptor_set=0x%llx count=%u image_mask=0x%x buffer_mask=0x%x\n",
+         YTTRIUM_LOG("yttrium: Venus native draw rejected sampled descriptors pipeline_id=%llu descriptor_set=0x%llx count=%u expected=%u stages=0x%x\n",
                      (unsigned long long)pipeline->pipeline_obj.id,
                      (unsigned long long)YTTRIUM_VENUS_HANDLE_TO_U64(
                         draw_descriptor_set),
                      sampled_image_count,
-                     pipeline->sampled_image_mask,
-                     pipeline->sampled_buffer_mask);
+                     expected_sampled_count,
+                     pipeline->key.sampled_stage_mask);
          return false;
       }
 
-      uint32_t seen_mask = 0;
       for (uint32_t i = 0; i < sampled_image_count; i++) {
          const struct yttrium_venus_sampled_image *sampled =
             &sampled_images[i];
+         const struct yttrium_venus_sampled_binding_layout *layout =
+            &pipeline->key.sampled_bindings[i];
          struct yttrium_venus_resource *sampled_resource = sampled->resource;
          uint32_t sampled_resource_id = sampled->resource_id;
-         const uint32_t raw_slot =
-            sampled->binding >= YTTRIUM_SHADER_SAMPLED_IMAGE_BINDING_BASE ?
-            sampled->binding - YTTRIUM_SHADER_SAMPLED_IMAGE_BINDING_BASE :
-            UINT32_MAX;
-         const uint32_t raw_mask =
-            raw_slot < YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES ?
-            (1u << raw_slot) : 0;
+         const uint32_t raw_slot = layout->raw_slot;
 
-         if (raw_slot >= YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES ||
-             !(sampled_mask & raw_mask) ||
-             (seen_mask & raw_mask) ||
-             sampled->binding != yttrium_shader_sampler_binding(raw_slot)) {
-            YTTRIUM_LOG("yttrium: Venus native draw rejected sampled binding pipeline_id=%llu binding=%u raw_slot=%u buffer=%u seen=0x%x image_mask=0x%x buffer_mask=0x%x\n",
+         if (sampled->binding != layout->binding ||
+             sampled->buffer != (layout->buffer != VK_FALSE)) {
+            YTTRIUM_LOG("yttrium: Venus native draw rejected sampled binding pipeline_id=%llu index=%u binding=%u expected_binding=%u stage=%u raw_slot=%u buffer=%u expected_buffer=%u\n",
                         (unsigned long long)pipeline->pipeline_obj.id,
-                        sampled->binding, raw_slot, sampled->buffer,
-                        seen_mask, pipeline->sampled_image_mask,
-                        pipeline->sampled_buffer_mask);
+                        i, sampled->binding, layout->binding,
+                        layout->stage, raw_slot, sampled->buffer,
+                        layout->buffer);
             return false;
          }
 
-         const bool expect_buffer =
-            (pipeline->sampled_buffer_mask & raw_mask) != 0;
-         if (sampled->buffer != expect_buffer) {
-            YTTRIUM_LOG("yttrium: Venus native draw rejected sampled descriptor kind pipeline_id=%llu binding=%u raw_slot=%u got_buffer=%u expect_buffer=%u image_mask=0x%x buffer_mask=0x%x\n",
-                        (unsigned long long)pipeline->pipeline_obj.id,
-                        sampled->binding, raw_slot, sampled->buffer,
-                        expect_buffer, pipeline->sampled_image_mask,
-                        pipeline->sampled_buffer_mask);
-            return false;
-         }
+         const bool expect_buffer = layout->buffer != VK_FALSE;
 
          if (expect_buffer) {
             if (!sampled_resource || sampled_resource == resource ||
@@ -9296,11 +9946,10 @@ retry_batch_layout:
                   &sampled_buffer_views[sampled_update_count],
             };
          } else {
-            if (!pipeline->samplers[raw_slot]) {
-               YTTRIUM_LOG("yttrium: Venus native draw rejected sampled image missing sampler pipeline_id=%llu raw_slot=%u image_mask=0x%x buffer_mask=0x%x\n",
+            if (!pipeline->samplers[i]) {
+               YTTRIUM_LOG("yttrium: Venus native draw rejected sampled image missing sampler pipeline_id=%llu index=%u stage=%u raw_slot=%u binding=%u\n",
                            (unsigned long long)pipeline->pipeline_obj.id,
-                           raw_slot, pipeline->sampled_image_mask,
-                           pipeline->sampled_buffer_mask);
+                           i, layout->stage, raw_slot, layout->binding);
                return false;
             }
 
@@ -9318,10 +9967,12 @@ retry_batch_layout:
                yttrium_venus_sampled_attachment_feedback_loop(
                   pipeline, sampled_resource, color_resources,
                   color_resource_count, depth_resource, NULL, NULL);
+            const bool depth_read_only = pipeline->key.depth_read_only &&
+                                         sampled_resource == depth_resource;
 
             if (!sampled_resource ||
                 ((sampled_resource == resource || sampled_attachment) &&
-                 !feedback_loop) ||
+                 !feedback_loop && !depth_read_only) ||
                 !sampled_resource->initialized ||
                 sampled_resource->buffer_backed ||
                 !sampled_resource->image) {
@@ -9356,10 +10007,12 @@ retry_batch_layout:
 
             sampled_image_infos[sampled_update_count] =
                (VkDescriptorImageInfo) {
-               .sampler = pipeline->samplers[raw_slot],
+               .sampler = pipeline->samplers[i],
                .imageView = sampled_view,
                .imageLayout = feedback_loop ?
                   VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT :
+                  depth_read_only ?
+                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL :
                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             };
             sampled_writes[sampled_update_count] = (VkWriteDescriptorSet) {
@@ -9373,15 +10026,6 @@ retry_batch_layout:
             };
          }
          sampled_update_count++;
-         seen_mask |= raw_mask;
-      }
-
-      if (seen_mask != sampled_mask) {
-         YTTRIUM_LOG("yttrium: Venus native draw rejected sampled set incomplete pipeline_id=%llu seen=0x%x image_mask=0x%x buffer_mask=0x%x count=%u\n",
-                     (unsigned long long)pipeline->pipeline_obj.id,
-                     seen_mask, pipeline->sampled_image_mask,
-                     pipeline->sampled_buffer_mask, sampled_image_count);
-         return false;
       }
 
       if (use_push_descriptors) {
@@ -9517,8 +10161,8 @@ retry_batch_layout:
    const VkPipeline draw_pipeline =
       use_push_descriptors ? pipeline->push_pipeline : pipeline->pipeline;
    const struct yttrium_venus_object *draw_pipeline_layout_obj =
-      yttrium_venus_select_draw_pipeline_layout(
-         venus, pipeline, use_push_descriptors,
+      yttrium_venus_select_pipeline_layout(
+         &venus->push_descriptor_layout_index, pipeline, use_push_descriptors,
          ubo_update_count + sampled_update_count + storage_update_count);
    const VkPipelineLayout draw_pipeline_layout =
       YTTRIUM_VENUS_HANDLE(
@@ -9560,6 +10204,12 @@ retry_batch_layout:
             venus, "native draw batch index tracking failure");
          return false;
       }
+      if (draw_indirect &&
+          !yttrium_venus_cmd_batch_track_resource(venus, indirect_resource)) {
+         yttrium_venus_cancel_command_batch_setup_failure(
+            venus, "native draw batch indirect argument tracking failure");
+         return false;
+      }
       if (!yttrium_venus_cmd_batch_track_sampled_refs(
              venus, sampled_images, sampled_image_count)) {
          yttrium_venus_cancel_command_batch_setup_failure(
@@ -9580,36 +10230,22 @@ retry_batch_layout:
       }
       struct yttrium_venus_cmd_batch_footprint footprint;
       memset(&footprint, 0, sizeof(footprint));
-      footprint.descriptor_set = draw_descriptor_set;
+      /*
+       * Batch descriptor sets are updated per draw and therefore must not be
+       * reused while earlier commands are pending.  The pipeline-owned static
+       * sampled set is different: it is initialized once, retained by the
+       * tracked pipeline, and never updated when the cached bindings match.
+       * Treating that immutable set as transient forces a false conflict on
+       * every repeated draw that uses it.
+       */
+      footprint.descriptor_set =
+         use_static_sampled_cache ? VK_NULL_HANDLE : draw_descriptor_set;
       footprint.pipeline_id = pipeline->pipeline_obj.id;
       footprint.resource_id = resource_id;
-      for (uint32_t i = 0;
-           sampled_images && i < sampled_image_count &&
-           footprint.sampled_image_count <
-              ARRAY_SIZE(footprint.sampled_image_ids);
-           i++) {
-         if (!sampled_images[i].buffer && sampled_images[i].resource)
-            footprint.sampled_image_ids
-               [footprint.sampled_image_count++] =
-                  sampled_images[i].resource->image_obj.id;
-      }
-      for (uint32_t i = 0;
-           color_resources && i < color_resource_count &&
-           footprint.attachment_image_count <
-              ARRAY_SIZE(footprint.attachment_image_ids);
-           i++) {
-         if (color_resources[i])
-            footprint.attachment_image_ids
-               [footprint.attachment_image_count++] =
-                  color_resources[i]->image_obj.id;
-      }
-      if (depth_resource &&
-          footprint.attachment_image_count <
-             ARRAY_SIZE(footprint.attachment_image_ids)) {
-         footprint.attachment_image_ids
-            [footprint.attachment_image_count++] =
-               depth_resource->image_obj.id;
-      }
+      yttrium_venus_cmd_batch_collect_image_roles(
+         sampled_images, sampled_image_count, color_resources,
+         color_resource_count, depth_resource, pipeline->key.depth_read_only,
+         &footprint);
       if (!yttrium_venus_pipeline_ubo_footprint(
              venus, pipeline, ubo_uploads, ubo_upload_count,
              &footprint.ubo)) {
@@ -9658,7 +10294,7 @@ retry_batch_layout:
          has_index_resource ? index_resource->buffer : resource->draw_index_buffer;
 
    bool mirror_copy_pending = false;
-   for (uint32_t i = 0; i < vertex_upload_count; i++) {
+   for (uint32_t i = 0; !draw_indirect && i < vertex_upload_count; i++) {
       if (vertex_uploads[i].resource &&
           yttrium_venus_device_local_draw_mirror_needs_copy(
              vertex_uploads[i].resource)) {
@@ -9666,7 +10302,7 @@ retry_batch_layout:
          break;
       }
    }
-   if (!mirror_copy_pending && has_index_resource) {
+   if (!draw_indirect && !mirror_copy_pending && has_index_resource) {
       mirror_copy_pending =
          yttrium_venus_device_local_draw_mirror_needs_copy(index_resource);
    }
@@ -9684,15 +10320,15 @@ retry_batch_layout:
    for (uint32_t i = 0; i < vertex_upload_count; i++) {
       if (!vertex_uploads[i].resource)
          continue;
-      direct_vertex_buffers[i] =
+      direct_vertex_buffers[i] = draw_indirect ?
+         vertex_uploads[i].resource->buffer :
          yttrium_venus_prepare_device_local_draw_mirror(
-            venus, vertex_uploads[i].resource,
-            &direct_vertex_mirrored[i]);
+            venus, vertex_uploads[i].resource, &direct_vertex_mirrored[i]);
       if (!direct_vertex_buffers[i])
          goto fail_restore_command_buffer;
    }
    bool direct_index_mirrored = false;
-   if (has_index_resource) {
+   if (has_index_resource && !draw_indirect) {
       draw_index_buffer = yttrium_venus_prepare_device_local_draw_mirror(
          venus, index_resource, &direct_index_mirrored);
       if (!draw_index_buffer)
@@ -9794,15 +10430,15 @@ retry_batch_layout:
       if (direct_vertex_mirrored[i])
          continue;
       const VkAccessFlags src_access =
-         upload->host_write_pending ?
-         VK_ACCESS_HOST_WRITE_BIT :
-         (VK_ACCESS_TRANSFER_WRITE_BIT |
-          VK_ACCESS_TRANSFORM_FEEDBACK_WRITE_BIT_EXT);
+         VK_ACCESS_TRANSFER_WRITE_BIT |
+         VK_ACCESS_TRANSFORM_FEEDBACK_WRITE_BIT_EXT |
+         (draw_indirect ? VK_ACCESS_SHADER_WRITE_BIT : 0) |
+         (upload->host_write_pending ? VK_ACCESS_HOST_WRITE_BIT : 0);
       const VkPipelineStageFlags src_stage =
-         upload->host_write_pending ?
-         VK_PIPELINE_STAGE_HOST_BIT :
-         (VK_PIPELINE_STAGE_TRANSFER_BIT |
-          VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT);
+         VK_PIPELINE_STAGE_TRANSFER_BIT |
+         VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT |
+         (draw_indirect ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : 0) |
+         (upload->host_write_pending ? VK_PIPELINE_STAGE_HOST_BIT : 0);
       buffer_barriers[buffer_barrier_count++] = (VkBufferMemoryBarrier) {
          .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
          .srcAccessMask = src_access,
@@ -9860,15 +10496,15 @@ retry_batch_layout:
       vertex_src_stages |= src_stage;
    } else if (indexed && has_index_resource && !direct_index_mirrored) {
       const VkAccessFlags src_access =
-         index_host_write_pending ?
-         VK_ACCESS_HOST_WRITE_BIT :
-         (VK_ACCESS_TRANSFER_WRITE_BIT |
-          VK_ACCESS_TRANSFORM_FEEDBACK_WRITE_BIT_EXT);
+         VK_ACCESS_TRANSFER_WRITE_BIT |
+         VK_ACCESS_TRANSFORM_FEEDBACK_WRITE_BIT_EXT |
+         (draw_indirect ? VK_ACCESS_SHADER_WRITE_BIT : 0) |
+         (index_host_write_pending ? VK_ACCESS_HOST_WRITE_BIT : 0);
       const VkPipelineStageFlags src_stage =
-         index_host_write_pending ?
-         VK_PIPELINE_STAGE_HOST_BIT :
-         (VK_PIPELINE_STAGE_TRANSFER_BIT |
-          VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT);
+         VK_PIPELINE_STAGE_TRANSFER_BIT |
+         VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT |
+         (draw_indirect ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : 0) |
+         (index_host_write_pending ? VK_PIPELINE_STAGE_HOST_BIT : 0);
       buffer_barriers[buffer_barrier_count++] =
          (VkBufferMemoryBarrier) {
             .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
@@ -9898,6 +10534,27 @@ retry_batch_layout:
                                      buffer_barriers, 0, NULL);
    }
 
+   if (draw_indirect) {
+      /* CopyStructureCount, UAV stores and CPU-authored initial arguments all
+       * converge here.  Consume the original buffer, not a CPU shadow or a
+       * vertex/index mirror.  This is outside the render pass. */
+      const VkBufferMemoryBarrier barrier = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+         .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT,
+         .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
+         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .buffer = indirect_resource->buffer,
+         .offset = indirect_offset,
+         .size = indirect_size,
+      };
+      vn_async_vkCmdPipelineBarrier(
+         &venus->vn_ring, venus->command_buffer,
+         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+         VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0,
+         0, NULL, 1, &barrier, 0, NULL);
+   }
+
    const VkPipelineStageFlags sampled_stage_flags =
       yttrium_venus_sampled_stage_flags(pipeline);
 
@@ -9916,17 +10573,36 @@ retry_batch_layout:
          if (!sampled->buffer)
             continue;
          if (!sampled_resource || !sampled_resource->buffer ||
-             !sampled->buffer_data || !sampled->buffer_size ||
+             !sampled->buffer_size ||
+             (!sampled->buffer_data && !sampled_resource->contents_initialized) ||
              sampled_buffer_barrier_count >=
                 YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES)
             goto fail_restore_command_buffer;
 
          VkDeviceSize written_size = 0;
-         if (!yttrium_venus_cmd_update_buffer_padded(
-                venus, venus->command_buffer, sampled_resource->buffer, 0,
-                sampled->buffer_size, sampled->buffer_data, &written_size))
-            goto fail_restore_command_buffer;
-         YTTRIUM_LOG("yttrium: Venus sampled buffer upload res_id=%u buffer_id=%llu view_offset=0x%llx view_range=0x%llx upload_offset=0x0 upload_size=0x%llx written_size=0x%llx\n",
+         if (sampled->buffer_data) {
+            const VkBufferMemoryBarrier overwrite = {
+               .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+               .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT |
+                                VK_ACCESS_MEMORY_WRITE_BIT,
+               .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+               .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+               .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+               .buffer = sampled_resource->buffer,
+               .offset = 0,
+               .size = sampled->buffer_size,
+            };
+            vn_async_vkCmdPipelineBarrier(
+               &venus->vn_ring, venus->command_buffer,
+               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+               0, NULL, 1, &overwrite, 0, NULL);
+            if (!yttrium_venus_cmd_update_buffer_padded(
+                   venus, venus->command_buffer, sampled_resource->buffer, 0,
+                   sampled->buffer_size, sampled->buffer_data, &written_size))
+               goto fail_restore_command_buffer;
+         }
+         YTTRIUM_LOG("yttrium: Venus sampled buffer publish res_id=%u buffer_id=%llu view_offset=0x%llx view_range=0x%llx upload_offset=0x0 upload_size=0x%llx written_size=0x%llx\n",
                      sampled->resource_id,
                      (unsigned long long)sampled_resource->buffer_obj.id,
                      (unsigned long long)sampled->buffer_offset,
@@ -9937,13 +10613,14 @@ retry_batch_layout:
          sampled_buffer_barriers[sampled_buffer_barrier_count++] =
             (VkBufferMemoryBarrier) {
                .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-               .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+               .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT |
+                                VK_ACCESS_HOST_WRITE_BIT,
                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                .buffer = sampled_resource->buffer,
-               .offset = 0,
-               .size = written_size,
+               .offset = sampled->buffer_offset,
+               .size = sampled->buffer_range,
             };
          sampled_resource->contents_initialized = true;
       }
@@ -9951,7 +10628,8 @@ retry_batch_layout:
       if (sampled_buffer_barrier_count) {
          vn_async_vkCmdPipelineBarrier(&venus->vn_ring,
                                         venus->command_buffer,
-                                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT |
+                                        VK_PIPELINE_STAGE_HOST_BIT,
                                         sampled_stage_flags,
                                         0, 0, NULL,
                                         sampled_buffer_barrier_count,
@@ -9977,26 +10655,42 @@ retry_batch_layout:
              storage_buffer_barrier_count >=
                 YTTRIUM_VENUS_MAX_PIPELINE_STORAGE_IMAGES)
             goto fail_restore_command_buffer;
-         if (!storage->buffer_data || !storage->buffer_size)
-            continue;
-
          VkDeviceSize written_size = 0;
-         if (!yttrium_venus_cmd_update_buffer_padded(
-                venus, venus->command_buffer, storage_resource->buffer, 0,
-                storage->buffer_size, storage->buffer_data, &written_size))
-            goto fail_restore_command_buffer;
+         if (storage->buffer_data && storage->buffer_size) {
+            const VkBufferMemoryBarrier overwrite = {
+               .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+               .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT |
+                                VK_ACCESS_MEMORY_WRITE_BIT,
+               .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+               .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+               .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+               .buffer = storage_resource->buffer,
+               .offset = 0,
+               .size = storage->buffer_size,
+            };
+            vn_async_vkCmdPipelineBarrier(
+               &venus->vn_ring, venus->command_buffer,
+               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+               0, NULL, 1, &overwrite, 0, NULL);
+            if (!yttrium_venus_cmd_update_buffer_padded(
+                   venus, venus->command_buffer, storage_resource->buffer, 0,
+                   storage->buffer_size, storage->buffer_data, &written_size))
+               goto fail_restore_command_buffer;
+         }
 
          storage_buffer_barriers[storage_buffer_barrier_count++] =
             (VkBufferMemoryBarrier) {
                .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-               .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+               .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT |
+                                VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT,
                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
                                 VK_ACCESS_SHADER_WRITE_BIT,
                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                .buffer = storage_resource->buffer,
-               .offset = 0,
-               .size = written_size,
+               .offset = storage->buffer_offset,
+               .size = storage->buffer_range,
             };
          storage_resource->contents_initialized = true;
       }
@@ -10004,8 +10698,9 @@ retry_batch_layout:
       if (storage_buffer_barrier_count) {
          vn_async_vkCmdPipelineBarrier(&venus->vn_ring,
                                         venus->command_buffer,
-                                        VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT |
+                                        VK_PIPELINE_STAGE_HOST_BIT,
+                                        VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
                                         0, 0, NULL,
                                         storage_buffer_barrier_count,
                                         storage_buffer_barriers, 0, NULL);
@@ -10013,7 +10708,6 @@ retry_batch_layout:
    }
 
    VkBufferMemoryBarrier ubo_barriers[YTTRIUM_VENUS_MAX_PIPELINE_UBO_SLOTS];
-   memset(ubo_barriers, 0, sizeof(ubo_barriers));
    const bool direct_ubo_upload =
       native_draw_batch && yttrium_venus_direct_ubo_upload_enabled() &&
       venus->ubo_upload_arena && venus->ubo_upload_arena->mapping.map;
@@ -10154,8 +10848,11 @@ retry_batch_layout:
                pipeline, sampled_resource, color_resources,
                color_resource_count, depth_resource,
                &color_feedback, &depth_feedback);
+         const bool depth_read_only = pipeline->key.depth_read_only &&
+                                      sampled_resource == depth_resource;
          const VkImageLayout sampled_layout = feedback_loop ?
             VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT :
+            depth_read_only ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL :
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
          VkAccessFlags sampled_access = VK_ACCESS_SHADER_READ_BIT;
          VkPipelineStageFlags sampled_stages = sampled_stage_flags;
@@ -10164,9 +10861,10 @@ retry_batch_layout:
                               VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
             sampled_stages |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
          }
-         if (depth_feedback) {
+         if (depth_feedback || depth_read_only) {
             sampled_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-                              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+                              (depth_feedback ?
+                                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT : 0);
             sampled_stages |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                               VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
          }
@@ -10270,17 +10968,19 @@ retry_batch_layout:
             draw_state->depth_level, draw_state->depth_layer,
             MAX2(draw_state->depth_layers, 1));
       const bool feedback_loop = pipeline->key.depth_feedback_loop;
+      const bool depth_read_only = pipeline->key.depth_read_only;
       const VkImageLayout depth_layout = feedback_loop ?
          VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT :
+         depth_read_only ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL :
          VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
       const VkAccessFlags depth_access =
          VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
-         (feedback_loop ? VK_ACCESS_SHADER_READ_BIT : 0);
+         (depth_read_only ? 0 : VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT) |
+         ((feedback_loop || depth_read_only) ? VK_ACCESS_SHADER_READ_BIT : 0);
       const VkPipelineStageFlags depth_stages =
          VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
          VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
-         (feedback_loop ? sampled_stage_flags : 0);
+         ((feedback_loop || depth_read_only) ? sampled_stage_flags : 0);
       if (defer_render_pass) {
          if (!yttrium_venus_cmd_batch_transition_image(
                 venus, depth_resource, depth_layout,
@@ -10439,7 +11139,7 @@ retry_batch_layout:
                                           &draw_descriptor_set, 0, NULL);
       }
       yttrium_venus_cmd_push_static_ubo_constants(
-         venus, draw_pipeline_layout,
+         venus, &venus->vn_ring, draw_pipeline_layout,
          draw_state->push_constant_data +
             YTTRIUM_SHADER_VS_PUSH_CONSTANT_OFFSET,
          draw_state->push_constant_vs_size,
@@ -10482,13 +11182,6 @@ retry_batch_layout:
       }
 
       if (draw_auto) {
-         const uint32_t max_stride =
-            yttrium_venus2_max_transform_feedback_stride(venus);
-         if (max_stride && draw_auto_stride > max_stride) {
-            YTTRIUM_LOG("yttrium: Venus native draw rejected DrawAuto stride=%u max_stride=%u\n",
-                        draw_auto_stride, max_stride);
-            goto fail_restore_command_buffer;
-         }
          vn_async_vkCmdDrawIndirectByteCountEXT(
             &venus->vn_ring, venus->command_buffer,
             instance_count, 0,
@@ -10498,9 +11191,20 @@ retry_batch_layout:
          vn_async_vkCmdBindIndexBuffer(&venus->vn_ring, venus->command_buffer,
                                        draw_index_buffer, draw_index_offset,
                                        index_type);
-         vn_async_vkCmdDrawIndexed(&venus->vn_ring, venus->command_buffer,
-                                   index_count, instance_count, 0,
-                                   vertex_offset, 0);
+         if (draw_indirect)
+            vn_async_vkCmdDrawIndexedIndirect(
+               &venus->vn_ring, venus->command_buffer,
+               indirect_resource->buffer, indirect_offset, 1,
+               sizeof(VkDrawIndexedIndirectCommand));
+         else
+            vn_async_vkCmdDrawIndexed(&venus->vn_ring, venus->command_buffer,
+                                      index_count, instance_count, 0,
+                                      vertex_offset, 0);
+      } else if (draw_indirect) {
+         vn_async_vkCmdDrawIndirect(
+            &venus->vn_ring, venus->command_buffer,
+            indirect_resource->buffer, indirect_offset, 1,
+            sizeof(VkDrawIndirectCommand));
       } else {
          vn_async_vkCmdDraw(&venus->vn_ring, venus->command_buffer,
                             vertex_count, instance_count, 0, 0);
@@ -10585,7 +11289,7 @@ retry_batch_layout:
                             draw_state->scissors[0].offset.y,
                             draw_state->scissors[0].extent.width,
                             draw_state->scissors[0].extent.height);
-   YTTRIUM_LOG("yttrium: Venus native draw res_id=%u image_id=%llu depth_res_id=%u depth_image_id=%llu sampled_res_id=%u sampled_object_id=%llu sampled_buffer=%u pipeline_id=%llu count=%u instances=%u vertex_bytes=0x%llx vertex_bindings=%u indexed=%u index_count=%u index_bytes=0x%llx index_type=%u vertex_offset=%d ubos=%u sampled_count=%u image_mask=0x%x buffer_mask=0x%x viewports=%u viewport0=%f,%f %fx%f scissor0=%d,%d %ux%u topology=%u depth_test=%u depth_write=%u depth_compare=%u\n",
+   YTTRIUM_LOG("yttrium: Venus native draw res_id=%u image_id=%llu depth_res_id=%u depth_image_id=%llu sampled_res_id=%u sampled_object_id=%llu sampled_buffer=%u pipeline_id=%llu count=%u instances=%u vertex_bytes=0x%llx vertex_bindings=%u indexed=%u index_count=%u index_bytes=0x%llx index_type=%u vertex_offset=%d ubos=%u sampled_count=%u sampled_expected=%u sampled_stages=0x%x viewports=%u viewport0=%f,%f %fx%f scissor0=%d,%d %ux%u topology=%u depth_test=%u depth_write=%u depth_compare=%u\n",
                  resource_id,
                  (unsigned long long)resource->image_obj.id,
                  has_depth ? depth_resource_id : 0,
@@ -10609,8 +11313,8 @@ retry_batch_layout:
                  indexed ? vertex_offset : 0,
                  ubo_upload_count,
                  sampled_image_count,
-                 pipeline->sampled_image_mask,
-                 pipeline->sampled_buffer_mask,
+                 pipeline->key.sampled_binding_count,
+                 pipeline->key.sampled_stage_mask,
                  draw_state->viewport_count,
                  draw_state->viewports[0].x,
                 draw_state->viewports[0].y,
@@ -10688,10 +11392,49 @@ yttrium_venus_clear_display_buffer(struct yttrium_venus *venus,
    return yttrium_venus_cmd_batch_after_record(venus, "buffer clear");
 }
 
+static bool
+yttrium_venus_compute_push_descriptors_complete(
+   struct yttrium_pipeline *pipeline,
+   const VkWriteDescriptorSet *ubo_writes,
+   uint32_t ubo_update_count,
+   uint32_t sampled_image_count,
+   uint32_t storage_update_count)
+{
+   if (ubo_update_count != pipeline->ubo_descriptor_count ||
+       ubo_update_count != pipeline->ubo_count ||
+       ubo_update_count > YTTRIUM_VENUS_MAX_PIPELINE_UBO_SLOTS ||
+       sampled_image_count != pipeline->sampled_image_descriptor_count ||
+       pipeline->sampled_buffer_descriptor_count ||
+       storage_update_count != pipeline->storage_image_descriptor_count +
+                                  pipeline->storage_buffer_descriptor_count)
+      return false;
+
+   /* Sampled bindings are checked in layout order and storage bindings have an
+    * exact seen mask below. Counts alone do not exclude duplicate UBO writes;
+    * require one write for each declared (binding, array element) as well. */
+   uint32_t seen_ubos = 0;
+   for (uint32_t i = 0; i < ubo_update_count; i++) {
+      const VkWriteDescriptorSet *write = &ubo_writes[i];
+      struct yttrium_venus_ubo_slot *slot =
+         yttrium_venus_pipeline_find_ubo_slot(
+            pipeline, write->dstBinding, write->dstArrayElement);
+      if (!slot || write->descriptorCount != 1 ||
+          write->descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
+         return false;
+      const uint32_t bit = 1u << (slot - pipeline->ubos);
+      if (seen_ubos & bit)
+         return false;
+      seen_ubos |= bit;
+   }
+   return true;
+}
+
 bool
 yttrium_venus2_dispatch_compute(
    struct yttrium_venus *venus,
    struct yttrium_pipeline *pipeline,
+   const struct yttrium_venus_sampled_image *sampled_images,
+   uint32_t sampled_image_count,
    const struct yttrium_venus_storage_image *storage_images,
    uint32_t storage_image_count,
    const struct yttrium_venus_ubo_upload *ubo_uploads,
@@ -10704,8 +11447,14 @@ yttrium_venus2_dispatch_compute(
        !grid_z)
       return false;
 
+   if (sampled_image_count != pipeline->key.sampled_binding_count ||
+       sampled_image_count > YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES ||
+       (sampled_image_count && !sampled_images) || pipeline->has_sampled_buffer)
+      return false;
+
    const bool has_descriptors =
       pipeline->ubo_descriptor_count ||
+      pipeline->sampled_image_descriptor_count ||
       pipeline->storage_image_descriptor_count ||
       pipeline->storage_buffer_descriptor_count;
    const bool use_push_descriptors =
@@ -10746,6 +11495,81 @@ yttrium_venus2_dispatch_compute(
           ubo_uploads, ubo_upload_count, use_push_descriptors, ubo_infos,
           ubo_writes, &ubo_update_count))
       return false;
+
+   struct yttrium_venus_sampled_image resolved_samples
+      [YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES];
+   VkDescriptorImageInfo sampled_infos
+      [YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES];
+   VkWriteDescriptorSet sampled_writes
+      [YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES];
+   memset(resolved_samples, 0, sizeof(resolved_samples));
+   memset(sampled_infos, 0, sizeof(sampled_infos));
+   memset(sampled_writes, 0, sizeof(sampled_writes));
+   for (uint32_t i = 0; i < sampled_image_count; i++) {
+      const struct yttrium_venus_sampled_binding_layout *layout =
+         &pipeline->key.sampled_bindings[i];
+      struct yttrium_venus_sampled_image *sampled = &resolved_samples[i];
+      *sampled = sampled_images[i];
+      if (layout->stage != MESA_SHADER_COMPUTE || layout->buffer ||
+          sampled->buffer || sampled->binding != layout->binding ||
+          !pipeline->samplers[i])
+         return false;
+      if (!sampled->resource &&
+          !yttrium_venus_ensure_null_sampled_image(
+             venus, &sampled->resource, &sampled->resource_id))
+         return false;
+
+      const struct yttrium_venus_resource *resource = sampled->resource;
+      if (!resource || !resource->initialized || resource->buffer_backed ||
+          !resource->image ||
+          !(resource->image_usage & VK_IMAGE_USAGE_SAMPLED_BIT))
+         return false;
+
+      /* The existing depth initializer covers only mip 0 / layer 0, but
+       * layout and initialization state are tracked for the whole image.
+       * Do not claim the remaining subresources were initialized by it.
+       */
+      if (yttrium_venus_format_has_depth(resource->vk_format) &&
+          !resource->contents_initialized &&
+          (resource->levels > 1 || resource->layers > 1)) {
+         YTTRIUM_WARN("yttrium: compute dispatch rejected owner=yttrium_venus reason=uninitialized_depth_subresources_unsupported res_id=%u levels=%u layers=%u\n",
+                      sampled->resource_id, resource->levels, resource->layers);
+         return false;
+      }
+
+      VkImageView view = VK_NULL_HANDLE;
+      if (!yttrium_venus_ensure_sample_image_view(
+             venus, sampled->resource, sampled->resource_id,
+             yttrium_venus2_pipe_format(sampled->format),
+             sampled->swizzle_key, sampled->view_type,
+             sampled->first_level, sampled->level_count,
+             sampled->first_layer, sampled->layer_count,
+             sampled->aspect_mask, &view))
+         return false;
+
+      /* GENERAL also permits non-overlapping SRV/UAV views of one image.
+       * Keep their descriptors and the resource's tracked layout consistent.
+       */
+      sampled_infos[i] = (VkDescriptorImageInfo) {
+         .sampler = pipeline->samplers[i],
+         .imageView = view,
+         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+      };
+      sampled_writes[i] = (VkWriteDescriptorSet) {
+         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+         .dstSet = use_push_descriptors ? VK_NULL_HANDLE :
+                      dispatch_descriptor_set,
+         .dstBinding = sampled->binding,
+         .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+         .pImageInfo = &sampled_infos[i],
+      };
+   }
+   if (sampled_image_count && !use_push_descriptors) {
+      vn_async_vkUpdateDescriptorSets(&venus->vn_ring, venus->device_handle,
+                                      sampled_image_count, sampled_writes,
+                                      0, NULL);
+   }
 
    VkDescriptorImageInfo storage_image_infos
       [YTTRIUM_VENUS_MAX_PIPELINE_STORAGE_IMAGES];
@@ -10851,6 +11675,16 @@ yttrium_venus2_dispatch_compute(
       }
    }
 
+   /* Rotate only after proving a complete write of the declared layout.
+    * Existing producers supply complete state; incomplete input retains the
+    * original layout selection. */
+   const bool complete_push_descriptors =
+      use_push_descriptors && pipeline->push_pipeline_layout_alt &&
+      yttrium_venus_push_descriptor_layout_rotation_enabled() &&
+      yttrium_venus_compute_push_descriptors_complete(
+         pipeline, ubo_writes, ubo_update_count,
+         sampled_image_count, storage_update_count);
+
    if (!yttrium_venus_begin_command_batch(venus, "native compute dispatch",
                                           false, true))
       return false;
@@ -10859,6 +11693,14 @@ yttrium_venus2_dispatch_compute(
       yttrium_venus_cancel_command_batch_setup_failure(
          venus, "native compute dispatch pipeline tracking failure");
       return false;
+   }
+   for (uint32_t i = 0; i < sampled_image_count; i++) {
+      if (!yttrium_venus_cmd_batch_track_resource(
+             venus, resolved_samples[i].resource)) {
+         yttrium_venus_cancel_command_batch_setup_failure(
+            venus, "native compute dispatch sampled resource tracking failure");
+         return false;
+      }
    }
    for (uint32_t i = 0; i < ubo_upload_count; i++) {
       if (ubo_uploads[i].direct_resource &&
@@ -10899,32 +11741,49 @@ yttrium_venus2_dispatch_compute(
 
          if (storage->buffer_data && storage->buffer_size) {
             VkDeviceSize written_size = 0;
+            const VkBufferMemoryBarrier overwrite = {
+               .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+               .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT |
+                                VK_ACCESS_MEMORY_WRITE_BIT,
+               .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+               .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+               .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+               .buffer = storage_resource->buffer,
+               .offset = 0,
+               .size = storage->buffer_size,
+            };
+            vn_async_vkCmdPipelineBarrier(
+               &venus->vn_ring, venus->command_buffer,
+               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+               0, NULL, 1, &overwrite, 0, NULL);
             if (!yttrium_venus_cmd_update_buffer_padded(
                    venus, venus->command_buffer, storage_resource->buffer, 0,
                    storage->buffer_size, storage->buffer_data,
                    &written_size))
                goto fail_command_batch;
-
-            storage_barriers[storage_barrier_count++] =
+         }
+         storage_barriers[storage_barrier_count++] =
                (VkBufferMemoryBarrier) {
                   .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-                  .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                  .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT |
+                                   VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT,
                   .dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
                                    VK_ACCESS_SHADER_WRITE_BIT,
                   .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                   .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                   .buffer = storage_resource->buffer,
-                  .offset = 0,
-                  .size = written_size,
+                  .offset = storage->buffer_offset,
+                  .size = storage->buffer_range,
                };
-            storage_resource->contents_initialized = true;
-         }
+         storage_resource->contents_initialized = true;
       }
 
       if (storage_barrier_count) {
          vn_async_vkCmdPipelineBarrier(&venus->vn_ring,
                                        venus->command_buffer,
-                                       VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT |
+                                       VK_PIPELINE_STAGE_HOST_BIT,
                                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                        0, 0, NULL,
                                        storage_barrier_count,
@@ -10979,6 +11838,34 @@ yttrium_venus2_dispatch_compute(
                                     0, NULL);
    }
 
+   for (uint32_t i = 0; i < sampled_image_count; i++) {
+      struct yttrium_venus_sampled_image *sampled = &resolved_samples[i];
+      struct yttrium_venus_resource *resource = sampled->resource;
+      const bool depth = yttrium_venus_format_has_depth(resource->vk_format);
+      if (depth ?
+          !yttrium_venus_cmd_ensure_depth_initialized(
+             venus, resource, sampled->resource_id) :
+          !yttrium_venus_cmd_ensure_image_initialized(
+             venus, resource, sampled->resource_id))
+         goto fail_command_batch;
+
+      /* Layout state is per resource, not per view. Transition all mips and
+       * layers; the descriptor still exposes only the requested SRV range.
+       */
+      const VkImageSubresourceRange range = {
+         .aspectMask = yttrium_venus_format_aspects(resource->vk_format),
+         .baseMipLevel = 0,
+         .levelCount = MAX2(resource->levels, 1),
+         .baseArrayLayer = 0,
+         .layerCount = MAX2(resource->layers, 1),
+      };
+      yttrium_venus_cmd_transition_image(venus, resource,
+                                         VK_IMAGE_LAYOUT_GENERAL,
+                                         VK_ACCESS_SHADER_READ_BIT,
+                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                         &range);
+   }
+
    if (pipeline->has_storage_image) {
       for (uint32_t i = 0; i < storage_image_count; i++) {
          struct yttrium_venus_resource *image_resource =
@@ -10992,10 +11879,10 @@ yttrium_venus2_dispatch_compute(
          const VkImageSubresourceRange range = {
             .aspectMask = storage_images[i].aspect_mask ?
                storage_images[i].aspect_mask : VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel = storage_images[i].first_level,
-            .levelCount = storage_images[i].level_count,
-            .baseArrayLayer = storage_images[i].first_layer,
-            .layerCount = storage_images[i].layer_count,
+            .baseMipLevel = 0,
+            .levelCount = MAX2(image_resource->levels, 1),
+            .baseArrayLayer = 0,
+            .layerCount = MAX2(image_resource->layers, 1),
          };
 
          if (!yttrium_venus_cmd_ensure_image_initialized(
@@ -11012,20 +11899,28 @@ yttrium_venus2_dispatch_compute(
 
    const VkPipeline compute_pipeline =
       use_push_descriptors ? pipeline->push_pipeline : pipeline->pipeline;
+   const struct yttrium_venus_object *compute_pipeline_layout_obj =
+      yttrium_venus_select_pipeline_layout(
+         &venus->compute_push_descriptor_layout_index, pipeline,
+         use_push_descriptors,
+         complete_push_descriptors ?
+            ubo_update_count + sampled_image_count + storage_update_count : 0);
    const VkPipelineLayout compute_pipeline_layout =
-      use_push_descriptors ? pipeline->push_pipeline_layout :
-                             pipeline->pipeline_layout;
+      YTTRIUM_VENUS_HANDLE(VkPipelineLayout, compute_pipeline_layout_obj);
    vn_async_vkCmdBindPipeline(&venus->vn_ring, venus->command_buffer,
                               VK_PIPELINE_BIND_POINT_COMPUTE,
                               compute_pipeline);
    if (use_push_descriptors) {
       VkWriteDescriptorSet push_writes
          [YTTRIUM_VENUS_MAX_PIPELINE_UBO_SLOTS +
+          YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES +
           YTTRIUM_VENUS_MAX_PIPELINE_STORAGE_IMAGES];
       uint32_t push_write_count = 0;
 
       for (uint32_t i = 0; i < ubo_update_count; i++)
          push_writes[push_write_count++] = ubo_writes[i];
+      for (uint32_t i = 0; i < sampled_image_count; i++)
+         push_writes[push_write_count++] = sampled_writes[i];
       for (uint32_t i = 0; i < storage_update_count; i++)
          push_writes[push_write_count++] = storage_writes[i];
 
@@ -11480,6 +12375,8 @@ yttrium_venus2_copy_image_region_aspect_to_display_buffer(struct yttrium_venus *
        !render->image || !scanout || !scanout->initialized ||
        !scanout->buffer_backed || !scanout->buffer)
       return false;
+   if (!(scanout->buffer_usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT))
+      return false;
    if (!(render->image_usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
       return false;
    const bool src_is_3d = render->layers == 1 && render->depth > 1;
@@ -11556,6 +12453,26 @@ yttrium_venus2_copy_image_region_aspect_to_display_buffer(struct yttrium_venus *
                                       VK_PIPELINE_STAGE_TRANSFER_BIT,
                                       &range);
 
+   /* The destination can also be a GPU indirect/counter buffer, not only a
+    * readback staging buffer.  Order the overwritten range after shader,
+    * indirect and host accesses as well as preceding transfers. */
+   const VkBufferMemoryBarrier overwrite_barrier = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
+                       VK_ACCESS_HOST_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .buffer = scanout->buffer,
+      .offset = buffer_offset,
+      .size = last_byte - buffer_offset,
+   };
+   vn_async_vkCmdPipelineBarrier(&venus->vn_ring, venus->command_buffer,
+                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT |
+                                 VK_PIPELINE_STAGE_HOST_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                                 0, NULL, 1, &overwrite_barrier, 0, NULL);
+
    const VkBufferImageCopy copy_region = {
       .bufferOffset = buffer_offset,
       .bufferRowLength = scanout_stride / cpp,
@@ -11573,6 +12490,24 @@ yttrium_venus2_copy_image_region_aspect_to_display_buffer(struct yttrium_venus *
                                    render->image,
                                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                    scanout->buffer, 1, &copy_region);
+   {
+      const VkBufferMemoryBarrier host_read_barrier = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
+                          VK_ACCESS_HOST_READ_BIT,
+         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .buffer = scanout->buffer,
+         .offset = buffer_offset,
+         .size = last_byte - buffer_offset,
+      };
+      vn_async_vkCmdPipelineBarrier(
+         &venus->vn_ring, venus->command_buffer,
+         VK_PIPELINE_STAGE_TRANSFER_BIT,
+         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0,
+         0, NULL, 1, &host_read_barrier, 0, NULL);
+   }
    yttrium_trace_venus_upload(
       YTTRIUM_TRACE_VENUS_UPLOAD_IMAGE_TO_BUFFER, 0,
       (uint64_t)scanout_stride * height, render->image_obj.id,
@@ -11625,9 +12560,7 @@ yttrium_venus2_copy_buffer_to_buffer(struct yttrium_venus *venus,
 
    const VkBufferMemoryBarrier src_barrier = {
       .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-      .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT |
-                       VK_ACCESS_SHADER_WRITE_BIT |
-                       VK_ACCESS_TRANSFORM_FEEDBACK_WRITE_BIT_EXT,
+      .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT,
       .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -11637,11 +12570,26 @@ yttrium_venus2_copy_buffer_to_buffer(struct yttrium_venus *venus,
    };
    vn_async_vkCmdPipelineBarrier(
       &venus->vn_ring, venus->command_buffer,
-      VK_PIPELINE_STAGE_TRANSFER_BIT |
-      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-      VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT,
+      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
       VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
       0, NULL, 1, &src_barrier, 0, NULL);
+
+   const VkBufferMemoryBarrier overwrite_barrier = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
+                       VK_ACCESS_HOST_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .buffer = dst->buffer,
+      .offset = dst_offset,
+      .size = size,
+   };
+   vn_async_vkCmdPipelineBarrier(
+      &venus->vn_ring, venus->command_buffer,
+      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+      0, NULL, 1, &overwrite_barrier, 0, NULL);
 
    const VkBufferCopy copy_region = {
       .srcOffset = src_offset,
@@ -11657,7 +12605,8 @@ yttrium_venus2_copy_buffer_to_buffer(struct yttrium_venus *venus,
    const VkBufferMemoryBarrier dst_barrier = {
       .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
       .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-      .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+      .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
+                       VK_ACCESS_HOST_READ_BIT,
       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .buffer = dst->buffer,
@@ -11666,6 +12615,7 @@ yttrium_venus2_copy_buffer_to_buffer(struct yttrium_venus *venus,
    };
    vn_async_vkCmdPipelineBarrier(&venus->vn_ring, venus->command_buffer,
                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT |
                                  VK_PIPELINE_STAGE_HOST_BIT, 0,
                                  0, NULL, 1, &dst_barrier, 0, NULL);
 
@@ -13307,13 +14257,17 @@ yttrium_venus2_resource_fini(
          yttrium_venus_destroy_retired_resource(venus, retired);
       }
    } else {
-      for (unsigned i = 0; i < YTTRIUM_VENUS_SAMPLE_IMAGE_VIEW_CACHE_SIZE;
-           i++) {
-         if (resource->sample_image_view_cache[i].view)
-            vn_async_vkDestroyImageView(
-               &venus->vn_ring, venus->device_handle,
-               resource->sample_image_view_cache[i].view, NULL);
+      struct yttrium_venus_sample_image_view *image_view =
+         resource->sample_image_views;
+      while (image_view) {
+         struct yttrium_venus_sample_image_view *next = image_view->next;
+         if (image_view->view)
+            vn_async_vkDestroyImageView(&venus->vn_ring, venus->device_handle,
+                                        image_view->view, NULL);
+         FREE(image_view);
+         image_view = next;
       }
+      resource->sample_image_views = NULL;
       struct yttrium_venus_sample_buffer_view *buffer_view =
          resource->sample_buffer_views;
       while (buffer_view) {
@@ -13413,6 +14367,25 @@ yttrium_venus2_create(struct gdikmt_device *device)
       YTTRIUM_WARN("yttrium: ERROR: Venus2 grouped queue submits disabled owner=venus2 reason=batch_epoch_wait_required %s=1 D3D10UMD_YTTRIUM_BATCH_EPOCH_WAIT=0\n",
                    YTTRIUM_VENUS_GROUP_QUEUE_SUBMITS_ENV);
    }
+
+   const int64_t group_queue_submit_op_threshold =
+      yttrium_gdi_debug_get_num_option(
+         YTTRIUM_VENUS_GROUP_QUEUE_SUBMIT_OP_THRESHOLD_ENV, 0);
+   if (group_queue_submit_op_threshold > 0) {
+      if (venus->group_queue_submits) {
+         venus->group_queue_submit_op_threshold =
+            (uint64_t)group_queue_submit_op_threshold;
+         YTTRIUM_WARN("yttrium: WARNING: experimental grouped queue submit operation threshold enabled owner=venus2 component=grouped-queue-submit reason=process-option action=flush-at-operation-threshold threshold=%llu variable=%s\n",
+                      (unsigned long long)
+                         venus->group_queue_submit_op_threshold,
+                      YTTRIUM_VENUS_GROUP_QUEUE_SUBMIT_OP_THRESHOLD_ENV);
+      } else {
+         YTTRIUM_WARN("yttrium: WARNING: grouped queue submit operation threshold ignored owner=venus2 component=grouped-queue-submit reason=grouped-submits-disabled action=leave-threshold-disabled requested=%lld variable=%s\n",
+                      (long long)group_queue_submit_op_threshold,
+                      YTTRIUM_VENUS_GROUP_QUEUE_SUBMIT_OP_THRESHOLD_ENV);
+      }
+   }
+
    if (venus->group_queue_submits) {
       venus->pending_submit_batches =
          CALLOC(venus->group_queue_submit_size,
